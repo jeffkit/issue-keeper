@@ -1,0 +1,38 @@
+# issue-keeper 配置文件
+# 把本地 bridge profile 绑定到 GitHub 仓库；程序监控这些仓库的 issue，
+# 发现有新 issue 或新评论时，按 P0 协议调用对应 profile 的 agent 处理，
+# 并把 agent 的 stdout 作为评论发到 issue。
+
+# daemon 模式的轮询间隔（秒）。--once 模式忽略此值。
+poll_interval_secs: 300
+
+# 状态文件路径：记录每个仓库已处理的 issue / 评论 / agent 会话。
+# 支持 ~ 展开。
+state_file: ~/.issue-keeper/state.json
+
+# agent 回复在 GitHub 评论里携带的隐藏标记，用于识别"bot 自己发的评论"，
+# 避免监控循环触发自己。会以 HTML 注释形式 prepend 到评论正文前面。
+bot_marker: "<!-- issue-keeper-bot -->"
+
+# 调用 agent 时的整体超时（秒）。可被 profile YAML 里的 timeout_secs 覆盖。
+default_timeout_secs: 600
+
+# 调用 agent 时写入 AGENT_FROM_USER 的值（来源标识）。
+agent_from_user: "issue-keeper"
+
+# 仓库 -> profile 绑定列表
+repos:
+  - repo: "owner/repo-name"           # GitHub 仓库全名（owner/name）
+    profile: "ilink-claude"            # ~/.ilink-hub-bridge/profiles/<name>.yaml 的 stem
+    # 可选：只监控带这些 label 的 issue；留空 / 不写 = 监控全部
+    labels: []
+    # 可选：覆盖全局轮询间隔
+    # poll_interval_secs: 600
+    # 可选：该仓库 issue 的 agent 会话 id 前缀（默认 issue-keeper）
+    # session_prefix: "issue-keeper"
+    # 可选：覆盖默认超时
+    # timeout_secs: 900
+
+  - repo: "owner/another-repo"
+    profile: "recursive"
+    labels: ["bug", "ai"]

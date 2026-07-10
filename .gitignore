@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# issue-keeper 运行时
+config.yaml
+state.json
+.issue-keeper/
+
+# 编辑器
+.DS_Store
+.idea/
+.vscode/
