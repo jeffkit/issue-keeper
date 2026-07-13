@@ -262,10 +262,13 @@ def main(argv: list[str] | None = None) -> int:
     keeper_parser.add_argument("--log-level", default="INFO",
                                choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
-    # dashboard（后续轮次实现）
-    dash_parser = subparsers.add_parser("dashboard", help="启动 Web 看板（即将实现）")
+    # dashboard（Web 看板，读 internal.db）
+    dash_parser = subparsers.add_parser("dashboard", help="启动 Web 看板（读 internal source）")
     dash_parser.add_argument("--port", type=int, default=7433)
-    dash_parser.add_argument("--db", help="SQLite 路径")
+    dash_parser.add_argument("--host", default="127.0.0.1")
+    dash_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
+    dash_parser.add_argument("--agent-label", default="dashboard",
+                             help="dashboard 在 db 里发评论/改状态时用的身份（默认 dashboard）")
 
     # internal source 管理
     internal_parser = subparsers.add_parser("internal", help="管理 internal source 的 issue")
@@ -314,7 +317,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "internal":
         return _run_internal(args)
     if args.cmd == "dashboard":
-        print("dashboard 即将实现（下一轮）", file=sys.stderr)
+        from .dashboard import run_dashboard
+        from .sources.internal import DEFAULT_DB
+        db_path = args.db or str(DEFAULT_DB)
+        run_dashboard(db_path, host=args.host, port=args.port,
+                      agent_label=args.agent_label)
         return 0
 
     return 2

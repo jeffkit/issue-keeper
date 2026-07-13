@@ -129,7 +129,7 @@ python -m issue_keeper internal projects
   review → done  by alpha-agent（agent）  备注: 自动 review 通过
 ```
 
-> Web 看板（dashboard）即将实现：FastAPI 后端 + React 前端，支持拖拽改状态。
+> Web 看板（dashboard）已实现：FastAPI 后端 + Vite/React 前端，支持拖拽改状态，见下文「Web 看板」一节。
 
 ## 安全过滤（screener）
 
@@ -224,9 +224,47 @@ CLI 不依赖 `config.yaml`，直接用 `--db` 指定 SQLite 路径（或默认 
 
 **当前不做**（留给后续）：
 
-- Web dashboard（`web_url` 暂返回空串）
 - HTTP server（让外部系统通过 HTTP 提 issue）
 - 用户认证系统
+
+### Web 看板（dashboard）
+
+读 internal.db 的 Web 看板，支持拖拽改状态、点开看详情/评论/状态历史、新建 issue、加评论。后端 FastAPI，前端 Vite + React（`@dnd-kit` 拖拽）。
+
+**首次使用需构建前端**：
+
+```bash
+cd frontend
+npm install
+npm run build        # 产出 frontend/dist/，由后端一并托管
+```
+
+**启动**：
+
+```bash
+# 默认读 ~/.issue-keeper/internal.db，监听 127.0.0.1:7433
+python -m issue_keeper dashboard
+
+# 自定义端口 / db / 操作身份
+python -m issue_keeper dashboard --port 8080 --db /path/to/internal.db --agent-label alice
+```
+
+浏览器打开 `http://127.0.0.1:7433` 即可。顶栏可切项目、切 issue/PR、设置「当前身份」（你以谁的名义发评论/改状态，会存 localStorage）。卡片在六列之间拖拽即触发 `move`；点卡片标题打开详情面板。
+
+**开发模式**（改前端代码热更新）：
+
+```bash
+# 终端 1：后端
+python -m issue_keeper dashboard --port 7433
+# 终端 2：前端 dev server（5173），/api 代理到 7433
+cd frontend && npm run dev
+```
+
+开发时打开 `http://127.0.0.1:5173`。后端开 CORS 允许前端跨域。
+
+> 若未构建前端就启动 dashboard，根路径会提示去 `npm run build`，但 `/api` 仍可用。
+
+dashboard 不依赖 `config.yaml`，直接用 `--db` 指向 internal source 的 SQLite。
 
 ### PR 支持
 
