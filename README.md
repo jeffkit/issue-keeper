@@ -283,8 +283,8 @@ dashboard 不依赖 `config.yaml`，直接用 `--db` 指向 internal source 的 
 ## 前置依赖
 
 - Python 3.11+，安装依赖：`pip install -r requirements.txt`
-- `agentproc` CLI 已安装（`npm install -g agentproc`）—— 用于调 agent
-- 至少一个 AgentProc profile：`binding.profile` 可以是 hub 名（如 `deepseek`/`claude-code`/`kimi-code`，agentproc 自动拉取缓存），或本地 `.yaml` 路径
+- `agentproc` CLI 已安装——用于调 agent。推荐 PyPI 包（wire 0.3，含 hub 缓存 `_shared` 修复）：`pip install "agentproc>=0.7.1"`；旧版 npm 包 `npm install -g agentproc`（0.4.x，wire 0.2）也能跑但建议升级。若 PATH 上 `agentproc` 解析到非预期版本，用环境变量 `AGENTPROC_BIN=/abs/path/agentproc` 显式指定
+- 至少一个 AgentProc profile：`binding.profile` 可以是 hub 名（如 `claude-code`，agentproc 自动从 CDN 拉取并缓存），或本地 `.yaml` 路径
 - 对应 agent CLI 已安装并配好凭据（如 `deepseek` CLI + `DEEPSEEK_API_KEY`、`claude` CLI + `ANTHROPIC_API_KEY`）。凭据通过 `binding.env` 注入，支持 `${VAR}` 插值
 - `gh` CLI 已安装并登录 —— 仅 `source: github_cli` 需要
 - `source: github_token` 需要一个 PAT（classic 或 fine-grained），配在 `github_token` 字段或 `GITHUB_TOKEN` 环境变量
@@ -344,7 +344,7 @@ repos:
 - `--session <session_id>`：续接同一 issue/PR 的 agent 会话
 - `--from <agent_from_user>`：来源标识
 - `--prompt <message>`：消息直接以参数传入。注：agentproc 的 `--stdin` 在 0.4.0 和 0.7.0（wire 0.3）实测均读不到消息（message 为空），故用 `--prompt`；代价是长消息受命令行长度限制，常见 issue body 量级无影响
-- `binding.env`：额外环境变量（API key、模型等），支持 `${VAR}` 插值
+- `--env KEY=VALUE`：`binding.env` 里每个变量都经 `--env` 透传给 agent。**agentproc 0.7.0+ 不再继承父进程全量 env**（只传 infra 集 + profile env 块的 allowlist 变量 + CLI `--env`），所以非 allowlist 的变量（如 `ANTHROPIC_BASE_URL`）必须走 `--env` 才能到 agent；0.4.x 也支持 `--env`，故两版兼容
 
 agent 收到的消息会明确告诉它：
 
