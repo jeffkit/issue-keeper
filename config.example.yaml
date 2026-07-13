@@ -1,38 +1,107 @@
 # issue-keeper 配置文件
-# 把本地 bridge profile 绑定到 GitHub 仓库；程序监控这些仓库的 issue，
-# 发现有新 issue 或新评论时，按 P0 协议调用对应 profile 的 agent 处理，
-# 并把 agent 的 stdout 作为评论发到 issue。
+# 把 AgentProc profile 绑定到仓库；程序监控这些仓库的 issue（可选 PR），
+# 发现有新 issue/PR 或新评论时，先过一道安全过滤（screener），
+# 再通过 agentproc CLI 调用对应 profile 的 agent 处理，并把 agent 的回复作为评论发回。
 
 # daemon 模式的轮询间隔（秒）。--once 模式忽略此值。
 poll_interval_secs: 300
 
-# 状态文件路径：记录每个仓库已处理的 issue / 评论 / agent 会话。
-# 支持 ~ 展开。
+# 状态文件路径：记录每个仓库已处理的 issue/PR / 评论 / agent 会话。
 state_file: ~/.issue-keeper/state.json
 
-# agent 回复在 GitHub 评论里携带的隐藏标记，用于识别"bot 自己发的评论"，
-# 避免监控循环触发自己。会以 HTML 注释形式 prepend 到评论正文前面。
+# agent 发出的评论里携带的隐藏标记。三层防循环之第一层（机器识别）。
 bot_marker: "<!-- issue-keeper-bot -->"
 
-# 调用 agent 时的整体超时（秒）。可被 profile YAML 里的 timeout_secs 覆盖。
+# 调用 agent 时的整体超时（秒）。
 default_timeout_secs: 600
 
-# 调用 agent 时写入 AGENT_FROM_USER 的值（来源标识）。
+# 调用 agent 时写入 AGENT_FROM_USER 的值；也作为 agent_label 的 fallback。
 agent_from_user: "issue-keeper"
 
-# 仓库 -> profile 绑定列表
+# 默认 review agent：人提的 issue 处理完后，由这个 agent 先 review。
+# 为空则人提的 issue 处理完停在 review 状态等人接手。
+# 每个 repo 也可单独配 review_agent 覆盖此全局默认。
+default_review_agent: "reviewer-agent"
+
+# ─── 安全过滤层（screener）────────────────────────────────────────────
+# 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。
+# 这一层在 keeper 进程内完成，不起子进程、无本地权限。
+#
+# provider: openai     —— OpenAI 兼容（DeepSeek / OpenAI / Moonshot 等）。默认。
+# provider: anthropic  —— Anthropic messages API。
+#
+# fail-safe：必须显式声明 screener.enabled。不写 screener 段 = 启动报错。
+screener:
+  enabled: true
+  provider: openai
+  api_key: ${DEEPSEEK_API_KEY}
+  base_url: "https://api.deepseek.com/v1"
+  model: deepseek-chat
+  on_unsafe: skip        # skip（默认）/ comment
+  max_chars: 8000
+
+# ─── 仓库 -> profile 绑定 ─────────────────────────────────────────────
 repos:
-  - repo: "owner/repo-name"           # GitHub 仓库全名（owner/name）
-    profile: "ilink-claude"            # ~/.ilink-hub-bridge/profiles/<name>.yaml 的 stem
-    # 可选：只监控带这些 label 的 issue；留空 / 不写 = 监控全部
+  # GitHub 仓库示例
+  - repo: "owner/repo-name"
+    profile: "deepseek"                  # AgentProc profile（hub 名或本地 .yaml 路径）
+    source: github_token                 # 或 github_cli
+    github_token: ${GITHUB_TOKEN}
+    agent_label: "proj-a-agent"
+    cwd: ~/projects/proj-a               # agent 工作目录（动态指定，一个 hub profile 通吃）
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_MODEL: deepseek-v4-pro
     labels: []
-    # 可选：覆盖全局轮询间隔
-    # poll_interval_secs: 600
-    # 可选：该仓库 issue 的 agent 会话 id 前缀（默认 issue-keeper）
-    # session_prefix: "issue-keeper"
-    # 可选：覆盖默认超时
+    monitor_prs: false
+    # pr_labels: ["ai"]
     # timeout_secs: 900
 
-  - repo: "owner/another-repo"
-    profile: "recursive"
-    labels: ["bug", "ai"]
+  # ─── 自建 issue 系统示例（agent 之间互相沟通）────────────────────────
+  - repo: "proj-alpha"                   # 任意项目名
+    profile: "deepseek"
+    source: internal
+    agent_label: "alpha-agent"           # 必填：agent 身份标签，也是 self_identity
+    cwd: ~/projects/proj-alpha           # agent 在这个项目代码里跑
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_MODEL: deepseek-v4-pro
+    # review_agent: "alpha-agent"        # 该仓库专用 review agent（覆盖全局 default_review_agent）
+    # internal_db: ~/.issue-keeper/internal.db   # 可选：覆盖默认 SQLite 路径
+    monitor_prs: false
+
+  - repo: "proj-beta"
+    profile: "deepseek"
+    source: internal
+    agent_label: "beta-agent"
+    cwd: ~/projects/proj-beta
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_MODEL: deepseek-v4-pro
+    monitor_prs: false
+
+# ─── 防循环机制（三层保险）───────────────────────────────────────────
+# 1. 评论/资源正文含 bot_marker（隐藏 HTML 注释）
+# 2. 评论/资源正文含可见前缀 [issue-keeper:<agent_label>]
+# 3. 评论/资源的 author == 当前 source 身份（self_identity）
+# 任一命中即跳过。资源层（issue 本体）也识别 marker：
+# AI 自己提的 issue 不触发首次回复，但评论层照常——别人/别的 agent 来评论仍触发。
+
+# ─── 状态机（仅 internal source）─────────────────────────────────────
+# issue 有 6 个状态：inbox / todo / doing / review / done / closed
+# 流转规则（keeper 自动）：
+#   人提的 issue 新建 → inbox
+#   agent 提的 issue 新建 → todo
+#   keeper 开始调 agent → doing
+#   agent 回复完 → review
+#   review 通过 → done
+#   close → closed
+#
+# review 规则：
+#   - agent 提的 issue → 该 agent 自己 review（下轮自动通过）
+#   - 人提的 issue → 由 default_review_agent（或 repo 的 review_agent）先 review
+#     需要人二次 review 时人接手
+#
+# CLI 改状态：python -m issue_keeper internal move <project> <number> --status <状态>
+# CLI 看板：  python -m issue_keeper internal board <project>
+

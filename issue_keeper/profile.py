@@ -1,50 +1,46 @@
-"""解析 bridge profile YAML 并按 P0 协议调用 agent。
+"""通过 agentproc CLI 调用 agent。
 
-P0 协议：bridge 通过 env var 传入输入，handler 向 stdout 写出输出。
-输入 env: AGENT_MESSAGE / AGENT_SESSION_ID / AGENT_SESSION_NAME /
-         AGENT_FROM_USER / AGENT_CONTEXT_TOKEN
-stdout:  可选首行 `AGENT_SESSION:<uuid>`，其余为回复正文。
+issue-keeper 不再直接读 bridge profile YAML，而是调 `agentproc` CLI，
+由 agentproc 负责加载 profile（hub 名或本地路径）、驱动 agent 子进程、
+解析 AgentProc 协议输出。
+
+profile 字段语义（binding.profile）：
+- 简短名字（如 "deepseek"、"claude-code"）→ 当作 hub profile 名，
+  agentproc 自动从 hub 拉取并缓存。等价于 `agentproc hub run <name>`。
+- 文件路径（如 "./profiles/glm.yaml" 或 "/abs/path/x.yaml"）→ 当作本地
+  profile 路径，等价于 `agentproc --profile <path>`。
+
+凭据：通过 binding.env 注入子进程环境，支持 ${VAR} 插值。profile 自身的
+env_allowlist 决定哪些 env 真正传到 agent 子进程（由 agentproc/profile 控制）。
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import shlex
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
-import yaml
+log = logging.getLogger("issue-keeper.profile")
 
-PROFILES_DIR = Path.home() / ".ilink-hub-bridge" / "profiles"
-
-_RUNTIME_BY_EXT = {
-    ".py": ["python3"],
-    ".js": ["node"],
-    ".mjs": ["node"],
-    ".ts": ["npx", "tsx"],
-    ".sh": ["bash"],
-    ".bash": ["bash"],
-    ".rb": ["ruby"],
-}
+AGENTPROC_BIN = os.environ.get("AGENTPROC_BIN", "agentproc")
 
 
 @dataclass
 class ProfileEntry:
-    """解析后的一条 profile（default profile 对应的执行单元）。"""
+    """一个 binding 对应的 agent 调用配置。
 
-    name: str
-    kind: str  # "claude-code" | "script" | "command"
-    cwd: Path | None
-    env: dict[str, str]
-    timeout_secs: int | None
-    # command 模式
-    command: str | None = None
-    args: list[str] | None = None
-    stdin_mode: str = "none"
-    # script 模式
-    script: str | None = None
+    issue-keeper 不再解析 profile YAML 内容——那交给 agentproc。
+    这里只保留 issue-keeper 调 agentproc 时需要的参数。
+    """
+
+    name: str  # 原始 profile 字段值（hub 名或路径），用于日志/缓存 key
+    is_hub: bool  # True=hub 名，False=本地路径
+    cwd: str | None  # agent 工作目录（binding.cwd）
+    env: dict[str, str] = field(default_factory=dict)  # 额外 env（支持 ${VAR} 已展开）
+    timeout_secs: int | None = None
 
 
 @dataclass
@@ -53,105 +49,89 @@ class AgentReply:
     text: str               # 回复正文
 
 
-def _resolve_profile_path(profile_name: str) -> Path:
-    p = PROFILES_DIR / f"{profile_name}.yaml"
-    if not p.exists():
-        # 兼容 .yml
-        yml = PROFILES_DIR / f"{profile_name}.yml"
-        if yml.exists():
-            return yml
-        raise FileNotFoundError(
-            f"找不到 profile YAML: {p}（也在 {PROFILES_DIR} 下未发现 {profile_name}.yml）"
-        )
-    return p
+def _expand_env(value: str) -> str:
+    """展开 ${VAR}。"""
+    s = str(value)
+    for k, mv in os.environ.items():
+        s = s.replace(f"${{{k}}}", mv)
+    return s
 
 
-def load_profile(profile_name: str) -> ProfileEntry:
-    """读取 profile YAML，解析出 default profile 对应的执行单元。"""
-    path = _resolve_profile_path(profile_name)
-    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    profiles: dict[str, Any] = raw.get("profiles") or {}
-    if not profiles:
-        raise ValueError(f"profile {profile_name} 缺少 profiles 段")
+def load_profile(binding) -> ProfileEntry:
+    """根据 binding 解析出 ProfileEntry。
 
-    routing = raw.get("routing") or {}
-    default_name = routing.get("default_profile")
-    if not default_name:
-        # 取第一个 profile 作为默认
-        default_name = next(iter(profiles))
-    entry_raw = profiles.get(default_name)
-    if not entry_raw:
-        raise ValueError(f"profile {profile_name} 找不到 default_profile '{default_name}'")
+    binding.profile 可以是：
+      - hub 名（deepseek / claude-code / kimi-code / ...）
+      - 本地 .yaml 路径
 
-    cwd_raw = entry_raw.get("cwd")
-    cwd = Path(cwd_raw).expanduser() if cwd_raw else None
-
-    env = {str(k): str(v) for k, v in (entry_raw.get("env") or {}).items()}
-
-    if entry_raw.get("command"):
-        kind = "command"
-    elif entry_raw.get("script"):
-        kind = "script"
-    elif entry_raw.get("type"):
-        kind = entry_raw["type"]
-    else:
-        raise ValueError(f"profile {profile_name}/{default_name} 未提供 type/script/command")
+    binding.cwd 决定 agent 工作目录。
+    binding.env 是额外环境变量（${VAR} 已在 config 层展开过，这里直接用）。
+    """
+    raw = binding.profile.strip()
+    is_hub = True
+    # 启发式判断：包含路径分隔符或以 . 开头或后缀是 .yaml/.yml，当作本地路径
+    if "/" in raw or "\\" in raw or raw.endswith(".yaml") or raw.endswith(".yml"):
+        is_hub = False
+        p = Path(raw).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"profile 本地路径不存在: {p}")
 
     return ProfileEntry(
-        name=default_name,
-        kind=kind,
-        cwd=cwd,
-        env=env,
-        timeout_secs=int(entry_raw["timeout_secs"]) if entry_raw.get("timeout_secs") else None,
-        command=entry_raw.get("command"),
-        args=list(entry_raw.get("args") or []),
-        stdin_mode=entry_raw.get("stdin") or "none",
-        script=entry_raw.get("script"),
+        name=raw,
+        is_hub=is_hub,
+        cwd=binding.cwd or None,
+        env=dict(getattr(binding, "env", None) or {}),
+        timeout_secs=getattr(binding, "timeout_secs", None),
     )
 
 
-def _build_command(entry: ProfileEntry, message: str, session_id: str) -> list[str]:
-    """根据 entry 类型构造要执行的命令。"""
-    if entry.kind == "claude-code":
-        # 内置类型：交给 ilink-hub-bridge profile claude-code 运行
-        bridge_bin = os.environ.get("ILINK_HUB_BRIDGE_BIN", "ilink-hub-bridge")
-        return [bridge_bin, "profile", "claude-code"]
+def _build_command(entry: ProfileEntry, message: str, session_id: str,
+                   *, from_user: str = "issue-keeper",
+                   default_timeout: int = 600) -> list[str]:
+    """构造 agentproc 调用命令。
 
-    if entry.kind == "script" and entry.script:
-        script_path = Path(entry.script).expanduser()
-        runtime = _RUNTIME_BY_EXT.get(script_path.suffix.lower())
-        if runtime:
-            return [*runtime, str(script_path)]
-        # 未知扩展名：直接执行（需 chmod +x）
-        return [str(script_path)]
+    hub 名：agentproc hub run <name> --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
+    本地：  agentproc --profile <path>   --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
 
-    if entry.kind == "command" and entry.command:
-        # command + args，替换占位符
-        cmd = [entry.command, *entry.args]
-        cmd = [
-            c.replace("{{MESSAGE}}", message)
-              .replace("{{SESSION_ID}}", session_id)
-              .replace("{{SESSION_NAME}}", "default")
-            for c in cmd
-        ]
-        # command 可能含空格（如 "claude -p"），用 shlex 拆分首段
-        first = shlex.split(cmd[0])
-        return [*first, *cmd[1:]]
+    prompt 用 --stdin 传，避免命令行长度限制 + 转义问题。
+    """
+    if entry.is_hub:
+        cmd = [AGENTPROC_BIN, "hub", "run", entry.name]
+    else:
+        cmd = [AGENTPROC_BIN, "--profile", entry.name]
 
-    raise ValueError(f"无法为 profile kind='{entry.kind}' 构造命令")
+    cmd += ["--stdin", "--quiet"]
+    if entry.cwd:
+        cmd += ["--cwd", entry.cwd]
+    if session_id:
+        cmd += ["--session", session_id]
+    if from_user:
+        cmd += ["--from", from_user]
+    if entry.timeout_secs:
+        cmd += ["--timeout", str(entry.timeout_secs)]
+    elif default_timeout:
+        cmd += ["--timeout", str(default_timeout)]
+    return cmd
 
 
-def _parse_reply(stdout: str) -> AgentReply:
-    """解析 stdout：可选首行 AGENT_SESSION:<uuid>，其余为正文。"""
-    if not stdout:
-        return AgentReply(session_id=None, text="")
-    lines = stdout.splitlines()
+def _parse_reply(stdout: str, stderr: str) -> AgentReply:
+    """解析 agentproc 输出。
+
+    agentproc 的输出契约（来自 --help）：
+      stderr → 协议行（AGENT_PARTIAL:, AGENT_SESSION:, AGENT_ERROR:）
+      stdout → 最终回复正文（非协议行）
+      最终 session id 印在 stderr 的 `agentproc:session:<id>` 行
+
+    我们用 --quiet 抑制协议行，但 `agentproc:session:<id>` 仍会在 stderr。
+    stdout 整体作为回复正文。
+    """
+    text = stdout.strip()
     session_id = None
-    start = 0
-    if lines and lines[0].startswith("AGENT_SESSION:"):
-        session_id = lines[0][len("AGENT_SESSION:"):].strip() or None
-        start = 1
-    text = "\n".join(lines[start:]).strip()
+    for line in stderr.splitlines():
+        # 形如 "agentproc:session:abc-123"
+        if line.startswith("agentproc:session:"):
+            session_id = line[len("agentproc:session:"):].strip() or None
+            break
     return AgentReply(session_id=session_id, text=text)
 
 
@@ -162,40 +142,47 @@ def invoke_agent(
     *,
     from_user: str = "issue-keeper",
     default_timeout: int = 600,
-    context_token: str = "issue-keeper",
 ) -> AgentReply:
-    """按 P0 协议调用 agent，返回 AgentReply。"""
-    timeout = entry.timeout_secs if entry.timeout_secs else default_timeout
+    """调 agent，返回 AgentReply。
+
+    子进程的 env = 当前 env + binding.env（凭据等）。
+    agentproc/profile 的 env_allowlist 决定哪些真正传到 agent 子进程。
+    """
+    cmd = _build_command(entry, message, session_id or "",
+                        from_user=from_user, default_timeout=default_timeout)
+    log.debug("调 agentproc: %s", " ".join(shlex.quote(c) for c in cmd[:6]) + " ...")
 
     env = os.environ.copy()
-    # P0 输入 env
-    env["AGENT_MESSAGE"] = message
-    env["AGENT_SESSION_ID"] = session_id or ""
-    env["AGENT_SESSION_NAME"] = "default"
-    env["AGENT_FROM_USER"] = from_user
-    env["AGENT_CONTEXT_TOKEN"] = context_token
-    # profile 自定义 env
     env.update(entry.env)
 
-    cmd = _build_command(entry, message, session_id)
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=message,
+            capture_output=True,
+            text=True,
+            cwd=entry.cwd or None,
+            env=env,
+            timeout=default_timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"agent 超时 ({default_timeout}s): cmd={' '.join(cmd[:4])}..."
+        ) from e
 
-    stdin_data = None
-    if entry.stdin_mode == "message":
-        stdin_data = message
-
-    proc = subprocess.run(
-        cmd,
-        input=stdin_data,
-        capture_output=True,
-        text=True,
-        cwd=str(entry.cwd) if entry.cwd else None,
-        env=env,
-        timeout=timeout,
-    )
     if proc.returncode != 0:
         raise RuntimeError(
-            f"agent 执行失败 (profile kind={entry.kind}): exit={proc.returncode}\n"
-            f"cmd: {' '.join(cmd)}\n"
+            f"agent 执行失败 (profile={entry.name}): exit={proc.returncode}\n"
+            f"cmd: {' '.join(cmd[:6])}...\n"
             f"stderr: {proc.stderr.strip()[:2000]}"
         )
-    return _parse_reply(proc.stdout)
+
+    # 即使 exit=0，agentproc 也可能在 stderr 报 AGENT_ERROR
+    if "AGENT_ERROR:" in proc.stderr:
+        for line in proc.stderr.splitlines():
+            if line.startswith("AGENT_ERROR:"):
+                log.warning("agent 报错: %s", line)
+                # 不 raise——有些 agent 错误仍带部分输出；让 keeper 决定要不要发
+                break
+
+    return _parse_reply(proc.stdout, proc.stderr)

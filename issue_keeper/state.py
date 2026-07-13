@@ -1,4 +1,9 @@
-"""已处理 issue / 评论 / agent 会话的状态持久化。"""
+"""已处理 issue / PR / 评论 / agent 会话的状态持久化。
+
+资源 key 规范：
+- issue: 纯数字字符串（如 "42"），与历史 state.json 兼容
+- PR:    "pr:42"，与 issue 隔离会话与处理进度
+"""
 
 from __future__ import annotations
 
@@ -9,20 +14,21 @@ from typing import Any
 
 
 @dataclass
-class IssueState:
-    processed: bool = False  # issue 本体（首次创建）是否已处理
+class ItemState:
+    processed: bool = False  # 资源本体（首次创建）是否已处理
     session_id: str | None = None  # agent 返回的会话 uuid，用于续接
     processed_comment_ids: set[str] = field(default_factory=set)
+    blocked: bool = False  # 安全过滤命中，后续不再自动处理
 
 
 @dataclass
 class RepoState:
-    issues: dict[int, IssueState] = field(default_factory=dict)
+    items: dict[str, ItemState] = field(default_factory=dict)
 
-    def issue(self, number: int) -> IssueState:
-        if number not in self.issues:
-            self.issues[number] = IssueState()
-        return self.issues[number]
+    def item(self, key: str) -> ItemState:
+        if key not in self.items:
+            self.items[key] = ItemState()
+        return self.items[key]
 
 
 @dataclass
@@ -42,12 +48,14 @@ def load_state(path: Path) -> State:
     state = State()
     for repo_slug, rdata in (raw.get("repos") or {}).items():
         rs = state.repo(repo_slug)
-        for num_str, idata in (rdata.get("issues") or {}).items():
-            num = int(num_str)
-            is_ = rs.issue(num)
-            is_.processed = bool(idata.get("processed", False))
-            is_.session_id = idata.get("session_id")
-            is_.processed_comment_ids = set(str(x) for x in (idata.get("processed_comment_ids") or []))
+        # 兼容旧字段名 issues
+        items_src = (rdata.get("items") or rdata.get("issues") or {})
+        for key, idata in items_src.items():
+            it = rs.item(str(key))
+            it.processed = bool(idata.get("processed", False))
+            it.session_id = idata.get("session_id")
+            it.processed_comment_ids = set(str(x) for x in (idata.get("processed_comment_ids") or []))
+            it.blocked = bool(idata.get("blocked", False))
     return state
 
 
@@ -56,13 +64,14 @@ def save_state(path: Path, state: State) -> None:
     raw: dict[str, Any] = {"repos": {}}
     for repo_slug, rs in state.repos.items():
         raw["repos"][repo_slug] = {
-            "issues": {
-                str(num): {
-                    "processed": is_.processed,
-                    "session_id": is_.session_id,
-                    "processed_comment_ids": sorted(is_.processed_comment_ids),
+            "items": {
+                key: {
+                    "processed": it.processed,
+                    "session_id": it.session_id,
+                    "processed_comment_ids": sorted(it.processed_comment_ids),
+                    "blocked": it.blocked,
                 }
-                for num, is_ in rs.issues.items()
+                for key, it in rs.items.items()
             }
         }
     path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
