@@ -39,10 +39,25 @@ _AGENT_PREAMBLE = (
     "你有 bash 等工具能力（在当前工作目录下运行）。如果需要跨项目沟通，"
     "可以用 bash 调用 issue-keeper 的 CLI 给别的项目提 issue：\n"
     "  python -m issue_keeper internal create <项目名> --title \"标题\" --body \"正文\" --author {agent_label}\n"
-    "其中 <项目名> 是配置里出现的 repo 名（如 proj-alpha、proj-beta），"
     "--author 必须用你自己的身份标签（{agent_label}），这样对方才知道是你去的。\n"
     "跨项目提 issue 是可选的——只在确实需要别的项目协同时才用。"
+    "可跨项目提 issue 的目标 <项目名> 见下方「可用项目」列表（标「（你自己）」的是你当前所在项目）。"
 )
+
+
+def _roster(config: Config, current_repo: str) -> str:
+    """列出所有项目及其 agent 身份，供当前 agent 跨项目提 issue 时参考。"""
+    lines = []
+    for b in config.repos:
+        label = b.agent_label or config.agent_from_user or "issue-keeper"
+        tag = "（你自己）" if b.repo == current_repo else ""
+        lines.append(f"  - {b.repo}（agent：{label}）{tag}")
+    return "可用项目：\n" + "\n".join(lines)
+
+
+def _preamble(binding: RepoBinding, config: Config, agent_label: str) -> str:
+    """组装给 agent 的系统提示（含跨项目花名册）。"""
+    return _AGENT_PREAMBLE.format(agent_label=agent_label) + "\n" + _roster(config, binding.repo)
 
 
 def _agent_label(binding: RepoBinding, config: Config) -> str:
@@ -56,14 +71,14 @@ def _visible_prefix(binding: RepoBinding, config: Config) -> str:
 
 
 def _compose_new_message(
-    binding: RepoBinding, res: Resource, src: IssueSource, agent_label: str
+    binding: RepoBinding, res: Resource, src: IssueSource, agent_label: str, config: Config
 ) -> str:
     """新 issue/PR 时发给 agent 的消息正文。"""
     labels = ", ".join(res.labels) if res.labels else "（无）"
     url = src.web_url(binding.repo, res)
     url_line = f"链接：{url}\n" if url else ""
     return (
-        f"{_AGENT_PREAMBLE.format(agent_label=agent_label)}\n\n"
+        f"{_preamble(binding, config, agent_label)}\n\n"
         f"---\n\n"
         f"项目 {binding.repo} 收到新 {res.noun} #{res.number}：\n"
         f"标题：{res.title}\n"
@@ -77,13 +92,14 @@ def _compose_new_message(
 
 
 def _compose_comment_message(
-    binding: RepoBinding, res: Resource, comment, src: IssueSource, agent_label: str
+    binding: RepoBinding, res: Resource, comment, src: IssueSource, agent_label: str,
+    config: Config,
 ) -> str:
     """issue/PR 有新评论时发给 agent 的消息正文。"""
     url = comment.url or src.web_url(binding.repo, res)
     url_line = f"链接：{url}\n" if url else ""
     return (
-        f"{_AGENT_PREAMBLE.format(agent_label=agent_label)}\n\n"
+        f"{_preamble(binding, config, agent_label)}\n\n"
         f"---\n\n"
         f"项目 {binding.repo} 的 {res.noun} #{res.number} 有新评论：\n"
         f"标题：{res.title}\n"
@@ -243,7 +259,7 @@ def _process_resource(
             log.info("[%s] %s 由当前账号 %s 创建，跳过首次回复", label, kind, me)
             it.processed = True
         else:
-            message = _compose_new_message(binding, res, src, _agent_label(binding, config))
+            message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
 
             if screener.enabled and not _screen_or_block(message, screener, source):
@@ -301,7 +317,7 @@ def _process_resource(
             it.processed_comment_ids.add(c.id)
             continue
 
-        message = _compose_comment_message(binding, res, c, src, _agent_label(binding, config))
+        message = _compose_comment_message(binding, res, c, src, _agent_label(binding, config), config)
         source = f"{label} comment {c.id}"
 
         if screener.enabled and not _screen_or_block(message, screener, source):
