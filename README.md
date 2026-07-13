@@ -363,6 +363,15 @@ python -m issue_keeper keep --config config.yaml --once --log-level DEBUG
 python -m issue_keeper internal create proj-a --title "..." --body "..." --author alice
 python -m issue_keeper internal list proj-a
 python -m issue_keeper internal show proj-a 1
+
+# 启动 Web 看板
+python -m issue_keeper dashboard            # 默认 127.0.0.1:7433
+```
+
+## 测试
+
+```bash
+python -m pytest -q                         # 51 个用例：screener / config / internal / 防循环 / dashboard API
 ```
 
 ## 状态文件
