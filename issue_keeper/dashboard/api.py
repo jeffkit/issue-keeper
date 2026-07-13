@@ -115,6 +115,24 @@ def list_statuses() -> list[str]:
     return list(STATUSES)
 
 
+@router.get("/team")
+def list_team(request: Request) -> list[dict[str, Any]]:
+    """列出团队成员（agent 花名册 + 自我介绍）。读 team.json。"""
+    from ..team import DEFAULT_TEAM_PATH, load_team
+
+    team_path = getattr(request.app.state, "team_path", None) or str(DEFAULT_TEAM_PATH)
+    members = load_team(team_path)
+    return [
+        {
+            "project": m.project,
+            "agent_label": m.agent_label,
+            "cwd": m.cwd,
+            "intro": m.intro,
+        }
+        for m in members
+    ]
+
+
 @router.get("/projects")
 def list_projects(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
     """列出所有项目及其 issue 计数。"""

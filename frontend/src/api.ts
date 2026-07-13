@@ -5,6 +5,7 @@ import type {
   Status,
   ActorType,
   Kind,
+  TeamMember,
 } from "./types";
 
 // 同源 / 开发代理都走 /api 相对路径
@@ -21,6 +22,10 @@ async function j<T>(resP: Promise<Response>): Promise<T> {
 
 export function listProjects(): Promise<Project[]> {
   return j(fetch(`${BASE}/projects`));
+}
+
+export function listTeam(): Promise<TeamMember[]> {
+  return j(fetch(`${BASE}/team`));
 }
 
 export function listIssues(project: string, kind: Kind = "issue"): Promise<Issue[]> {

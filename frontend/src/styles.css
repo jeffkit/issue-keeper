@@ -53,6 +53,25 @@ body {
   gap: 8px;
 }
 .logo { color: var(--accent); }
+.view-tabs {
+  display: inline-flex;
+  margin-left: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.view-tabs .tab {
+  padding: 4px 12px;
+  font-size: 13px;
+  background: transparent;
+  color: var(--muted, #888);
+  border: none;
+  cursor: pointer;
+}
+.view-tabs .tab.active {
+  background: var(--accent);
+  color: #fff;
+}
 .controls {
   display: flex;
   align-items: center;
@@ -233,6 +252,50 @@ button.mini.danger { color: var(--danger); }
   box-shadow: 0 16px 48px rgba(0,0,0,0.5);
 }
 .detail { max-height: calc(100vh - 80px); overflow-y: auto; }
+
+/* ── 团队成员 ─────────────────────────────── */
+.team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+  padding: 8px 4px;
+}
+.team-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.team-avatar {
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--accent), #6a5acd);
+  color: #fff;
+  font-weight: 700;
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.team-body { flex: 1; min-width: 0; }
+.team-name { font-weight: 600; font-size: 15px; }
+.team-project { font-size: 12px; color: var(--muted, #888); margin-bottom: 8px; }
+.team-intro { font-size: 13px; line-height: 1.55; margin: 0 0 8px; color: var(--text); }
+.team-intro.empty { color: var(--muted, #888); font-style: italic; }
+.team-cwd {
+  font-size: 11px;
+  color: var(--muted, #888);
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .detail-head {
   display: flex;
   justify-content: space-between;

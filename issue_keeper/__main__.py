@@ -252,6 +252,49 @@ def _add_internal_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
 
 
+def _run_team(args) -> int:
+    """团队成员管理 CLI。"""
+    from .team import load_team, set_intro, sync_from_config, to_json
+
+    if args.team_cmd == "sync":
+        try:
+            config = load_config(args.config)
+        except Exception as e:
+            print(f"加载配置失败: {e}", file=sys.stderr)
+            return 2
+        members = sync_from_config(config, args.team)
+        print(f"已同步 {len(members)} 个团队成员到 {args.team or '~/.issue-keeper/team.json'}：")
+        for m in members:
+            intro_tag = "（有介绍）" if m.intro else "（无介绍）"
+            print(f"  {m.agent_label:20} 项目={m.project}  {intro_tag}")
+        return 0
+
+    if args.team_cmd == "set-intro":
+        m = set_intro(args.agent_label, args.intro, args.team)
+        if m is None:
+            print(f"找不到 agent_label={args.agent_label}，请先 `team sync` 生成花名册",
+                  file=sys.stderr)
+            return 1
+        print(f"已设置 {m.agent_label} 的介绍（{len(m.intro)} 字）")
+        return 0
+
+    if args.team_cmd == "list":
+        members = load_team(args.team)
+        if not members:
+            print("团队为空。请先 `team sync --config config.yaml` 生成花名册。")
+            return 0
+        print(f"团队成员（共 {len(members)} 个，来源 {args.team or '~/.issue-keeper/team.json'}）：")
+        for m in members:
+            print(f"\n  {m.agent_label}")
+            print(f"    项目: {m.project}")
+            if m.cwd:
+                print(f"    工作目录: {m.cwd}")
+            print(f"    介绍: {m.intro or '（待生成）'}")
+        return 0
+
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="issue-keeper",
@@ -273,6 +316,23 @@ def main(argv: list[str] | None = None) -> int:
     dash_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
     dash_parser.add_argument("--agent-label", default="dashboard",
                              help="dashboard 在 db 里发评论/改状态时用的身份（默认 dashboard）")
+    dash_parser.add_argument("--team",
+                             help=f"团队成员 JSON 路径（默认 {Path.home()}/.issue-keeper/team.json）")
+
+    # 团队成员管理
+    team_parser = subparsers.add_parser("team", help="管理团队成员（agent 花名册 + 介绍）")
+    team_parser.add_argument("--team",
+                             help=f"team.json 路径（默认 {Path.home()}/.issue-keeper/team.json）")
+    team_sub = team_parser.add_subparsers(dest="team_cmd", required=True)
+
+    p_sync = team_sub.add_parser("sync", help="从 config.yaml 同步 agent 花名册（保留已有介绍）")
+    p_sync.add_argument("--config", "-c", required=True)
+
+    p_intro = team_sub.add_parser("set-intro", help="设置某 agent 的自我介绍")
+    p_intro.add_argument("agent_label", help="agent 身份标签")
+    p_intro.add_argument("--intro", required=True, help="介绍正文")
+
+    p_list = team_sub.add_parser("list", help="列出团队成员")
 
     # internal source 管理
     internal_parser = subparsers.add_parser("internal", help="管理 internal source 的 issue")
@@ -327,8 +387,10 @@ def main(argv: list[str] | None = None) -> int:
         from .sources.internal import DEFAULT_DB
         db_path = args.db or str(DEFAULT_DB)
         run_dashboard(db_path, host=args.host, port=args.port,
-                      agent_label=args.agent_label)
+                      agent_label=args.agent_label, team_path=args.team)
         return 0
+    if args.cmd == "team":
+        return _run_team(args)
 
     return 2
 

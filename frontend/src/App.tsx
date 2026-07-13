@@ -9,11 +9,14 @@ import {
   type DragStartEvent,
 } from "@dnd-kit/core";
 
-import { listIssues, listProjects, moveIssue } from "./api";
-import { STATUS_ORDER, type Issue, type Kind, type Project, type Status } from "./types";
+import { listIssues, listProjects, listTeam, moveIssue } from "./api";
+import { STATUS_ORDER, type Issue, type Kind, type Project, type Status, type TeamMember } from "./types";
 import { Board } from "./components/Board";
 import { IssueDetail } from "./components/IssueDetail";
 import { CreateIssueModal } from "./components/CreateIssueModal";
+import { TeamPanel } from "./components/TeamPanel";
+
+type View = "board" | "team";
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -29,6 +32,8 @@ export default function App() {
   const [actorType, setActorType] = useState<"human" | "agent">(
     () => (localStorage.getItem("ik_actor_type") as "human" | "agent") || "human",
   );
+  const [view, setView] = useState<View>("board");
+  const [teamCount, setTeamCount] = useState<number>(0);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -39,6 +44,7 @@ export default function App() {
       setProjects(ps);
       if (!project && ps.length > 0) setProject(ps[0].project);
     }).catch((e) => setError(String(e)));
+    listTeam().then((t) => setTeamCount((t as TeamMember[]).length)).catch(() => setTeamCount(0));
   }, []);
 
   useEffect(() => {
@@ -104,23 +110,37 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <span className="logo">▦</span> issue-keeper
+          <div className="view-tabs">
+            <button
+              className={view === "board" ? "tab active" : "tab"}
+              onClick={() => setView("board")}
+            >看板</button>
+            <button
+              className={view === "team" ? "tab active" : "tab"}
+              onClick={() => setView("team")}
+            >团队成员{teamCount > 0 ? `（${teamCount}）` : ""}</button>
+          </div>
         </div>
         <div className="controls">
-          <select value={project} onChange={(e) => setProject(e.target.value)} disabled={!projects.length}>
-            {projects.length === 0 && <option value="">（无项目）</option>}
-            {projects.map((p) => (
-              <option key={p.project} value={p.project}>
-                {p.project}（{p.open}/{p.total}）
-              </option>
-            ))}
-          </select>
-          <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
-            <option value="issue">issue</option>
-            <option value="pr">PR</option>
-          </select>
-          <button className="primary" onClick={() => setShowCreate(true)} disabled={!project}>
-            + 新建
-          </button>
+          {view === "board" && (
+            <>
+              <select value={project} onChange={(e) => setProject(e.target.value)} disabled={!projects.length}>
+                {projects.length === 0 && <option value="">（无项目）</option>}
+                {projects.map((p) => (
+                  <option key={p.project} value={p.project}>
+                    {p.project}（{p.open}/{p.total}）
+                  </option>
+                ))}
+              </select>
+              <select value={kind} onChange={(e) => setKind(e.target.value as Kind)}>
+                <option value="issue">issue</option>
+                <option value="pr">PR</option>
+              </select>
+              <button className="primary" onClick={() => setShowCreate(true)} disabled={!project}>
+                + 新建
+              </button>
+            </>
+          )}
           <div className="whoami">
             <input
               value={actorName}
@@ -137,27 +157,34 @@ export default function App() {
       </header>
 
       {error && <div className="banner error">{error}</div>}
-      {loading && <div className="banner">加载中…</div>}
-      {!loading && project && issues.length === 0 && (
-        <div className="banner">该项目暂无 {kind}，点「+ 新建」提一个。</div>
-      )}
 
-      <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd}>
-        <Board
-          statusOrder={STATUS_ORDER}
-          byStatus={byStatus}
-          onSelect={setSelected}
-          selectedNumber={selected?.number ?? null}
-        />
-        <DragOverlay>
-          {activeIssue ? (
-            <div className="card dragging">
-              <div className="card-title">#{activeIssue.number} {activeIssue.title}</div>
-              <div className="card-meta">{activeIssue.author}/{activeIssue.actor_type}</div>
-            </div>
-          ) : null}
-        </DragOverlay>
-      </DndContext>
+      {view === "team" ? (
+        <TeamPanel />
+      ) : (
+        <>
+          {loading && <div className="banner">加载中…</div>}
+          {!loading && project && issues.length === 0 && (
+            <div className="banner">该项目暂无 {kind}，点「+ 新建」提一个。</div>
+          )}
+
+          <DndContext sensors={sensors} onDragStart={onDragStart} onDragEnd={onDragEnd}>
+            <Board
+              statusOrder={STATUS_ORDER}
+              byStatus={byStatus}
+              onSelect={setSelected}
+              selectedNumber={selected?.number ?? null}
+            />
+            <DragOverlay>
+              {activeIssue ? (
+                <div className="card dragging">
+                  <div className="card-title">#{activeIssue.number} {activeIssue.title}</div>
+                  <div className="card-meta">{activeIssue.author}/{activeIssue.actor_type}</div>
+                </div>
+              ) : null}
+            </DragOverlay>
+          </DndContext>
+        </>
+      )}
 
       {selected && (
         <IssueDetail

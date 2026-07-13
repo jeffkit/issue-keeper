@@ -255,7 +255,24 @@ python -m issue_keeper dashboard
 python -m issue_keeper dashboard --port 8080 --db /path/to/internal.db --agent-label alice
 ```
 
-浏览器打开 `http://127.0.0.1:7433` 即可。顶栏可切项目、切 issue/PR、设置「当前身份」（你以谁的名义发评论/改状态，会存 localStorage）。卡片在六列之间拖拽即触发 `move`；点卡片标题打开详情面板。
+浏览器打开 `http://127.0.0.1:7433` 即可。顶栏可切项目、切 issue/PR、设置「当前身份」（你以谁的名义发评论/改状态，会存 localStorage）。卡片在六列之间拖拽即触发 `move`；点卡片标题打开详情面板。顶栏「看板 / 团队成员」切换看板视图与团队视图。
+
+### 团队成员（team）
+
+多项目协作时，dashboard 的「团队成员」页展示参与工作的所有 agent 及其自我介绍。数据存在 `~/.issue-keeper/team.json`（独立于 internal.db），由 `team` CLI 子命令维护：
+
+```bash
+# 从 config.yaml 同步 agent 花名册（project/agent_label/cwd），保留已有介绍
+python -m issue_keeper team sync --config config.yaml
+
+# 给某个 agent 写自我介绍（dashboard 团队页展示）
+python -m issue_keeper team set-intro agentproc-agent --intro "我是 ..."
+
+# 列出当前团队
+python -m issue_keeper team list
+```
+
+介绍最好由 agent 自己生成（最准确）：可以直接经 `invoke_agent` 调一次 agent 让它读自己项目仓库后写一段 100-200 字介绍，再用 `team set-intro` 写入。dashboard 的 `GET /api/team` 读 team.json（默认路径，可用 `dashboard --team <path>` 覆盖）。
 
 **开发模式**（改前端代码热更新）：
 

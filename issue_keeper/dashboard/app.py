@@ -28,11 +28,13 @@ def _frontend_dist() -> Path | None:
     return None
 
 
-def create_app(db_path: str, *, agent_label: str = "dashboard") -> FastAPI:
+def create_app(db_path: str, *, agent_label: str = "dashboard",
+               team_path: str | None = None) -> FastAPI:
     """构造 FastAPI 应用。
 
     db_path: internal.db 路径
     agent_label: dashboard 以谁的身份发评论/改状态（默认 "dashboard"）
+    team_path: team.json 路径（团队成员花名册 + 介绍，默认 ~/.issue-keeper/team.json）
     """
     app = FastAPI(title="issue-keeper dashboard", version="0.1.0")
 
@@ -44,9 +46,10 @@ def create_app(db_path: str, *, agent_label: str = "dashboard") -> FastAPI:
         allow_headers=["*"],
     )
 
-    # db / agent_label 通过 app.state 传给路由（api.py 的 _ctx 依赖读取）
+    # db / agent_label / team_path 通过 app.state 传给路由（api.py 的 _ctx 依赖读取）
     app.state.db_path = db_path
     app.state.agent_label = agent_label
+    app.state.team_path = team_path
     app.include_router(router)
 
     dist = _frontend_dist()
@@ -88,11 +91,12 @@ def create_app(db_path: str, *, agent_label: str = "dashboard") -> FastAPI:
 
 
 def run_dashboard(db_path: str, *, host: str = "127.0.0.1",
-                  port: int = 7433, agent_label: str = "dashboard") -> None:
+                  port: int = 7433, agent_label: str = "dashboard",
+                  team_path: str | None = None) -> None:
     """启动 dashboard 服务（阻塞）。"""
     import uvicorn
 
-    app = create_app(db_path, agent_label=agent_label)
+    app = create_app(db_path, agent_label=agent_label, team_path=team_path)
     print(f"issue-keeper dashboard 启动: http://{host}:{port}")
     print(f"  db: {db_path}")
     print(f"  前端: {'已构建 (frontend/dist)' if _frontend_dist() else '未构建，仅 API 可用'}")

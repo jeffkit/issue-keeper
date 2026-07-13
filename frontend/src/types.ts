@@ -55,6 +55,13 @@ export interface Project {
   open: number;
 }
 
+export interface TeamMember {
+  project: string;
+  agent_label: string;
+  cwd: string;
+  intro: string;
+}
+
 export const STATUS_ORDER: Status[] = [
   "inbox",
   "todo",
