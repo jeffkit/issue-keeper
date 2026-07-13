@@ -274,6 +274,23 @@ python -m issue_keeper team list
 
 介绍最好由 agent 自己生成（最准确）：可以直接经 `invoke_agent` 调一次 agent 让它读自己项目仓库后写一段 100-200 字介绍，再用 `team set-intro` 写入。dashboard 的 `GET /api/team` 读 team.json（默认路径，可用 `dashboard --team <path>` 覆盖）。
 
+### onboarding 新项目（onboard）
+
+把一个新项目快速注册进协同，一条命令完成「加 binding → team sync → 生成介绍 → 重载 keeper」：
+
+```bash
+DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY python3 -m issue_keeper onboard \
+  /Users/kongjie/projects/<新项目目录> \
+  --config config.yaml --agent-label <新项目>-agent --gen-intro --reload
+```
+
+参数：`--repo`（项目名，默认取目录名）、`--agent-label`（默认 `<repo>-agent`）、`--profile`（默认 `claude-code`）、`--gen-intro`（调 agent 自动写介绍）、`--reload`（完成后重载 keeper daemon）。会往 config.yaml 的 `repos` 追加一条 binding（复用 `_agent_env` anchor），并同步 team.json。
+
+### 人类如何参与协同
+
+- **作为参与者**：在 dashboard 选项目提 issue / 评论（顶栏设「当前身份」），或用 `internal create` CLI。注意 issue 正文写成正常 bug/需求，不要写成对 AI 的直接指令（会被 screener 当注入跳过）。
+- **作为管理者**：`issue-keeper` 项目本身有 `issue-keeper-agent`（cwd 就是 issue-keeper 仓，有 bash 能力），充当「协同管家」。在 `issue-keeper` 项目提管理类 issue（如「把 foo 项目加进协同」「更新某 agent 介绍」），issue-keeper-agent 会调 `onboard`/`team` CLI 执行并回复。
+
 **开发模式**（改前端代码热更新）：
 
 ```bash

@@ -102,3 +102,50 @@ def set_intro(agent_label: str, intro: str, path: Path | str | None = None) -> T
 
 def to_json(members: list[TeamMember]) -> list[dict[str, Any]]:
     return [m.to_dict() for m in members]
+
+
+def add_binding_to_config(
+    config_path: str | Path,
+    *,
+    repo: str,
+    agent_label: str,
+    cwd: str,
+    profile: str = "claude-code",
+) -> None:
+    """往 config.yaml 的 repos 列表追加一个 binding（文本追加，保留注释/anchor）。
+
+    假设 repos 是配置文件最后一个顶层段（issue-keeper 的约定写法）。若文件里
+    已定义 `&agent_env` anchor，新 binding 复用它；否则写一份显式 DeepSeek env。
+    repo 已存在则抛 ValueError。
+    """
+    import re
+    from pathlib import Path
+
+    p = Path(config_path)
+    text = p.read_text(encoding="utf-8")
+    if re.search(rf'^\s*-\s*repo:\s*["\']?{re.escape(repo)}["\']?\s*$', text, re.M):
+        raise ValueError(f"repo '{repo}' 已存在于 {p}")
+
+    use_anchor = "&agent_env" in text
+    if use_anchor:
+        env_block = "    env: *agent_env"
+    else:
+        env_block = (
+            "    env:\n"
+            "      ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}\n"
+            '      ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic"\n'
+            '      CLAUDE_MODEL: "deepseek-chat"'
+        )
+    block = (
+        f'\n  - repo: "{repo}"\n'
+        f'    profile: "{profile}"\n'
+        f'    source: internal\n'
+        f'    agent_label: "{agent_label}"\n'
+        f'    cwd: {cwd}\n'
+        f'{env_block}\n'
+        f'    monitor_prs: false\n'
+    )
+    if not text.endswith("\n"):
+        text += "\n"
+    p.write_text(text + block, encoding="utf-8")
+

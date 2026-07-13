@@ -295,6 +295,79 @@ def _run_team(args) -> int:
     return 2
 
 
+def _run_onboard(args) -> int:
+    """把一个新项目 onboard 进 issue-keeper 协同：加 binding + team sync + 可选生成介绍 + 可选重载 keeper。"""
+    import os
+    from pathlib import Path
+    from .team import add_binding_to_config, set_intro, sync_from_config
+
+    project_path = Path(args.project_path).expanduser().resolve()
+    if not project_path.is_dir():
+        print(f"项目目录不存在: {project_path}", file=sys.stderr)
+        return 1
+    repo = args.repo or project_path.name
+    agent_label = args.agent_label or f"{repo}-agent"
+
+    # 1) 往 config.yaml 加 binding
+    try:
+        add_binding_to_config(
+            args.config, repo=repo, agent_label=agent_label, cwd=str(project_path),
+            profile=args.profile,
+        )
+    except ValueError as e:
+        print(f"跳过加 binding: {e}", file=sys.stderr)
+    print(f"已往 {args.config} 追加 binding: repo={repo}, agent_label={agent_label}, cwd={project_path}")
+
+    # 2) team sync（从 config 重建花名册，保留已有介绍）
+    config = load_config(args.config)
+    members = sync_from_config(config, args.team)
+    print(f"team sync 完成，共 {len(members)} 个成员")
+
+    # 3) 可选：生成自我介绍
+    if args.gen_intro:
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            print("未设置 DEEPSEEK_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
+        else:
+            from .profile import ProfileEntry, invoke_agent
+            env = {
+                "ANTHROPIC_API_KEY": os.environ["DEEPSEEK_API_KEY"],
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "CLAUDE_MODEL": "deepseek-chat",
+            }
+            entry = ProfileEntry(name=args.profile, is_hub=True, cwd=str(project_path),
+                                 env=env, timeout_secs=180)
+            prompt = (
+                "请用 100-180 字写一段自我介绍，用于 issue-keeper dashboard 团队页卡片展示。"
+                "覆盖：本项目是做什么的（一句话）、你作为本项目 agent 负责什么（一句话）、技术栈（一两个关键词）。"
+                "只输出一段纯文本，不要 markdown 标题、不要列表、不要元描述。"
+            )
+            try:
+                reply = invoke_agent(entry, prompt, "", from_user="onboard", default_timeout=180)
+                intro = (reply.text or "").strip()
+                set_intro(agent_label, intro, args.team)
+                print(f"已生成并写入介绍（{len(intro)} 字）")
+            except Exception as e:
+                print(f"介绍生成失败: {e}", file=sys.stderr)
+
+    # 4) 可选：重载 keeper（仅 macOS launchd）
+    if args.reload:
+        import platform
+        if platform.system() == "Darwin":
+            import subprocess
+            plist = Path.home() / "Library/LaunchAgents/com.issue-keeper.keeper.plist"
+            if plist.exists():
+                subprocess.run(["launchctl", "unload", str(plist)], check=False)
+                subprocess.run(["launchctl", "load", str(plist)], check=False)
+                print("已重载 keeper daemon")
+            else:
+                print(f"未找到 {plist}，跳过重载（请手工重启 keeper）", file=sys.stderr)
+        else:
+            print("非 macOS，跳过 launchd 重载（请手工重启 keeper）", file=sys.stderr)
+
+    print(f"\nonboard 完成：{agent_label}（项目 {repo}）已加入协同。")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="issue-keeper",
@@ -333,6 +406,18 @@ def main(argv: list[str] | None = None) -> int:
     p_intro.add_argument("--intro", required=True, help="介绍正文")
 
     p_list = team_sub.add_parser("list", help="列出团队成员")
+
+    # onboard：把一个新项目快速注册进协同
+    onb_parser = subparsers.add_parser(
+        "onboard", help="把一个新项目 onboard 进 issue-keeper 协同（加 binding + team sync + 可选生成介绍 + 重载 keeper）")
+    onb_parser.add_argument("project_path", help="新项目目录路径（git 仓根）")
+    onb_parser.add_argument("--config", "-c", required=True, help="issue-keeper config.yaml 路径")
+    onb_parser.add_argument("--repo", help="项目名（默认取目录名）")
+    onb_parser.add_argument("--agent-label", help="agent 身份标签（默认 <repo>-agent）")
+    onb_parser.add_argument("--profile", default="claude-code", help="agentproc profile（默认 claude-code）")
+    onb_parser.add_argument("--team", help="team.json 路径（默认 ~/.issue-keeper/team.json）")
+    onb_parser.add_argument("--gen-intro", action="store_true", help="调 agent 自动生成自我介绍并写入 team.json")
+    onb_parser.add_argument("--reload", action="store_true", help="完成后重载 keeper daemon（macOS launchd）")
 
     # internal source 管理
     internal_parser = subparsers.add_parser("internal", help="管理 internal source 的 issue")
@@ -391,6 +476,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "team":
         return _run_team(args)
+    if args.cmd == "onboard":
+        return _run_onboard(args)
 
     return 2
 
