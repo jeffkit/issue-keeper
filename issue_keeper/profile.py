@@ -95,6 +95,11 @@ def _build_command(entry: ProfileEntry, message: str, session_id: str,
 
     prompt 用 --prompt 直接传。注：agentproc 0.4.0 的 --stdin 实现有 bug
     （报 AGENT_MESSAGE 缺失），故改用 --prompt。
+
+    env 通过 --env KEY=VALUE 显式传。这是 agentproc 0.7.0（wire 0.3）的硬要求：
+    新 runner 不再继承父进程全量 env，只传 infra 集 + profile env 块（allowlist
+    过滤）+ CLI --env 的 extraEnv；binding.env 里非 allowlist 的变量（如
+    ANTHROPIC_BASE_URL）只有走 --env 才能到 agent。--env 在 0.4.0 也支持，冗余但无害。
     """
     if entry.is_hub:
         cmd = [AGENTPROC_BIN, "hub", "run", entry.name]
@@ -108,6 +113,9 @@ def _build_command(entry: ProfileEntry, message: str, session_id: str,
         cmd += ["--session", session_id]
     if from_user:
         cmd += ["--from", from_user]
+    # binding.env 经 --env 透传给 agent（绕过 0.7.0 的 env_allowlist 过滤）
+    for k, v in entry.env.items():
+        cmd += ["--env", f"{k}={v}"]
     if entry.timeout_secs:
         cmd += ["--timeout", str(entry.timeout_secs)]
     elif default_timeout:
@@ -178,10 +186,17 @@ def invoke_agent(
             f"stderr: {proc.stderr.strip()[:2000]}"
         )
 
-    # 即使 exit=0，agentproc 也可能在 stderr 报 AGENT_ERROR
-    if "AGENT_ERROR:" in proc.stderr:
+    # 即使 exit=0，agentproc 也可能在 stderr 报错。兼容两种 wire：
+    #   0.2 旧协议：`AGENT_ERROR:<msg>`
+    #   0.3 新协议：`agentproc:error:<msg>`（NDJSON 事件经 CLI 汇总后的行）
+    error_prefix = None
+    for line in proc.stderr.splitlines():
+        if line.startswith("AGENT_ERROR:") or line.startswith("agentproc:error:"):
+            error_prefix = "AGENT_ERROR:" if line.startswith("AGENT_ERROR:") else "agentproc:error:"
+            break
+    if error_prefix:
         for line in proc.stderr.splitlines():
-            if line.startswith("AGENT_ERROR:"):
+            if line.startswith(error_prefix):
                 log.warning("agent 报错: %s", line)
                 # 不 raise——有些 agent 错误仍带部分输出；让 keeper 决定要不要发
                 break
