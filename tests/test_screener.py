@@ -1,6 +1,14 @@
 """screener 的纯逻辑测试（不发真实 HTTP）。"""
 
-from issue_keeper.screener import _extract_json, _truncate, screen, ScreenerConfig, Verdict
+from issue_keeper.screener import (
+    _anthropic_messages_url,
+    _extract_json,
+    _openai_chat_url,
+    _truncate,
+    screen,
+    ScreenerConfig,
+    Verdict,
+)
 
 
 class TestExtractJson:
@@ -45,3 +53,17 @@ class TestScreenFailSafe:
         v = screen("hello", cfg, source_label="t")
         assert v.safe is False
         assert "未配置" in v.reason
+
+
+class TestEndpointUrls:
+    def test_anthropic_without_v1(self):
+        assert _anthropic_messages_url("https://api.anthropic.com") == "https://api.anthropic.com/v1/messages"
+
+    def test_anthropic_with_v1_no_double(self):
+        assert _anthropic_messages_url("https://glm.example.com/v1") == "https://glm.example.com/v1/messages"
+
+    def test_anthropic_trailing_slash(self):
+        assert _anthropic_messages_url("https://x.com/v1/") == "https://x.com/v1/messages"
+
+    def test_openai_chat_url(self):
+        assert _openai_chat_url("https://api.deepseek.com/v1") == "https://api.deepseek.com/v1/chat/completions"

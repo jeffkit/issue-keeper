@@ -140,6 +140,18 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + "\n…[已截断]"
 
 
+def _anthropic_messages_url(base_url: str) -> str:
+    """Anthropic messages 端点 URL，兼容 base_url 是否已含 /v1。"""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/messages"
+    return base + "/v1/messages"
+
+
+def _openai_chat_url(base_url: str) -> str:
+    return base_url.rstrip("/") + "/chat/completions"
+
+
 def _extract_json(text: str) -> dict[str, Any] | None:
     """从 LLM 输出里提取首个 JSON 对象。容错：允许前后有少量说明文字。"""
     text = text.strip()
@@ -163,7 +175,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 def _call_openai(cfg: ScreenerConfig, prompt: str, *, source_label: str) -> str:
     """OpenAI 兼容协议（DeepSeek / OpenAI / Moonshot / Together 等）。"""
-    url = cfg.base_url.rstrip("/") + "/chat/completions"
+    url = _openai_chat_url(cfg.base_url)
     payload = {
         "model": cfg.model,
         "max_tokens": 200,
@@ -196,7 +208,7 @@ def _call_openai(cfg: ScreenerConfig, prompt: str, *, source_label: str) -> str:
 
 def _call_anthropic(cfg: ScreenerConfig, prompt: str, *, source_label: str) -> str:
     """Anthropic messages 协议（含 GLM anthropic 兼容端点）。"""
-    url = cfg.base_url.rstrip("/") + "/v1/messages"
+    url = _anthropic_messages_url(cfg.base_url)
     payload = {
         "model": cfg.model,
         "max_tokens": 200,

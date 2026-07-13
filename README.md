@@ -271,7 +271,7 @@ dashboard 不依赖 `config.yaml`，直接用 `--db` 指向 internal source 的 
 每个 `repos` 条目可选 `monitor_prs: true`，开启后会同时扫描该仓库的 open PR：
 
 - PR 与 issue 的 agent 会话互相隔离（状态 key 为 `pr:N` vs 纯数字 `N`）。
-- 最小版本只处理 PR 本体 + PR 级别的普通评论。PR 的 **review comments（行内评论）** 暂不在监控范围内。
+- 处理 PR 本体 + PR 级别的普通评论 + **行内 review comments**。review comments 的 body 会前置 `📍 path:line` 定位行，方便 agent 看上下文。
 - PR 可单独配置 label 过滤（`pr_labels`），不写则回退到 `labels`。
 
 ## 前置依赖
@@ -371,7 +371,7 @@ python -m issue_keeper dashboard            # 默认 127.0.0.1:7433
 ## 测试
 
 ```bash
-python -m pytest -q                         # 51 个用例：screener / config / internal / 防循环 / dashboard API
+python -m pytest -q                         # 62 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API
 ```
 
 ## 状态文件
@@ -410,7 +410,7 @@ python -m pytest -q                         # 51 个用例：screener / config /
 
 - **回复方式**：issue-keeper 把 agent 的回复作为评论发出，profile 无关，任何 AgentProc profile 都能用。
 - **会话连续性**：每个 issue/PR 持有一个 agent 会话 uuid，新评论复用该会话，agent 保持上下文。issue 与 PR 互相隔离。
-- **监控范围**：默认只监控 open issue；可按 label 过滤；`monitor_prs` 开启 PR；PR 的 review comments 暂不支持。
+- **监控范围**：默认只监控 open issue；可按 label 过滤；`monitor_prs` 开启 PR；PR 的普通评论与行内 review comments 均纳入监控（github_token source 自动分页，不丢评论）。
 - **防循环**：三层保险（隐藏 marker / 可见前缀 / self_identity）。资源层也识别 marker——AI 自己提的 issue 不触发首次回复，但评论照常处理。
 - **安全过滤**：所有投递给主 agent 的内容先过 screener（纯 HTTP LLM 调用，无本地权限）。fail-safe：配置不全拒绝启动。
 - **可插拔来源**：keeper 主循环依赖 `IssueSource` 协议而非具体 GitHub。当前支持 `github_cli` / `github_token`。加新来源（github_app / internal / discord / http）是纯加法。

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import urllib.error
@@ -22,6 +23,8 @@ from typing import Any
 from . import Comment, IssueSource, Resource
 
 GITHUB_API = "https://api.github.com"
+
+log = logging.getLogger("issue-keeper.github")
 
 
 def _parse_labels(raw: Any) -> list[str]:
@@ -55,6 +58,52 @@ def _gh_url(repo: str, resource: Resource) -> str:
     return f"{base}/{path}/{resource.number}"
 
 
+def _issue_comment_to_comment(raw: dict[str, Any], *, gh_cli: bool = False) -> Comment:
+    """把一条 issue-level 评论（REST 或 gh CLI --json 格式）转成 Comment。
+
+    gh CLI 的 --json 输出用 author/createdAt/url 字段名，REST 用 user/created_at/html_url。
+    """
+    if gh_cli:
+        return Comment(
+            id=str(raw.get("id", "")),
+            url=raw.get("url", "") or "",
+            author=_parse_author(raw.get("author")),
+            body=raw.get("body", "") or "",
+            created_at=raw.get("createdAt", ""),
+        )
+    return Comment(
+        id=str(raw.get("id", "")),
+        url=raw.get("html_url", "") or "",
+        author=_parse_author(raw.get("user")),
+        body=raw.get("body", "") or "",
+        created_at=raw.get("created_at", ""),
+    )
+
+
+def _review_comment_to_comment(raw: dict[str, Any]) -> Comment:
+    """把一条 PR 行内 review comment 转成 Comment。
+
+    review comment 带 path/line 位置信息，body 前加一行 📍 定位，方便 agent 看上下文。
+    line 取 line，回退 original_line（已删除行的评论 line 为 null）。
+    """
+    path = raw.get("path") or ""
+    line = raw.get("line") or raw.get("original_line") or ""
+    loc = f"📍 {path}:{line}\n" if path else ""
+    return Comment(
+        id=str(raw.get("id", "")),
+        url=raw.get("html_url", "") or "",
+        author=_parse_author(raw.get("user")),
+        body=f"{loc}{raw.get('body', '') or ''}",
+        created_at=raw.get("created_at", ""),
+    )
+
+
+def _sort_comments(comments: list[Comment]) -> list[Comment]:
+    """按时间升序排列（ISO 字符串字典序即时间序），id 做稳定 tiebreak。"""
+    comments.sort(key=lambda c: (c.created_at or "", c.id))
+    return comments
+
+
 # ─────────────────────────────────────────────────────────────────────
 # gh CLI 实现
 # ─────────────────────────────────────────────────────────────────────
@@ -69,6 +118,31 @@ def _run_gh(args: list[str]) -> str:
             f"stderr: {proc.stderr.strip()}"
         )
     return proc.stdout
+
+
+def _fetch_review_comments_gh(repo: str, number: int) -> list[Comment]:
+    """用 gh api 拉 PR 的行内 review comments，--paginate --jq '.[]' 输出 ndjson。"""
+    try:
+        out = _run_gh([
+            "api", f"repos/{repo}/pulls/{number}/comments",
+            "--paginate", "--jq", ".[]",
+        ])
+    except RuntimeError as e:
+        # 没有权限或接口异常时不应阻断 issue-level 评论，记录后返回空
+        log.warning("拉 PR review comments 失败 (%s#pr:%d): %s", repo, number, e)
+        return []
+    comments: list[Comment] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict):
+            comments.append(_review_comment_to_comment(raw))
+    return comments
 
 
 class GitHubSource(IssueSource):
@@ -110,19 +184,13 @@ class GitHubSource(IssueSource):
         ])
         data = json.loads(out) if out.strip() else {}
         raw_comments = data.get("comments") or []
-        comments: list[Comment] = []
-        for c in raw_comments:
-            comments.append(
-                Comment(
-                    id=str(c.get("id", "")),
-                    url=c.get("url", "") or "",
-                    author=_parse_author(c.get("author")),
-                    body=c.get("body", "") or "",
-                    created_at=c.get("createdAt", ""),
-                )
-            )
-        comments.sort(key=lambda c: c.id)
-        return comments
+        comments: list[Comment] = [
+            _issue_comment_to_comment(c, gh_cli=True) for c in raw_comments
+        ]
+        # PR 的行内 review comments 走 REST endpoint，gh pr view --json comments 不含它们
+        if resource.kind == "pr":
+            comments += _fetch_review_comments_gh(repo, resource.number)
+        return _sort_comments(comments)
 
     def post_comment(self, repo: str, resource: Resource, body: str) -> None:
         _run_gh([
@@ -248,22 +316,31 @@ class GitHubTokenSource(IssueSource):
         return out
 
     def list_comments(self, repo: str, resource: Resource) -> list[Comment]:
-        # issue 和 PR 的评论都用 issues/{n}/comments endpoint（PR 的 review comments 是另一套）
-        path = f"/repos/{repo}/issues/{resource.number}/comments"
-        rows = self._api(path, params={"per_page": 100}) or []
-        comments: list[Comment] = []
-        for c in rows:
-            comments.append(
-                Comment(
-                    id=str(c.get("id", "")),
-                    url=c.get("html_url", "") or "",
-                    author=_parse_author(c.get("user")),
-                    body=c.get("body", "") or "",
-                    created_at=c.get("created_at", ""),
-                )
+        # issue 和 PR 的会话级评论都用 issues/{n}/comments endpoint
+        comments = self._paged_comments(f"/repos/{repo}/issues/{resource.number}/comments", review=False)
+        # PR 的行内 review comments 是另一套 endpoint，需单独拉
+        if resource.kind == "pr":
+            comments += self._paged_comments(
+                f"/repos/{repo}/pulls/{resource.number}/comments", review=True
             )
-        comments.sort(key=lambda c: c.id)
-        return comments
+        return _sort_comments(comments)
+
+    def _paged_comments(self, path: str, *, review: bool) -> list[Comment]:
+        """分页拉评论（每页 100，自动翻页，兜底最多 2000 条）。"""
+        out: list[Comment] = []
+        page = 1
+        while True:
+            rows = self._api(path, params={"per_page": 100, "page": page}) or []
+            if not rows:
+                break
+            for r in rows:
+                out.append(_review_comment_to_comment(r) if review else _issue_comment_to_comment(r))
+            if len(rows) < 100:
+                break
+            page += 1
+            if page > 20:
+                break
+        return out
 
     def post_comment(self, repo: str, resource: Resource, body: str) -> None:
         path = f"/repos/{repo}/issues/{resource.number}/comments"
