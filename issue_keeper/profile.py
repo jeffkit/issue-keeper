@@ -85,16 +85,15 @@ def load_profile(binding) -> ProfileEntry:
     )
 
 
-def _build_command(entry: ProfileEntry, message: str, session_id: str,
+def _build_command(entry: ProfileEntry, session_id: str,
                    *, from_user: str = "issue-keeper",
                    default_timeout: int = 600) -> list[str]:
-    """构造 agentproc 调用命令。
+    """构造 agentproc 调用命令（不含 message，message 通过 stdin 传入）。
 
-    hub 名：agentproc hub run <name> --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
-    本地：  agentproc --profile <path>   --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
+    hub 名：agentproc hub run <name> --stdin [--cwd <path>] [--session <id>] [--from <user>]
+    本地：  agentproc --profile <path>   --stdin [--cwd <path>] [--session <id>] [--from <user>]
 
-    prompt 用 --prompt 直接传。注：agentproc 0.4.0 的 --stdin 实现有 bug
-    （报 AGENT_MESSAGE 缺失），故改用 --prompt。
+    message 通过 stdin 传给 agentproc 的 --stdin，避免命令行长度限制。
 
     env 通过 --env KEY=VALUE 显式传。这是 agentproc 0.7.0（wire 0.3）的硬要求：
     新 runner 不再继承父进程全量 env，只传 infra 集 + profile env 块（allowlist
@@ -106,7 +105,7 @@ def _build_command(entry: ProfileEntry, message: str, session_id: str,
     else:
         cmd = [AGENTPROC_BIN, "--profile", entry.name]
 
-    cmd += ["--quiet", "--prompt", message]
+    cmd += ["--quiet", "--stdin"]
     if entry.cwd:
         cmd += ["--cwd", entry.cwd]
     if session_id:
@@ -157,7 +156,7 @@ def invoke_agent(
     子进程的 env = 当前 env + binding.env（凭据等）。
     agentproc/profile 的 env_allowlist 决定哪些真正传到 agent 子进程。
     """
-    cmd = _build_command(entry, message, session_id or "",
+    cmd = _build_command(entry, session_id or "",
                         from_user=from_user, default_timeout=default_timeout)
     log.debug("调 agentproc: %s", " ".join(shlex.quote(c) for c in cmd[:6]) + " ...")
 
@@ -167,7 +166,7 @@ def invoke_agent(
     try:
         proc = subprocess.run(
             cmd,
-            input=None,
+            input=message,
             capture_output=True,
             text=True,
             cwd=entry.cwd or None,

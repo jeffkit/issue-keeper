@@ -343,7 +343,7 @@ repos:
 - `--cwd <binding.cwd>`：agent 工作目录。**这是动态切换项目上下文的关键**——一个 hub profile 通吃所有项目，不用每项目自建 profile
 - `--session <session_id>`：续接同一 issue/PR 的 agent 会话
 - `--from <agent_from_user>`：来源标识
-- `--prompt <message>`：消息直接以参数传入。注：agentproc 的 `--stdin` 在 0.4.0 和 0.7.0（wire 0.3）实测均读不到消息（message 为空），故用 `--prompt`；代价是长消息受命令行长度限制，常见 issue body 量级无影响
+- `--stdin`：消息通过 stdin 管道传入，避免命令行长度限制（ARG_MAX）。注：agentproc 0.4.x 的 `--stdin` 曾有 bug（消息为空），wire 0.3（NDJSON turn object）已修复，现切回 --stdin
 - `--env KEY=VALUE`：`binding.env` 里每个变量都经 `--env` 透传给 agent。**agentproc 0.7.0+ 不再继承父进程全量 env**（只传 infra 集 + profile env 块的 allowlist 变量 + CLI `--env`），所以非 allowlist 的变量（如 `ANTHROPIC_BASE_URL`）必须走 `--env` 才能到 agent；0.4.x 也支持 `--env`，故两版兼容
 
 agent 收到的消息会明确告诉它：
