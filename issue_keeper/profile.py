@@ -93,14 +93,15 @@ def _build_command(entry: ProfileEntry, message: str, session_id: str,
     hub 名：agentproc hub run <name> --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
     本地：  agentproc --profile <path>   --prompt <msg> [--cwd <path>] [--session <id>] [--from <user>]
 
-    prompt 用 --stdin 传，避免命令行长度限制 + 转义问题。
+    prompt 用 --prompt 直接传。注：agentproc 0.4.0 的 --stdin 实现有 bug
+    （报 AGENT_MESSAGE 缺失），故改用 --prompt。
     """
     if entry.is_hub:
         cmd = [AGENTPROC_BIN, "hub", "run", entry.name]
     else:
         cmd = [AGENTPROC_BIN, "--profile", entry.name]
 
-    cmd += ["--stdin", "--quiet"]
+    cmd += ["--quiet", "--prompt", message]
     if entry.cwd:
         cmd += ["--cwd", entry.cwd]
     if session_id:
@@ -158,7 +159,7 @@ def invoke_agent(
     try:
         proc = subprocess.run(
             cmd,
-            input=message,
+            input=None,
             capture_output=True,
             text=True,
             cwd=entry.cwd or None,
