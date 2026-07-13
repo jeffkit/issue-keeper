@@ -85,10 +85,13 @@ def _run_internal(args) -> int:
             title=args.title, body=args.body or "",
             author=args.author or ("anonymous" if actor_type == "human" else "anonymous-agent"),
             actor_type=actor_type,
+            labels=args.label or [],
         )
         print(f"已创建 {kind} #{res.number}：{res.title}")
         print(f"  作者: {res.author}（{actor_type}）")
         print(f"  状态: {res.status}")
+        if res.labels:
+            print(f"  标签: {', '.join(res.labels)}")
         print(f"  项目: {project}")
         print(f"  数据库: {db_path}")
         if args.body:
@@ -128,13 +131,14 @@ def _run_internal(args) -> int:
 
     if args.internal_cmd == "list":
         project = args.project
-        resources = src.list_open(project, [kind])
+        resources = src.list_open(project, [kind], labels=args.label or None)
         if not resources:
             print(f"项目 {project} 没有开放的 {kind}")
             return 0
         print(f"项目 {project} 的开放 {kind}（共 {len(resources)} 条）：")
         for r in resources:
-            print(f"  #{r.number}  [{r.status}]  [{r.author}/{r.actor_type}]  {r.title}")
+            label_tag = f"  [{','.join(r.labels)}]" if r.labels else ""
+            print(f"  #{r.number}  [{r.status}]  [{r.author}/{r.actor_type}]  {r.title}{label_tag}")
             body_preview = (r.body or "").replace("\n", " ")[:60]
             if body_preview:
                 suffix = "…" if len(r.body or "") > 60 else ""
@@ -278,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_internal_common(p_create)
     p_create.add_argument("--title", required=True)
     p_create.add_argument("--body", default="")
+    p_create.add_argument("--label", action="append", default=[], help="标签，可多次指定")
 
     p_comment = internal_sub.add_parser("comment", help="在某 issue 下评论")
     _add_internal_common(p_comment)
@@ -293,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_list = internal_sub.add_parser("list", help="列出某项目的 open issue")
     _add_internal_common(p_list)
+    p_list.add_argument("--label", action="append", default=[], help="按标签过滤，可多次指定（交集）")
 
     p_board = internal_sub.add_parser("board", help="看板视图（按状态分列）")
     _add_internal_common(p_board)

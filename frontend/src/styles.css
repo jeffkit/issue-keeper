@@ -202,6 +202,14 @@ button.mini.danger { color: var(--danger); }
   color: var(--muted);
 }
 .assignee { color: var(--agent); }
+.card-labels { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.label-tag {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(79,140,255,0.12);
+  color: var(--accent-2);
+}
 
 /* ─── 详情/弹窗 ─── */
 .overlay {

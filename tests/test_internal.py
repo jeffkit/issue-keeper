@@ -147,3 +147,39 @@ class TestPersistence:
         # 新实例指向同一个 db
         src2 = _src(tmp_path)
         assert len(src2.list_all("proj-test", ["issue"])) == 1
+
+
+class TestLabels:
+    def test_create_with_labels_persisted(self, tmp_path):
+        src = _src(tmp_path)
+        r = src.create_issue("proj-test", "issue", "a", "", "alice", labels=["bug", "ai"])
+        assert r.labels == ["bug", "ai"]
+        fresh = src.get_issue("proj-test", "issue", r.number)
+        assert fresh.labels == ["bug", "ai"]
+
+    def test_create_without_labels_defaults_empty(self, tmp_path):
+        src = _src(tmp_path)
+        r = src.create_issue("proj-test", "issue", "a", "", "alice")
+        assert r.labels == []
+
+    def test_list_open_filters_by_label_intersection(self, tmp_path):
+        src = _src(tmp_path)
+        src.create_issue("proj-test", "issue", "a", "", "alice", labels=["bug"])
+        src.create_issue("proj-test", "issue", "b", "", "alice", labels=["feature"])
+        src.create_issue("proj-test", "issue", "c", "", "alice", labels=["bug", "ai"])
+        src.create_issue("proj-test", "issue", "d", "", "alice")  # 无标签
+
+        bug = src.list_open("proj-test", ["issue"], labels=["bug"])
+        titles = {r.title for r in bug}
+        assert titles == {"a", "c"}
+
+        ai = src.list_open("proj-test", ["issue"], labels=["AI"])  # 大小写不敏感
+        assert {r.title for r in ai} == {"c"}
+
+        none_filter = src.list_open("proj-test", ["issue"], labels=None)
+        assert len(none_filter) == 4
+
+    def test_list_open_label_no_match_returns_empty(self, tmp_path):
+        src = _src(tmp_path)
+        src.create_issue("proj-test", "issue", "a", "", "alice", labels=["bug"])
+        assert src.list_open("proj-test", ["issue"], labels=["nope"]) == []

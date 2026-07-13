@@ -104,6 +104,7 @@ export function IssueDetail({ project, issue, actorName, actorType, onClose, onC
           <span>状态：<b>{STATUS_LABEL[issue.status]}</b></span>
           <span>作者：{issue.author || "—"}（{issue.actor_type}）</span>
           {issue.assignee && <span>负责人：{issue.assignee}</span>}
+          {issue.labels.length > 0 && <span>标签：{issue.labels.join(", ")}</span>}
           <span>创建：{issue.created_at}</span>
         </div>
 

@@ -216,6 +216,12 @@ python -m issue_keeper internal close proj-a 1
 
 # PR 也支持（--kind pr）
 python -m issue_keeper internal create proj-a --title "修复 PR" --kind pr --body "..." --author carol
+
+# 带标签创建（可多次 --label）
+python -m issue_keeper internal create proj-a --title "登录 bug" --author alice --label bug --label ai
+
+# 按标签过滤列出（交集，大小写不敏感）
+python -m issue_keeper internal list proj-a --label bug
 ```
 
 CLI 不依赖 `config.yaml`，直接用 `--db` 指定 SQLite 路径（或默认 `~/.issue-keeper/internal.db`）。这样既给人手工用，也能让 agent 在处理 issue 时直接用 bash 调用——agent 有 bash 工具能力，想给别的项目提 issue 时直接 `python -m issue_keeper internal create ...` 即可，不需要 keeper 参与解析。
@@ -371,7 +377,7 @@ python -m issue_keeper dashboard            # 默认 127.0.0.1:7433
 ## 测试
 
 ```bash
-python -m pytest -q                         # 62 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API
+python -m pytest -q                         # 67 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API
 ```
 
 ## 状态文件

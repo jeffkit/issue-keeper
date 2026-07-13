@@ -56,6 +56,7 @@ class CreateIssueReq(BaseModel):
     author: str = ""
     actor_type: str = Field(default="human", pattern="^(human|agent)$")
     kind: str = Field(default="issue", pattern="^(issue|pr)$")
+    labels: list[str] = Field(default_factory=list)
 
 
 class AddCommentReq(BaseModel):
@@ -87,6 +88,7 @@ def _resource_to_dict(r) -> dict[str, Any]:
         "body": r.body,
         "state": r.state,
         "status": r.status,
+        "labels": list(r.labels),
         "author": r.author,
         "actor_type": r.actor_type,
         "assignee": r.assignee,
@@ -183,6 +185,7 @@ def create_issue(
         repo=project, kind=req.kind,
         title=req.title, body=req.body,
         author=author, actor_type=req.actor_type,
+        labels=req.labels,
     )
     return _resource_to_dict(res)
 

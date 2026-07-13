@@ -29,6 +29,11 @@ export function IssueCard({ issue, onSelect, selected }: IssueCardProps) {
         <span>{issue.author || "—"}</span>
         {issue.assignee && <span className="assignee">→ {issue.assignee}</span>}
       </div>
+      {issue.labels.length > 0 && (
+        <div className="card-labels">
+          {issue.labels.map((l) => <span key={l} className="label-tag">{l}</span>)}
+        </div>
+      )}
     </div>
   );
 }

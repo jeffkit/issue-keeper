@@ -41,6 +41,7 @@ issue#5 和 PR#5 不会并存（同一表），因此 resource_key 直接用 num
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -71,6 +72,7 @@ CREATE TABLE IF NOT EXISTS issues (
     body        TEXT    NOT NULL DEFAULT '',
     state       TEXT    NOT NULL DEFAULT 'open',  -- 'open' | 'closed'（保留兼容）
     status      TEXT    NOT NULL DEFAULT 'inbox', -- 看板状态：inbox/todo/doing/review/done/closed
+    labels      TEXT    NOT NULL DEFAULT '[]',    -- JSON 数组字符串
     author      TEXT    NOT NULL DEFAULT '',
     actor_type  TEXT    NOT NULL DEFAULT 'human', -- 'human' | 'agent'
     assignee    TEXT    NOT NULL DEFAULT '',      -- 当前负责人
@@ -120,6 +122,19 @@ def _now_iso() -> str:
     """生成 ISO 时间戳。sqlite3 不支持直接传 datetime，用字符串。"""
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _parse_labels(raw: Any) -> list[str]:
+    """把 issues.labels 列（JSON 数组字符串）解析为 list。容错旧数据/脏数据。"""
+    if not raw:
+        return []
+    try:
+        v = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if isinstance(v, list):
+        return [str(x) for x in v if x]
+    return []
 
 
 class InternalSource(IssueSource):
@@ -183,6 +198,10 @@ class InternalSource(IssueSource):
         if "actor_type" not in ccols:
             conn.execute("ALTER TABLE comments ADD COLUMN actor_type TEXT NOT NULL DEFAULT 'human'")
 
+        icols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
+        if "labels" not in icols:
+            conn.execute("ALTER TABLE issues ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'")
+
     def _row_to_resource(self, row: sqlite3.Row) -> Resource:
         return Resource(
             kind=row["kind"],
@@ -190,7 +209,7 @@ class InternalSource(IssueSource):
             title=row["title"],
             body=row["body"],
             state=row["state"],
-            labels=[],  # internal 暂不支持 label 过滤
+            labels=_parse_labels(row["labels"]) if "labels" in row.keys() else [],
             author=row["author"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -206,7 +225,7 @@ class InternalSource(IssueSource):
         """列出某项目的开放资源（status 在 ACTIVE_STATUSES 里）。
 
         keeper 主循环扫"开放"的 issue——done/closed 不再处理。
-        labels 在 internal 里暂不支持过滤。
+        labels 非空时，只返回 labels 与之有交集的资源（Python 侧过滤，不依赖 json1）。
         """
         if not kinds:
             return []
@@ -223,7 +242,11 @@ class InternalSource(IssueSource):
                 rows = conn.execute(sql, [repo, *kinds, *ACTIVE_STATUSES]).fetchall()
             finally:
                 conn.close()
-        return [self._row_to_resource(r) for r in rows]
+        resources = [self._row_to_resource(r) for r in rows]
+        if labels:
+            wanted = {l.lower() for l in labels}
+            resources = [r for r in resources if {l.lower() for l in r.labels} & wanted]
+        return resources
 
     def list_all(self, repo: str, kinds: list[str] | None = None) -> list[Resource]:
         """列出某项目的全部 issue（任意状态），给看板视图用。"""
@@ -296,15 +319,17 @@ class InternalSource(IssueSource):
 
     def create_issue(
         self, repo: str, kind: str, title: str, body: str, author: str,
-        *, actor_type: str = ACTOR_HUMAN,
+        *, actor_type: str = ACTOR_HUMAN, labels: list[str] | None = None,
     ) -> Resource:
         """提一个新 issue/PR。编号在 (project, kind) 内递增。
 
         actor_type=human → 默认 status=inbox（等人规划）
         actor_type=agent → 默认 status=todo（直接待处理）
+        labels 存为 JSON 数组字符串。
         """
         default_status = DEFAULT_STATUS_AGENT if actor_type == ACTOR_AGENT else DEFAULT_STATUS_HUMAN
         now = _now_iso()
+        labels_json = json.dumps(list(labels) if labels else [])
         with self._lock:
             conn = self._conn()
             try:
@@ -316,9 +341,9 @@ class InternalSource(IssueSource):
                 next_num = int(row["next_num"])
                 conn.execute(
                     "INSERT INTO issues "
-                    "(project, kind, number, title, body, state, status, author, actor_type, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
-                    [repo, kind, next_num, title, body, default_status, author, actor_type, now, now],
+                    "(project, kind, number, title, body, state, status, labels, author, actor_type, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+                    [repo, kind, next_num, title, body, default_status, labels_json, author, actor_type, now, now],
                 )
                 row = conn.execute(
                     "SELECT * FROM issues WHERE project = ? AND kind = ? AND number = ?",

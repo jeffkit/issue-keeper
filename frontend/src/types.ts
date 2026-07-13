@@ -16,6 +16,7 @@ export interface Issue {
   body: string;
   state: string;
   status: Status;
+  labels: string[];
   author: string;
   actor_type: ActorType;
   assignee: string;

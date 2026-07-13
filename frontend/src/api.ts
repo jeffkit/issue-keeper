@@ -39,6 +39,7 @@ export function createIssue(
     author: string;
     actor_type: ActorType;
     kind: Kind;
+    labels?: string[];
   },
 ): Promise<Issue> {
   return j(

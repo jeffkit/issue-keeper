@@ -77,6 +77,16 @@ class TestDashboardApi:
         })
         assert r.json()["status"] == "todo"
 
+    def test_create_with_labels_echoed(self, tmp_path):
+        c = _client(tmp_path)
+        r = c.post("/api/projects/p/issues", json={
+            "title": "a", "author": "x", "labels": ["bug", "ai"],
+        })
+        assert r.json()["labels"] == ["bug", "ai"]
+        # 列表里也能拿到
+        listed = c.get("/api/projects/p/issues").json()
+        assert listed[0]["labels"] == ["bug", "ai"]
+
     def test_root_returns_index_or_hint(self, tmp_path):
         # 临时 db 路径下不会有 frontend/dist，但 dashboard 模块自带的 dist 检测
         # 是固定指向仓库 frontend/dist（构建后存在）。两种响应都接受。

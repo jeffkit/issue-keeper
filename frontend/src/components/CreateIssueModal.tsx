@@ -16,6 +16,7 @@ export function CreateIssueModal({ project, actorName, actorType, onClose, onCre
   const [kind, setKind] = useState<Kind>("issue");
   const [actorTypeLocal, setActorTypeLocal] = useState<ActorType>(actorType);
   const [author, setAuthor] = useState(actorName);
+  const [labelsText, setLabelsText] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -24,11 +25,13 @@ export function CreateIssueModal({ project, actorName, actorType, onClose, onCre
     setBusy(true);
     setErr("");
     try {
+      const labels = labelsText.split(",").map((s) => s.trim()).filter(Boolean);
       await createIssue(project, {
         title, body,
         author: author || "anonymous",
         actor_type: actorTypeLocal,
         kind,
+        labels,
       });
       onCreated();
     } catch (e) {
@@ -71,6 +74,13 @@ export function CreateIssueModal({ project, actorName, actorType, onClose, onCre
           <option value="human">human（默认进 inbox）</option>
           <option value="agent">agent（默认进 todo）</option>
         </select>
+
+        <label>标签（逗号分隔）</label>
+        <input
+          value={labelsText}
+          onChange={(e) => setLabelsText(e.target.value)}
+          placeholder="bug, ai, ..."
+        />
 
         <div className="right">
           <button className="link" onClick={onClose}>取消</button>
