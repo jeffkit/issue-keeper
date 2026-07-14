@@ -320,7 +320,7 @@ dashboard 不依赖 `config.yaml`，直接用 `--db` 指向 internal source 的 
 ## 前置依赖
 
 - Python 3.11+，安装依赖：`pip install -r requirements.txt`
-- `agentproc` CLI 已安装——用于调 agent。推荐 PyPI 包（wire 0.3，含 hub 缓存 `_shared` 修复）：`pip install "agentproc>=0.7.1"`；旧版 npm 包 `npm install -g agentproc`（0.4.x，wire 0.2）也能跑但建议升级。若 PATH 上 `agentproc` 解析到非预期版本，用环境变量 `AGENTPROC_BIN=/abs/path/agentproc` 显式指定
+- `agentproc` CLI 已安装——用于调 agent。要求 PyPI 包 wire 0.4：`pip install "agentproc>=0.9.0"`。升级后若 hub 缓存仍是旧 wire，跑一次 `agentproc hub run claude-code --refresh -p hi`（或清 `~/.agentproc/cache/hub`）。若 PATH 上 `agentproc` 解析到 npm 旧版，用 `AGENTPROC_BIN=/abs/path/agentproc` 显式指定
 - 至少一个 AgentProc profile：`binding.profile` 可以是 hub 名（如 `claude-code`，agentproc 自动从 CDN 拉取并缓存），或本地 `.yaml` 路径
 - 对应 agent CLI 已安装并配好凭据（如 `deepseek` CLI + `DEEPSEEK_API_KEY`、`claude` CLI + `ANTHROPIC_API_KEY`）。凭据通过 `binding.env` 注入，支持 `${VAR}` 插值
 - `gh` CLI 已安装并登录 —— 仅 `source: github_cli` 需要
@@ -394,8 +394,9 @@ python -m issue_keeper team list
 - `--cwd <binding.cwd>`：agent 工作目录。**这是动态切换项目上下文的关键**——一个 hub profile 通吃所有项目，不用每项目自建 profile
 - `--session <session_id>`：续接同一 issue/PR 的 agent 会话
 - `--from <agent_from_user>`：来源标识
-- `--stdin`：消息通过 stdin 管道传入，避免命令行长度限制（ARG_MAX）。注：agentproc 0.4.x 的 `--stdin` 曾有 bug（消息为空），wire 0.3（NDJSON turn object）已修复，现切回 --stdin
-- `--env KEY=VALUE`：`binding.env` 里每个变量都经 `--env` 透传给 agent。**agentproc 0.7.0+ 不再继承父进程全量 env**（只传 infra 集 + profile env 块的 allowlist 变量 + CLI `--env`），所以非 allowlist 的变量（如 `ANTHROPIC_BASE_URL`）必须走 `--env` 才能到 agent；0.4.x 也支持 `--env`，故两版兼容
+- `--stdin`：消息通过 stdin 管道传入，避免命令行长度限制（ARG_MAX）
+- `--quiet --no-stream`：抑制协议 NDJSON；关闭 streaming，确保 wire 0.4 下 stdout 取自 `{"type":"result"}`（否则 `claude-code` 等 streaming profile 在 quiet 模式下会得到空回复）
+- `--env KEY=VALUE`：`binding.env` 里每个变量都经 `--env` 透传给 agent。**agentproc 0.7.0+ 不再继承父进程全量 env**（只传 infra 集 + profile env 块的 allowlist 变量 + CLI `--env`），所以非 allowlist 的变量（如 `ANTHROPIC_BASE_URL`）必须走 `--env` 才能到 agent
 
 agent 收到的消息会明确告诉它：
 

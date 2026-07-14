@@ -45,7 +45,7 @@ class ProfileEntry:
 
 @dataclass
 class AgentReply:
-    session_id: str | None  # agent 返回的 AGENT_SESSION:<uuid>（若有）
+    session_id: str | None  # agent 返回的 session id（stderr agentproc:session:）
     text: str               # 回复正文
 
 
@@ -95,24 +95,28 @@ def _build_command(entry: ProfileEntry, session_id: str,
 
     message 通过 stdin 传给 agentproc 的 --stdin，避免命令行长度限制。
 
-    env 通过 --env KEY=VALUE 显式传。这是 agentproc 0.7.0（wire 0.3）的硬要求：
-    新 runner 不再继承父进程全量 env，只传 infra 集 + profile env 块（allowlist
-    过滤）+ CLI --env 的 extraEnv；binding.env 里非 allowlist 的变量（如
-    ANTHROPIC_BASE_URL）只有走 --env 才能到 agent。--env 在 0.4.0 也支持，冗余但无害。
+    env 通过 --env KEY=VALUE 显式传。agentproc 0.7.0+ 不再继承父进程全量 env，
+    只传 infra 集 + profile env 块（allowlist 过滤）+ CLI --env；binding.env 里
+    非 allowlist 的变量（如 ANTHROPIC_BASE_URL）只有走 --env 才能到 agent。
+
+    --no-stream 是 wire 0.4（agentproc 0.9+）的硬要求：streaming profile
+    （如 claude-code）若转发了 partial，runner 会把最终 reply 置空以免与
+    result.text 重复；CLI 即使 --quiet 也会注册 on_partial，导致 stdout 空。
+    批处理场景不需要流式，关掉后 reply 取自 {"type":"result"}。
     """
     if entry.is_hub:
         cmd = [AGENTPROC_BIN, "hub", "run", entry.name]
     else:
         cmd = [AGENTPROC_BIN, "--profile", entry.name]
 
-    cmd += ["--quiet", "--stdin"]
+    cmd += ["--quiet", "--no-stream", "--stdin"]
     if entry.cwd:
         cmd += ["--cwd", entry.cwd]
     if session_id:
         cmd += ["--session", session_id]
     if from_user:
         cmd += ["--from", from_user]
-    # binding.env 经 --env 透传给 agent（绕过 0.7.0 的 env_allowlist 过滤）
+    # binding.env 经 --env 透传给 agent（绕过 env_allowlist 过滤）
     for k, v in entry.env.items():
         cmd += ["--env", f"{k}={v}"]
     if entry.timeout_secs:
@@ -125,12 +129,11 @@ def _build_command(entry: ProfileEntry, session_id: str,
 def _parse_reply(stdout: str, stderr: str) -> AgentReply:
     """解析 agentproc 输出。
 
-    agentproc 的输出契约（来自 --help）：
-      stderr → 协议行（AGENT_PARTIAL:, AGENT_SESSION:, AGENT_ERROR:）
-      stdout → 最终回复正文（非协议行）
-      最终 session id 印在 stderr 的 `agentproc:session:<id>` 行
+    agentproc CLI 输出契约：
+      stdout → 最终回复正文（wire 0.4 来自 {"type":"result"}）
+      stderr → `agentproc:session:<id>` / `agentproc:error:<msg>`
+               （--quiet 抑制协议 NDJSON，这两行仍会印）
 
-    我们用 --quiet 抑制协议行，但 `agentproc:session:<id>` 仍会在 stderr。
     stdout 整体作为回复正文。
     """
     text = stdout.strip()
@@ -185,19 +188,11 @@ def invoke_agent(
             f"stderr: {proc.stderr.strip()[:2000]}"
         )
 
-    # 即使 exit=0，agentproc 也可能在 stderr 报错。兼容两种 wire：
-    #   0.2 旧协议：`AGENT_ERROR:<msg>`
-    #   0.3 新协议：`agentproc:error:<msg>`（NDJSON 事件经 CLI 汇总后的行）
-    error_prefix = None
+    # 即使 exit=0，agentproc 也可能在 stderr 报错（CLI 汇总行）。
     for line in proc.stderr.splitlines():
-        if line.startswith("AGENT_ERROR:") or line.startswith("agentproc:error:"):
-            error_prefix = "AGENT_ERROR:" if line.startswith("AGENT_ERROR:") else "agentproc:error:"
+        if line.startswith("agentproc:error:") or line.startswith("AGENT_ERROR:"):
+            log.warning("agent 报错: %s", line)
+            # 不 raise——有些 agent 错误仍带部分输出；让 keeper 决定要不要发
             break
-    if error_prefix:
-        for line in proc.stderr.splitlines():
-            if line.startswith(error_prefix):
-                log.warning("agent 报错: %s", line)
-                # 不 raise——有些 agent 错误仍带部分输出；让 keeper 决定要不要发
-                break
 
     return _parse_reply(proc.stdout, proc.stderr)
