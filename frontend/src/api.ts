@@ -5,6 +5,7 @@ import type {
   Status,
   ActorType,
   Kind,
+  Role,
   TeamMember,
 } from "./types";
 
@@ -22,6 +23,45 @@ async function j<T>(resP: Promise<Response>): Promise<T> {
 
 export function listProjects(): Promise<Project[]> {
   return j(fetch(`${BASE}/projects`));
+}
+
+export function createProject(data: {
+  name: string;
+  agent_label: string;
+  cwd: string;
+  profile: string;
+  source: "internal" | "github_cli" | "github_token";
+  github_token?: string;
+  monitor_prs?: boolean;
+  env?: Record<string, string>;
+  role: Role;
+}): Promise<{ project: string; agent_label: string; role: Role; created: boolean }> {
+  return j(
+    fetch(`${BASE}/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  );
+}
+
+export function updateProject(
+  name: string,
+  data: { role?: Role; agent_label?: string; cwd?: string; intro?: string },
+): Promise<{ project: string; role: Role; agent_label: string; cwd: string; intro: string }> {
+  return j(
+    fetch(`${BASE}/projects/${encodeURIComponent(name)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(data),
+    }),
+  );
+}
+
+export function deleteProject(name: string): Promise<{ project: string; deleted: boolean }> {
+  return j(
+    fetch(`${BASE}/projects/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  );
 }
 
 export function listTeam(): Promise<TeamMember[]> {

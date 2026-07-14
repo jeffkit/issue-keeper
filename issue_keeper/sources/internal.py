@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS projects (
     monitor_prs  INTEGER NOT NULL DEFAULT 0,
     env          TEXT NOT NULL DEFAULT '',   -- JSON：项目级 env 覆盖（${VAR} 占位，不存明文密钥）
     intro        TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT 'agent',  -- 'agent'（默认，负责本仓代码/issue）| 'keeper'（管理向，帮人类管 issue）
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
@@ -216,7 +217,7 @@ class InternalSource(IssueSource):
         if "labels" not in icols:
             conn.execute("ALTER TABLE issues ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'")
 
-        # projects 表：补 monitor_prs / env（旧库可能已建了 projects 但缺这两列）
+        # projects 表：补 monitor_prs / env / role（旧库可能已建了 projects 但缺这些列）
         pcols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
         if pcols:
             if "monitor_prs" not in pcols:
@@ -225,6 +226,8 @@ class InternalSource(IssueSource):
                 conn.execute("ALTER TABLE projects ADD COLUMN env TEXT NOT NULL DEFAULT ''")
             if "github_token" not in pcols:
                 conn.execute("ALTER TABLE projects ADD COLUMN github_token TEXT NOT NULL DEFAULT ''")
+            if "role" not in pcols:
+                conn.execute("ALTER TABLE projects ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'")
 
     def _row_to_resource(self, row: sqlite3.Row) -> Resource:
         return Resource(
@@ -526,17 +529,23 @@ class InternalSource(IssueSource):
                        cwd: str = "", profile: str = "", source: str = "internal",
                        github_token: str = "",
                        monitor_prs: bool = False,
-                       env: dict[str, str] | None = None) -> None:
-        """upsert 一行 projects。重跑时保留已有 intro；绑定字段（含 github_token/env）会覆盖。"""
+                       env: dict[str, str] | None = None,
+                       role: str = "agent") -> None:
+        """upsert 一行 projects。重跑时保留已有 intro / role；绑定字段（含 github_token/env）会覆盖。
+
+        role 只在 INSERT 时写入；ON CONFLICT 不覆盖——避免重新 sync 把已标成 keeper
+        的项目降级回 agent。要改 role 用 set_project_role。
+        """
         now = _now_iso()
         env_json = json.dumps(env, ensure_ascii=False) if env else ""
+        role = role if role in ("agent", "keeper") else "agent"
         with self._lock:
             conn = self._conn()
             try:
                 conn.execute(
                     "INSERT INTO projects "
-                    "(name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?) "
+                    "(name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro, role, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?) "
                     "ON CONFLICT(name) DO UPDATE SET "
                     "agent_label = excluded.agent_label, cwd = excluded.cwd, "
                     "profile = excluded.profile, source = excluded.source, "
@@ -544,10 +553,42 @@ class InternalSource(IssueSource):
                     "monitor_prs = excluded.monitor_prs, env = excluded.env, "
                     "updated_at = excluded.updated_at",
                     [name, agent_label, cwd, profile, source, github_token,
-                     1 if monitor_prs else 0, env_json, now, now],
+                     1 if monitor_prs else 0, env_json, role, now, now],
                 )
             finally:
                 conn.close()
+
+    def set_project_role(self, name: str, role: str) -> bool:
+        """设置某项目的 role（'agent' | 'keeper'）。返回是否命中。"""
+        if role not in ("agent", "keeper"):
+            raise ValueError(f"非法 role: {role}，合法值: agent / keeper")
+        now = _now_iso()
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute(
+                    "UPDATE projects SET role = ?, updated_at = ? WHERE name = ?",
+                    [role, now, name],
+                )
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def set_project_role_by_label(self, agent_label: str, role: str) -> str | None:
+        """按 agent_label 找项目并设 role。返回被更新的 project name，未命中返回 None。"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    "SELECT name FROM projects WHERE agent_label = ?",
+                    [agent_label],
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        self.set_project_role(row["name"], role)
+        return row["name"]
 
     def delete_project(self, name: str) -> bool:
         """删除一个项目绑定（不删它的 issue）。返回是否命中。"""
@@ -595,7 +636,7 @@ class InternalSource(IssueSource):
             conn = self._conn()
             try:
                 rows = conn.execute(
-                    "SELECT name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro "
+                    "SELECT name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro, role "
                     "FROM projects ORDER BY name"
                 ).fetchall()
             finally:
@@ -604,6 +645,7 @@ class InternalSource(IssueSource):
         for r in rows:
             d = dict(r)
             d["monitor_prs"] = bool(d.get("monitor_prs", 0))
+            d["role"] = d.get("role") or "agent"
             raw_env = d.get("env") or ""
             try:
                 d["env"] = json.loads(raw_env) if raw_env else {}
@@ -625,14 +667,14 @@ class InternalSource(IssueSource):
             try:
                 rows = conn.execute(
                     f"SELECT * FROM ("
-                    f"  SELECT p.name AS project, p.agent_label AS agent_label, p.intro AS intro, "
+                    f"  SELECT p.name AS project, p.agent_label AS agent_label, p.intro AS intro, p.role AS role, "
                     f"         COUNT(i.id) AS total, "
                     f"         SUM(CASE WHEN i.status IN ('{open_ph}') THEN 1 ELSE 0 END) AS open_n "
                     f"  FROM projects p "
                     f"  LEFT JOIN issues i ON i.project = p.name AND i.kind = 'issue' "
                     f"  GROUP BY p.name "
                     f"  UNION ALL "
-                    f"  SELECT i2.project AS project, '' AS agent_label, '' AS intro, "
+                    f"  SELECT i2.project AS project, '' AS agent_label, '' AS intro, 'agent' AS role, "
                     f"         COUNT(*) AS total, "
                     f"         SUM(CASE WHEN i2.status IN ('{open_ph}') THEN 1 ELSE 0 END) AS open_n "
                     f"  FROM issues i2 "
@@ -647,6 +689,7 @@ class InternalSource(IssueSource):
                 "project": r["project"],
                 "agent_label": r["agent_label"] or "",
                 "intro": r["intro"] or "",
+                "role": r["role"] or "agent",
                 "total": int(r["total"] or 0),
                 "open": int(r["open_n"] or 0),
             }

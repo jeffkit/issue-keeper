@@ -95,3 +95,45 @@ class TestDashboardApi:
         assert r.status_code == 200
         # 构建过 dist → index.html（text/html）；否则 JSON 提示
         assert "html" in r.headers["content-type"] or r.headers["content-type"].startswith("application/json")
+
+    def test_create_project_then_list_with_role(self, tmp_path):
+        c = _client(tmp_path)
+        r = c.post("/api/projects", json={
+            "name": "proj-a", "agent_label": "a-agent", "cwd": "/x/a",
+            "profile": "claude-code", "source": "internal", "role": "keeper",
+        })
+        assert r.status_code == 200
+        assert r.json()["role"] == "keeper"
+        # 出现在项目列表
+        ps = {p["project"]: p for p in c.get("/api/projects").json()}
+        assert ps["proj-a"]["agent_label"] == "a-agent"
+        assert ps["proj-a"]["role"] == "keeper"
+        # 出现在团队列表
+        team = {m["agent_label"]: m for m in c.get("/api/team").json()}
+        assert team["a-agent"]["role"] == "keeper"
+
+    def test_create_project_rejects_empty_name(self, tmp_path):
+        c = _client(tmp_path)
+        r = c.post("/api/projects", json={"name": "  "})
+        assert r.status_code == 400
+
+    def test_patch_project_role_and_delete(self, tmp_path):
+        c = _client(tmp_path)
+        c.post("/api/projects", json={"name": "p", "agent_label": "a-agent", "cwd": "/x"})
+        # 默认 agent
+        assert {p["project"]: p for p in c.get("/api/projects").json()}["p"]["role"] == "agent"
+        # PATCH 改成 keeper
+        r = c.patch("/api/projects/p", json={"role": "keeper"})
+        assert r.status_code == 200 and r.json()["role"] == "keeper"
+        # PATCH 404
+        assert c.patch("/api/projects/none", json={"role": "keeper"}).status_code == 404
+        # DELETE
+        assert c.delete("/api/projects/p").status_code == 200
+        assert c.delete("/api/projects/p").status_code == 404
+        assert all(p["project"] != "p" for p in c.get("/api/projects").json())
+
+    def test_create_project_defaults_role_agent(self, tmp_path):
+        c = _client(tmp_path)
+        c.post("/api/projects", json={"name": "p", "agent_label": "a", "cwd": "/x"})
+        ps = {p["project"]: p for p in c.get("/api/projects").json()}
+        assert ps["p"]["role"] == "agent"

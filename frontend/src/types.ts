@@ -49,10 +49,15 @@ export interface IssueDetail extends Issue {
   history: HistoryEntry[];
 }
 
+export type Role = "agent" | "keeper";
+
 export interface Project {
   project: string;
   total: number;
   open: number;
+  role: Role;
+  agent_label: string;
+  intro: string;
 }
 
 export interface TeamMember {
@@ -60,6 +65,7 @@ export interface TeamMember {
   agent_label: string;
   cwd: string;
   intro: string;
+  role: Role;
 }
 
 export const STATUS_ORDER: Status[] = [

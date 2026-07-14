@@ -23,6 +23,25 @@ agent_from_user: "issue-keeper"
 # 每个 repo 也可单独配 review_agent 覆盖此全局默认。
 default_review_agent: "reviewer-agent"
 
+# 单一人类模型：keeper 代谁 review / HitL 永远推给这一个人（ilink 通道只推给一个激活用户）。
+human_label: "human"
+
+# ─── keeper 巡检（代人类 review / 主动分诊）──────────────────────────────
+# keeper（role=keeper 的绑定，如 issue-keeper-agent）定期巡检「等人处理」的 issue：
+#   - 人提的 issue 停在 review（agent 已回复等人接手）→ keeper 代为 review。
+#   - 人提的 issue 停在 inbox 超过 stale_inbox_secs → keeper 代为分诊。0 = 只看 review。
+# 每 interval_cycles 轮跑一次（防每轮打扰人类）；每条 issue 无新活动不重复巡检/HitL。
+# 需要 keeper 绑定 role=keeper + 接好 hitl MCP（见 README「keeper 的 HitL 接入」）。
+keeper_patrol:
+  enabled: true
+  interval_cycles: 4        # 4 × poll_interval ≈ 20min
+  stale_inbox_secs: 7200    # inbox 停留超过 2h 纳入巡检；0 = 只看 review
+  max_per_cycle: 5          # 每轮最多巡检多少条候选 issue
+
+# keeper agent 的调用超时（秒）。keeper 可能用 HitL 等人类回复（hitl --timeout 3600 = 1h），
+# 所以默认 65min，比普通 agent 的 default_timeout_secs 大。仅对 role=keeper 的绑定生效。
+keeper_timeout_secs: 3900
+
 # ─── 安全过滤层（screener）────────────────────────────────────────────
 # 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。
 # 这一层在 keeper 进程内完成，不起子进程、无本地权限。

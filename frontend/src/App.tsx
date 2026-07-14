@@ -14,6 +14,7 @@ import { STATUS_ORDER, type Issue, type Kind, type Project, type Status, type Te
 import { Board } from "./components/Board";
 import { IssueDetail } from "./components/IssueDetail";
 import { CreateIssueModal } from "./components/CreateIssueModal";
+import { CreateProjectModal } from "./components/CreateProjectModal";
 import { TeamPanel } from "./components/TeamPanel";
 
 type View = "board" | "team";
@@ -25,6 +26,7 @@ export default function App() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [selected, setSelected] = useState<Issue | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showCreateProject, setShowCreateProject] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [activeId, setActiveId] = useState<number | null>(null);
@@ -79,6 +81,18 @@ export default function App() {
     listIssues(project, kind).then(setIssues).catch((e) => setError(String(e)));
   }
 
+  function refreshProjects(selectName?: string) {
+    listProjects().then((ps) => {
+      setProjects(ps);
+      if (selectName && ps.some((p) => p.project === selectName)) {
+        setProject(selectName);
+      } else if (!project && ps.length > 0) {
+        setProject(ps[0].project);
+      }
+    }).catch((e) => setError(String(e)));
+    listTeam().then((t) => setTeamCount((t as TeamMember[]).length)).catch(() => setTeamCount(0));
+  }
+
   function onDragStart(e: DragStartEvent) {
     setActiveId(Number(e.active.id));
   }
@@ -125,10 +139,10 @@ export default function App() {
           {view === "board" && (
             <>
               <select value={project} onChange={(e) => setProject(e.target.value)} disabled={!projects.length}>
-                {projects.length === 0 && <option value="">（无项目）</option>}
+                {projects.length === 0 && <option value="">（无项目，点「+ 项目」新建）</option>}
                 {projects.map((p) => (
                   <option key={p.project} value={p.project}>
-                    {p.project}（{p.open}/{p.total}）
+                    {p.project}（{p.open}/{p.total}）{p.role === "keeper" ? " · keeper" : ""}
                   </option>
                 ))}
               </select>
@@ -136,6 +150,9 @@ export default function App() {
                 <option value="issue">issue</option>
                 <option value="pr">PR</option>
               </select>
+              <button className="mini" onClick={() => setShowCreateProject(true)} title="新建项目绑定">
+                + 项目
+              </button>
               <button className="primary" onClick={() => setShowCreate(true)} disabled={!project}>
                 + 新建
               </button>
@@ -204,6 +221,17 @@ export default function App() {
           actorType={actorType}
           onClose={() => setShowCreate(false)}
           onCreated={() => { setShowCreate(false); refresh(); }}
+        />
+      )}
+
+      {showCreateProject && (
+        <CreateProjectModal
+          onClose={() => setShowCreateProject(false)}
+          onCreated={(name) => {
+            setShowCreateProject(false);
+            refreshProjects(name);
+            setView("board");
+          }}
         />
       )}
     </div>

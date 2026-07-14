@@ -256,7 +256,7 @@ def _run_team(args) -> int:
     """项目绑定 + 团队介绍管理 CLI。数据存 internal.db 的 projects 表。"""
     from .sources.internal import DEFAULT_DB
     from .team import (add_project_to_db, import_from_config, load_team,
-                       remove_project_from_db, set_intro)
+                       remove_project_from_db, set_intro, set_role)
 
     db_path = args.db or str(DEFAULT_DB)
 
@@ -279,8 +279,9 @@ def _run_team(args) -> int:
             profile=args.profile, source=args.source,
             github_token=args.github_token,
             monitor_prs=args.monitor_prs, env=env or None,
+            role=args.role,
         )
-        print(f"已写入项目绑定: repo={args.repo}, agent_label={args.agent_label}, cwd={args.cwd}")
+        print(f"已写入项目绑定: repo={args.repo}, agent_label={args.agent_label}, cwd={args.cwd}, role={args.role}")
         return 0
 
     if args.team_cmd == "remove":
@@ -300,6 +301,15 @@ def _run_team(args) -> int:
         print(f"已设置 {args.agent_label}（项目 {name}）的介绍（{len(args.intro)} 字）")
         return 0
 
+    if args.team_cmd == "set-role":
+        name = set_role(args.agent_label, args.role, db_path)
+        if name is None:
+            print(f"找不到 agent_label={args.agent_label}，请先 `team add` 添加项目",
+                  file=sys.stderr)
+            return 1
+        print(f"已设置 {args.agent_label}（项目 {name}）的角色为 {args.role}")
+        return 0
+
     if args.team_cmd == "list":
         members = load_team(db_path)
         if not members:
@@ -308,7 +318,8 @@ def _run_team(args) -> int:
         print(f"项目绑定 + 团队（共 {len(members)} 个，db {db_path}）：")
         for m in members:
             prs = " [监控PR]" if m.monitor_prs else ""
-            print(f"\n  {m.agent_label}")
+            role_tag = " [keeper]" if m.role == "keeper" else ""
+            print(f"\n  {m.agent_label}{role_tag}")
             print(f"    项目: {m.project}  profile={m.profile}  source={m.source}{prs}")
             if m.cwd:
                 print(f"    工作目录: {m.cwd}")
@@ -339,9 +350,9 @@ def _run_onboard(args) -> int:
     # 1) 写 db 绑定（单一配置源）
     add_project_to_db(
         db_path, repo=repo, agent_label=agent_label, cwd=str(project_path),
-        profile=args.profile,
+        profile=args.profile, role=args.role,
     )
-    print(f"已写入 db 绑定: repo={repo}, agent_label={agent_label}, cwd={project_path}（db: {db_path}）")
+    print(f"已写入 db 绑定: repo={repo}, agent_label={agent_label}, cwd={project_path}, role={args.role}（db: {db_path}）")
 
     # 2) 可选：生成自我介绍
     if args.gen_intro:
@@ -429,6 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     p_add.add_argument("--monitor-prs", action="store_true", help="是否监控 PR")
     p_add.add_argument("--env", action="append", default=[],
                        help="项目级 env 覆盖，格式 KEY=VALUE（可重复；密钥用 ${VAR} 占位）")
+    p_add.add_argument("--role", default="agent", choices=["agent", "keeper"],
+                       help="角色：agent（默认，负责本仓代码/issue）/ keeper（管理向，帮人类管 issue）")
 
     p_remove = team_sub.add_parser("remove", help="从 db 删除一个项目绑定（不删 issue）")
     p_remove.add_argument("repo", help="项目名")
@@ -436,6 +449,11 @@ def main(argv: list[str] | None = None) -> int:
     p_intro = team_sub.add_parser("set-intro", help="设置某 agent 的自我介绍")
     p_intro.add_argument("agent_label", help="agent 身份标签")
     p_intro.add_argument("--intro", required=True, help="介绍正文")
+
+    p_role = team_sub.add_parser("set-role", help="设置某 agent 的角色（agent / keeper）")
+    p_role.add_argument("agent_label", help="agent 身份标签")
+    p_role.add_argument("--role", required=True, choices=["agent", "keeper"],
+                        help="角色：agent（负责本仓代码/issue）/ keeper（管理向）")
 
     p_list = team_sub.add_parser("list", help="列出项目绑定 + 团队介绍")
 
@@ -450,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     onb_parser.add_argument("--profile", default="claude-code", help="agentproc profile（默认 claude-code）")
     onb_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
     onb_parser.add_argument("--gen-intro", action="store_true", help="调 agent 自动生成自我介绍并写入 db")
+    onb_parser.add_argument("--role", default="agent", choices=["agent", "keeper"],
+                            help="角色：agent（默认）/ keeper（管理向，帮人类管 issue）")
     onb_parser.add_argument("--reload", action="store_true", help="立即重载 keeper daemon（macOS launchd）；不加重载则等下一轮 live-reload")
 
     # internal source 管理

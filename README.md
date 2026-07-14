@@ -255,6 +255,80 @@ python -m issue_keeper dashboard --port 8080 --db /path/to/internal.db --agent-l
 
 浏览器打开 `http://127.0.0.1:7433` 即可。顶栏可切项目、切 issue/PR、设置「当前身份」（你以谁的名义发评论/改状态，会存 localStorage）。卡片在六列之间拖拽即触发 `move`；点卡片标题打开详情面板。顶栏「看板 / 团队成员」切换看板视图与团队视图。
 
+### 在 dashboard 里创建项目
+
+顶栏「+ 项目」按钮打开新建项目弹窗，等价于 CLI 的 `team add`：
+
+- 项目名（对应 binding.repo，可写 `proj-a` 或 `owner/repo`）
+- agent 身份标签（默认 `<项目名>-agent`）
+- 工作目录（cwd，agent 跑的上下文）
+- profile（默认 `claude-code`）
+- issue 来源（internal / github_token / github_cli）
+- 角色（agent / keeper，见下文「keeper 角色」）
+- 是否监控 PR
+
+写进 db 的 `projects` 表，keeper 下一轮 live-reload 自动接手。后端对应 `POST /api/projects`，另支持 `PATCH /api/projects/{name}`（改 role / agent_label / cwd / intro）与 `DELETE /api/projects/{name}`（删绑定，不删 issue）。
+
+### keeper 角色（管理向 agent）
+
+每个项目绑定有个 `role` 字段，两种取值：
+
+| role | 职责 |
+|---|---|
+| `agent`（默认） | 负责本仓的代码与 issue——别人/别的 agent 提的 issue，它来分析、回复、改代码、驱动状态流转 |
+| `keeper` | 管理向，**不以改本仓代码为主职**。帮人类管 issue、代理人类跨项目提问、issue 回弹给人类时优先解答/分诊、必要时通过 HitL 联系人类拿反馈 |
+
+`keeper` 角色在 keeper daemon 里会拿到一套**专属系统提示词**（区别于普通代码 agent 的提示词），明确告诉它：分类/规划/驱动状态、用 `internal create` 代理人类跨项目提问、回弹 issue 优先自答、用 `hitl` MCP 的 `send_and_wait_reply` / `send_message_only` 联系人类。
+
+> keeper 角色由 daemon 驱动，会响应 issue 变更事件——这区别于你在 Cursor/对话里直接对话的 agent（那个只在你主动对话时工作）。issue-keeper 项目本身的 `issue-keeper-agent` 已被标为 `keeper`，是本协同系统的「协同管家」。
+
+标记 / 查看 role：
+
+```bash
+# CLI 标记
+python -m issue_keeper team set-role issue-keeper-agent --role keeper
+python -m issue_keeper team list           # 输出里 keeper 会带 [keeper] 标记
+
+# 新建项目时直接指定
+python -m issue_keeper team add proj-x --agent-label proj-x-agent --cwd ~/p/x --role keeper
+python -m issue_keeper onboard ~/p/x --agent-label proj-x-agent --role keeper --gen-intro
+```
+
+dashboard 的「团队成员」页给 keeper 显示醒目的金色 keeper 徽章 + 卡片描边，并可一键「标为 keeper / 取消 keeper」（调 `PATCH /api/projects/{name}`）。
+
+### keeper 的 HitL 接入
+
+keeper 要真能调 `send_and_wait_reply` 联系人类，需要它跑的 claude-code 环境里注册了 `hitl` MCP 服务。keeper agent 通过 `agentproc hub run claude-code --cwd <issue-keeper 仓>` 调起，claude-code 跑 `claude -p --dangerously-skip-permissions`，会自动加载项目根的 `.mcp.json`。所以 issue-keeper 仓根放了一份 `.mcp.json`（已加进 `.gitignore`，含本机绝对路径），把 `hitl` MCP 指向本机的 hil-mcp 服务（ilink 引擎，`http://localhost:8081`，`--timeout 300` 让 `send_and_wait_reply` 最多等 5 分钟，配合 agent 10 分钟超时）。
+
+前提：hil-mcp 服务在本机 8081 已跑、ilink 已激活（微信能收消息）。若没有，参考 `hil-mcp-setup` skill 配置。换机/换路径时改 `.mcp.json` 即可。keeper 下一轮调用就是新 claude 进程，会自动加载新 `.mcp.json`，无需重启 daemon。
+
+> `.mcp.json` 里 hitl 的 `--timeout 3600`（1 小时）控制 `send_and_wait_reply` 最多等人类回复多久。配套地，`config.yaml` 的 `keeper_timeout_secs: 3900`（65 分钟）把 keeper agent 的调用超时调到比 HitL 等待更长，否则 agent 子进程会先于 HitL 超时被杀。普通项目 agent 仍用 `default_timeout_secs`（10 分钟）不变。
+
+### keeper 巡检：代人类 review / 主动分诊
+
+keeper 不只被动处理 issue-keeper 项目自己的 issue，还会**代人类巡检所有 internal 项目里「等人处理」的 issue**——即场景「人类没及时查看/回复，keeper 前置处理一道」：
+
+- **巡检对象**：人提的 issue 停在 `review`（agent 已回复等人接手）→ keeper 代为 review；人提的 issue 停在 `inbox` 超过 `stale_inbox_secs`（人类没及时规划）→ keeper 代为分诊。agent 自己提的 issue 不纳入（由各 agent 自 review）。
+- **keeper 怎么处理**：读 issue + agent 的回复/讨论，自己判断——
+  - 明显 OK → 用 `internal move ... --status done` 代人类通过；
+  - 需要人拍板 → 用 hitl 的 `send_and_wait_reply` 给人类发**一个**聚焦问题，拿到回复再 move/comment；
+  - 也可先 `internal comment` 补一条分诊/澄清。
+- **防刷屏**：每条 issue 巡检后记下 `updated_at` 快照，**没有新活动就不重复巡检、不重复 HitL**；keeper 自己发的评论会更新 `updated_at`，所以巡检后立刻把快照推进到新值，避免自己触发自己。整体每 `interval_cycles` 轮才跑一次（默认 4 × 300s ≈ 20min）。
+- **防循环**：keeper 的评论带 bot marker，各项目自己的 agent 会跳过，不会互相触发。
+- **单一人类**：`human_label` 配置谁是「那个人」；所有 HitL 都推给这一个激活用户（ilink 通道机制）。
+
+```yaml
+# config.yaml
+human_label: "kongjie"
+keeper_patrol:
+  enabled: true
+  interval_cycles: 4        # 每 4 轮跑一次巡检
+  stale_inbox_secs: 7200    # inbox 超 2h 纳入巡检；0 = 只看 review
+  max_per_cycle: 5          # 每轮最多巡检 5 条
+```
+
+> 当前只巡检 `internal` source 的项目（跨项目协同系统都在 internal db）。github source 项目的 review 暂不纳入，后续可加。`--once` 一次性扫描默认不触发巡检（巡检按轮次节流，daemon 模式才生效）。
+
 ### 团队成员（team）
 
 多项目协作时，dashboard 的「团队成员」页展示参与工作的所有 agent 及其自我介绍。数据存在 `internal.db` 的 `projects` 表——既是团队介绍、也是项目绑定的**单一配置源**。`team` CLI 维护：
@@ -292,7 +366,7 @@ DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY python3 -m issue_keeper onboard \
 ### 人类如何参与协同
 
 - **作为参与者**：在 dashboard 选项目提 issue / 评论（顶栏设「当前身份」），或用 `internal create` CLI。注意 issue 正文写成正常 bug/需求，不要写成对 AI 的直接指令（会被 screener 当注入跳过）。
-- **作为管理者**：`issue-keeper` 项目本身有 `issue-keeper-agent`（cwd 就是 issue-keeper 仓，有 bash 能力），充当「协同管家」。在 `issue-keeper` 项目提管理类 issue（如「把 foo 项目加进协同」「更新某 agent 介绍」），issue-keeper-agent 会调 `onboard`/`team` CLI 执行并回复。
+- **作为管理者**：`issue-keeper` 项目本身有 `issue-keeper-agent`（cwd 就是 issue-keeper 仓，有 bash 能力），`role=keeper`，充当「协同管家」。在 `issue-keeper` 项目提管理类 issue（如「把 foo 项目加进协同」「更新某 agent 介绍」），keeper 会调 `onboard`/`team` CLI 执行、代理人类跨项目提问、必要时通过 HitL 联系你拿反馈并回复。详见上节「keeper 角色」。
 
 **开发模式**（改前端代码热更新）：
 
@@ -376,7 +450,7 @@ python -m issue_keeper team list
 
 从旧版（`repos:` 写在 yaml）升级，一次性迁移：`python -m issue_keeper team import --config <旧 config.yaml>`（旧 team.json 的 intro 也会一并迁进 db，team.json 改名 `.migrated` 备份）。
 
-> db `projects` 表目前存：name / agent_label / cwd / profile / source / github_token / monitor_prs / env / intro。少数旧字段（per-repo `labels` / `pr_labels` / `review_agent` / `timeout_secs`）暂未入库，用全局默认；确需 per-project 差异可后续加列。
+> db `projects` 表目前存：name / agent_label / cwd / profile / source / github_token / monitor_prs / env / intro / role。少数旧字段（per-repo `labels` / `pr_labels` / `review_agent` / `timeout_secs`）暂未入库，用全局默认；确需 per-project 差异可后续加列。
 
 ### AgentProc profile
 
@@ -429,7 +503,7 @@ python -m issue_keeper dashboard            # 默认 127.0.0.1:7433
 ## 测试
 
 ```bash
-python -m pytest -q                         # 67 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API
+python -m pytest -q                         # 94 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API（含建项目、keeper 角色）/ keeper 巡检
 ```
 
 ## 状态文件

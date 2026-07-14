@@ -232,6 +232,47 @@ class TestProjectsTable:
         assert counts["ghost"]["total"] == 1
         assert counts["ghost"]["agent_label"] == ""  # 无元数据
 
+    def test_upsert_role_on_insert_and_default_agent(self, tmp_path):
+        src = _src(tmp_path)
+        src.upsert_project(name="proj-a", agent_label="a-agent", cwd="/x", role="keeper")
+        m = {x["name"]: x for x in src.list_projects_meta()}["proj-a"]
+        assert m["role"] == "keeper"
+        # 不传 role 默认 agent
+        src.upsert_project(name="proj-b", agent_label="b-agent", cwd="/y")
+        m2 = {x["name"]: x for x in src.list_projects_meta()}["proj-b"]
+        assert m2["role"] == "agent"
+
+    def test_upsert_preserves_role_on_resync(self, tmp_path):
+        """重新 upsert 不应把已标成 keeper 的项目降级回 agent。"""
+        src = _src(tmp_path)
+        src.upsert_project(name="proj-a", agent_label="a-agent", role="keeper")
+        # 模拟 sync 重跑，不传 role（默认 agent）
+        src.upsert_project(name="proj-a", agent_label="a-agent-v2", cwd="/y")
+        m = {x["name"]: x for x in src.list_projects_meta()}["proj-a"]
+        assert m["role"] == "keeper"
+        assert m["agent_label"] == "a-agent-v2"
+
+    def test_set_project_role_and_by_label(self, tmp_path):
+        import pytest
+        src = _src(tmp_path)
+        src.upsert_project(name="proj-a", agent_label="a-agent")
+        assert src.set_project_role("proj-a", "keeper") is True
+        with pytest.raises(ValueError):
+            src.set_project_role("proj-a", "bogus")  # 非法 role 抛错
+        m = {x["name"]: x for x in src.list_projects_meta()}["proj-a"]
+        assert m["role"] == "keeper"
+        # by label
+        assert src.set_project_role_by_label("a-agent", "agent") == "proj-a"
+        assert src.set_project_role_by_label("nope", "agent") is None
+        m2 = {x["name"]: x for x in src.list_projects_meta()}["proj-a"]
+        assert m2["role"] == "agent"
+
+    def test_counts_include_role(self, tmp_path):
+        src = _src(tmp_path)
+        src.upsert_project(name="k", agent_label="k-agent", role="keeper")
+        counts = {p["project"]: p for p in src.list_projects_with_counts()}
+        assert counts["k"]["role"] == "keeper"
+
 
 class TestTeamDbOps:
     def _old_yaml(self, tmp_path, db_path) -> str:

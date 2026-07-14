@@ -34,6 +34,7 @@ class TeamMember:
     profile: str = ""
     source: str = "internal"
     monitor_prs: bool = False
+    role: str = "agent"   # 'agent' | 'keeper'
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,6 +64,7 @@ def load_team(db_path: str | None = None) -> list[TeamMember]:
             profile=m["profile"],
             source=m["source"],
             monitor_prs=bool(m.get("monitor_prs", False)),
+            role=m.get("role") or "agent",
         )
         for m in src.list_projects_meta()
     ]
@@ -74,14 +76,21 @@ def add_project_to_db(
     profile: str = "claude-code", source: str = "internal",
     github_token: str = "",
     monitor_prs: bool = False, env: dict[str, str] | None = None,
+    role: str = "agent",
 ) -> None:
-    """新增/更新一个项目绑定到 db（on conflict 覆盖绑定字段、保留 intro）。"""
+    """新增/更新一个项目绑定到 db（on conflict 覆盖绑定字段、保留 intro/role）。"""
     src = _source(db_path)
     src.upsert_project(
         name=repo, agent_label=agent_label, cwd=cwd,
         profile=profile, source=source, github_token=github_token,
-        monitor_prs=monitor_prs, env=env,
+        monitor_prs=monitor_prs, env=env, role=role,
     )
+
+
+def set_role(agent_label: str, role: str, db_path: str | None = None) -> str | None:
+    """给某个 agent 设置 role（按 agent_label 找项目）。返回被更新的 project name，未命中返回 None。"""
+    src = _source(db_path)
+    return src.set_project_role_by_label(agent_label, role)
 
 
 def remove_project_from_db(db_path: str | None = None, *, repo: str) -> bool:

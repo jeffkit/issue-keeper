@@ -10,6 +10,9 @@ config.yaml
 state.json
 .issue-keeper/
 
+# keeper agent 的项目级 MCP 配置（含本机绝对路径，不入库）
+.mcp.json
+
 # 编辑器
 .DS_Store
 .idea/

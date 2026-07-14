@@ -59,6 +59,25 @@ class CreateIssueReq(BaseModel):
     labels: list[str] = Field(default_factory=list)
 
 
+class CreateProjectReq(BaseModel):
+    name: str
+    agent_label: str = ""
+    cwd: str = ""
+    profile: str = "claude-code"
+    source: str = Field(default="internal", pattern="^(internal|github_cli|github_token)$")
+    github_token: str = ""
+    monitor_prs: bool = False
+    env: dict[str, str] = Field(default_factory=dict)
+    role: str = Field(default="agent", pattern="^(agent|keeper)$")
+
+
+class UpdateProjectReq(BaseModel):
+    role: str | None = Field(default=None, pattern="^(agent|keeper)$")
+    agent_label: str | None = None
+    cwd: str | None = None
+    intro: str | None = None
+
+
 class AddCommentReq(BaseModel):
     body: str
     author: str = ""
@@ -117,7 +136,7 @@ def list_statuses() -> list[str]:
 
 @router.get("/team")
 def list_team(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
-    """列出团队成员（agent 花名册 + 自我介绍）。读 db 的 projects 表。"""
+    """列出团队成员（agent 花名册 + 自我介绍 + 角色）。读 db 的 projects 表。"""
     src = _source(ctx)
     return [
         {
@@ -125,6 +144,7 @@ def list_team(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
             "agent_label": m["agent_label"],
             "cwd": m["cwd"],
             "intro": m["intro"],
+            "role": m.get("role") or "agent",
         }
         for m in src.list_projects_meta()
     ]
@@ -135,6 +155,72 @@ def list_projects(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
     """列出所有项目及其 issue 计数（0 issue 项目也显示，读 projects 表）。"""
     src = _source(ctx)
     return src.list_projects_with_counts()
+
+
+@router.post("/projects")
+def create_project(req: CreateProjectReq, ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    """新增/更新一个项目绑定（等价 `team add`）。on conflict 覆盖绑定字段、保留 intro/role。"""
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="项目名不能为空")
+    src = _source(ctx)
+    src.upsert_project(
+        name=req.name.strip(),
+        agent_label=req.agent_label.strip(),
+        cwd=req.cwd.strip(),
+        profile=req.profile,
+        source=req.source,
+        github_token=req.github_token,
+        monitor_prs=req.monitor_prs,
+        env=req.env or None,
+        role=req.role,
+    )
+    return {"project": req.name.strip(), "agent_label": req.agent_label.strip(),
+            "role": req.role, "created": True}
+
+
+@router.patch("/projects/{name}")
+def update_project(name: str, req: UpdateProjectReq, ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    """更新项目绑定的部分字段（role / agent_label / cwd / intro）。未传字段保持不变。"""
+    src = _source(ctx)
+    meta = {m["name"]: m for m in src.list_projects_meta()}
+    if name not in meta:
+        raise HTTPException(status_code=404, detail=f"找不到项目 {name}")
+    m = meta[name]
+    if req.role is not None:
+        src.set_project_role(name, req.role)
+    if req.intro is not None:
+        src.set_project_intro(name, req.intro)
+    if req.agent_label is not None or req.cwd is not None:
+        # 覆盖绑定字段（保留 intro/role）
+        src.upsert_project(
+            name=name,
+            agent_label=(req.agent_label if req.agent_label is not None else m["agent_label"]),
+            cwd=(req.cwd if req.cwd is not None else m["cwd"]),
+            profile=m.get("profile") or "claude-code",
+            source=m.get("source") or "internal",
+            github_token=m.get("github_token") or "",
+            monitor_prs=bool(m.get("monitor_prs", False)),
+            env=m.get("env") or None,
+            role=m.get("role") or "agent",
+        )
+    fresh = {m2["name"]: m2 for m2 in src.list_projects_meta()}
+    return {
+        "project": name,
+        "agent_label": fresh[name]["agent_label"],
+        "cwd": fresh[name]["cwd"],
+        "intro": fresh[name]["intro"],
+        "role": fresh[name].get("role") or "agent",
+    }
+
+
+@router.delete("/projects/{name}")
+def delete_project(name: str, ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    """删除一个项目绑定（不删它的 issue）。"""
+    src = _source(ctx)
+    ok = src.delete_project(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"找不到项目 {name}")
+    return {"project": name, "deleted": True}
 
 
 @router.get("/projects/{project}/issues")

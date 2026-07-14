@@ -44,6 +44,28 @@ _AGENT_PREAMBLE = (
     "可跨项目提 issue 的目标 <项目名> 见下方「可用项目」列表（标「（你自己）」的是你当前所在项目）。"
 )
 
+# keeper 角色专属提示词：管理向，不聚焦改代码，而是帮人类管 issue、代理人类跨项目提问、
+# 回弹给人类时优先解答、必要时用 HitL（hitl MCP）联系人类拿反馈。
+# keeper 由 daemon 驱动，会响应 issue 变更事件——这点区别于「只在对话时工作」的交互式 agent。
+_KEEPER_PREAMBLE = (
+    "你是 issue-keeper 的「keeper」——本协同系统的管理向 agent（不是改本仓代码的代码 agent）。"
+    "你的回复会被原样作为评论发到对应 issue 上，请直接说话，不要写「回复草稿」「以下是回复」这类元描述。\n"
+    "你有 bash 工具能力（工作目录是 issue-keeper 仓）。你的核心职责：\n"
+    "1. 帮人类管理这些 issue：分类、规划、驱动状态流转（用 `python -m issue_keeper internal move ...`），"
+    "在 issue-keeper 项目里执行管理类诉求（如「把某项目加入协同」「更新某 agent 介绍」→ 调 `onboard`/`team` CLI）。\n"
+    "2. 代理人类跨项目提问：当人类想就某事问某个项目团队，由你判断目标项目并以你自己的身份"
+    "（--author {agent_label}）用 `python -m issue_keeper internal create <项目名> --title ... --body ...` 代为提 issue。"
+    "可用项目见下方「可用项目」列表。\n"
+    "3. 当 issue 回弹给人类（如停在 review 等人接手、或问题本身需要人决策）时，你优先尝试自行解答/分诊，"
+    "把能定的先定掉，把真正需要人拍板的精简成清晰问题再交回。\n"
+    "4. 必要时通过 HitL 联系人类拿反馈：你环境里有 `hitl` MCP 工具——"
+    "`send_and_wait_reply`（发带 [#id] 的确认问题并阻塞等回复，最多等约 1 小时）和 "
+    "`send_message_only`（单向通知，不等回复）。遇到关键决策、危险操作、或必须人确认的岔路时，"
+    "用 `send_and_wait_reply` 发简短问题给人类；只需告知无需等回复时用 `send_message_only`。"
+    "不要为琐碎事打扰人类。\n"
+    "你能改 issue-keeper 的代码，但那不是你的主职——只有当某 issue 明确是 issue-keeper 自身的代码缺陷时才动手修。"
+)
+
 
 def _roster(config: Config, current_repo: str) -> str:
     """列出所有项目及其 agent 身份，供当前 agent 跨项目提 issue 时参考。"""
@@ -56,8 +78,13 @@ def _roster(config: Config, current_repo: str) -> str:
 
 
 def _preamble(binding: RepoBinding, config: Config, agent_label: str) -> str:
-    """组装给 agent 的系统提示（含跨项目花名册）。"""
-    return _AGENT_PREAMBLE.format(agent_label=agent_label) + "\n" + _roster(config, binding.repo)
+    """组装给 agent 的系统提示（含跨项目花名册）。
+
+    role=keeper 用管理向提示词（帮人类管 issue / 代理提问 / 优先解答 / HitL），
+    其余用普通代码 agent 提示词。
+    """
+    base = _KEEPER_PREAMBLE if binding.role == "keeper" else _AGENT_PREAMBLE
+    return base.format(agent_label=agent_label) + "\n" + _roster(config, binding.repo)
 
 
 def _agent_label(binding: RepoBinding, config: Config) -> str:
@@ -195,7 +222,11 @@ def process_repo(
         return 0
 
     me = src.self_identity()
-    timeout = binding.effective_timeout(config.default_timeout_secs)
+    # keeper 可能用 HitL 等人类回复（最长 1 小时），用更大的调用超时；普通 agent 用默认。
+    if binding.role == "keeper":
+        timeout = max(binding.effective_timeout(config.default_timeout_secs), config.keeper_timeout_secs)
+    else:
+        timeout = binding.effective_timeout(config.default_timeout_secs)
 
     # 要扫描的资源类型列表：[(kind, labels)]
     kinds: list[tuple[str, list[str] | None]] = [("issue", binding.labels or None)]
@@ -434,8 +465,205 @@ def run_once(config: Config) -> int:
             _agent_label(binding, config), kinds,
         )
         total += process_repo(binding, config, state, profile_cache, source_cache)
+    # keeper 巡检：代人类 review / 主动分诊（按 interval_cycles 节流）
+    total += keeper_patrol(config, state, profile_cache, source_cache)
     save_state(config.state_path, state)
     return total
+
+
+def _find_keeper_binding(config: Config) -> RepoBinding | None:
+    """找到 role=keeper 的绑定（ keeper 巡检用它跑 agent）。没有返回 None。"""
+    for b in config.repos:
+        if b.role == "keeper":
+            return b
+    return None
+
+
+def _patrol_candidates(
+    src: IssueSource, config: Config, state: State,
+) -> list[tuple[RepoBinding, Resource]]:
+    """收集需要 keeper 巡检的候选 issue：人提的、停在 review 或 stale inbox。
+
+    只扫 internal source 的项目（跨项目协同系统都在 internal db 里；github source
+    的 review 暂不纳入巡检，后续可加）。排除「上次巡检后无新活动」的 issue（防刷屏）。
+    """
+    patrol = config.keeper_patrol
+    now = datetime.now().timestamp()
+    candidates: list[tuple[RepoBinding, Resource]] = []
+    for binding in config.repos:
+        if binding.source != "internal":
+            continue
+        try:
+            resources = src.list_open(binding.repo, ["issue", "pr"])
+        except Exception as e:
+            log.warning("[patrol] 列出 %s 失败: %s", binding.repo, e)
+            continue
+        for res in resources:
+            # 只代人类处理人提的 issue（agent 提的由各 agent 自 review）
+            if res.actor_type != "human":
+                continue
+            is_review = res.status == "review"
+            is_stale_inbox = (
+                res.status == "inbox"
+                and patrol.stale_inbox_secs > 0
+                and _age_secs(res.updated_at) >= patrol.stale_inbox_secs
+            )
+            if not (is_review or is_stale_inbox):
+                continue
+            key = state.patrol_key(binding.repo_slug, res.kind, res.number)
+            if state.patrol_snapshot(key) == res.updated_at:
+                # 上次巡检后无新活动，跳过（防刷屏）
+                continue
+            candidates.append((binding, res))
+    # review 优先于 stale inbox；按 updated_at 升序（最老的先处理）
+    def _rank(item: tuple[RepoBinding, Resource]) -> tuple[int, str]:
+        _, r = item
+        order = 0 if r.status == "review" else 1
+        return (order, r.updated_at)
+    candidates.sort(key=_rank)
+    return candidates[: patrol.max_per_cycle]
+
+
+def _age_secs(updated_at: str) -> float:
+    """updated_at（ISO）距今秒数；解析失败返回很大值（视为 stale）。"""
+    try:
+        from datetime import datetime as _dt
+        # updated_at 形如 2026-07-14T11:08:00+00:00
+        dt = _dt.fromisoformat(updated_at)
+        return datetime.now().timestamp() - dt.timestamp()
+    except Exception:
+        return 1e12
+
+
+def _compose_patrol_message(
+    keeper_binding: RepoBinding, config: Config, target_binding: RepoBinding,
+    res: Resource, comments: list, keeper_label: str,
+) -> str:
+    """组装巡检消息：keeper 提示词 + 候选 issue + 代人类 review 指令。"""
+    base = _preamble(keeper_binding, config, keeper_label)
+    cmt_block = ""
+    if comments:
+        lines = []
+        for c in comments[-6:]:
+            lines.append(f"— {c.author}（{c.created_at}）：\n{c.body}")
+        cmt_block = "\n\n最近评论：\n" + "\n\n".join(lines)
+    return (
+        f"{base}\n\n"
+        f"---\n\n"
+        f"【巡检任务·代人类 review】\n"
+        f"项目 {target_binding.repo} 的 {res.noun} #{res.number} 现在停在「{res.status}」状态，"
+        f"是人类（{config.human_label}）没及时查看/回复的。你代人类前置处理一道。\n\n"
+        f"标题：{res.title}\n"
+        f"提交人：{res.author} / 状态：{res.status} / 更新：{res.updated_at}\n\n"
+        f"{res.noun} 正文：\n{res.body or '（空）'}{cmt_block}\n\n"
+        f"你可以用 bash 调 issue-keeper CLI 在该 issue 上动作（--author 用你自己的 {keeper_label}）：\n"
+        f"  python -m issue_keeper internal move {target_binding.repo} {res.number} "
+        f"--status done --kind {res.kind} --author {keeper_label} --comment \"代人类 review 通过\"\n"
+        f"  python -m issue_keeper internal comment {target_binding.repo} {res.number} "
+        f"--kind {res.kind} --author {keeper_label} --body \"...\"\n"
+        f"处理原则：\n"
+        f"1. 读 agent 的回复/讨论，若显然没问题→move 到 done 自动通过。\n"
+        f"2. 若确实需要人拍板→用 hitl 的 send_and_wait_reply 给人类发**一个**聚焦问题"
+        f"（最多等约 1 小时），拿到回复后再 move/comment。一条 issue 最多发一次 HitL，别刷屏。\n"
+        f"3. 也可先 comment 补一条分诊/澄清再决定。\n"
+        f"你的最终回复会被原样作为评论发到该 issue（用你的 keeper 身份），直接给动作结论，不要写草稿。"
+    )
+
+
+def keeper_patrol(
+    config: Config, state: State,
+    profile_cache: dict[str, ProfileEntry],
+    source_cache: dict[str, IssueSource],
+) -> int:
+    """keeper 巡检一轮：代人类 review / 主动分诊等人处理的 issue。返回本轮处理的条目数。
+
+    - 只在有 role=keeper 绑定且 patrol.enabled 时跑
+    - 按 patrol.interval_cycles 节流（state.patrol_cycle 计数）
+    - 每条 issue 无新活动不重复巡检（防刷屏）
+    """
+    patrol = config.keeper_patrol
+    state.patrol_cycle += 1
+    if not patrol.enabled:
+        return 0
+    if state.patrol_cycle % patrol.interval_cycles != 0:
+        return 0
+    keeper_binding = _find_keeper_binding(config)
+    if keeper_binding is None:
+        return 0  # 没有 keeper，不巡检
+
+    try:
+        entry = _ensure_profile(keeper_binding, profile_cache)
+    except Exception as e:
+        log.error("[patrol] 加载 keeper profile '%s' 失败: %s", keeper_binding.profile, e)
+        return 0
+    # 用 keeper 自己的 source 读写各 internal 项目（keeper 是 internal source，同库可查任意项目）
+    try:
+        keeper_src = _ensure_source(keeper_binding, source_cache)
+    except Exception as e:
+        log.error("[patrol] 实例化 keeper source 失败: %s", e)
+        return 0
+    if not _supports_status(keeper_src):
+        return 0
+
+    keeper_label = _agent_label(keeper_binding, config)
+    visible_prefix = _visible_prefix(keeper_binding, config)
+    candidates = _patrol_candidates(keeper_src, config, state)
+    if not candidates:
+        return 0
+    log.info("[patrol] 本轮巡检 %d 条候选 issue", len(candidates))
+
+    handled = 0
+    for target_binding, res in candidates:
+        key = state.patrol_key(target_binding.repo_slug, res.kind, res.number)
+        label = f"{target_binding.repo} {res.kind}#{res.number}"
+        try:
+            comments = keeper_src.list_comments(target_binding.repo, res)
+        except Exception as e:
+            log.warning("[patrol] [%s] 读评论失败: %s", label, e)
+            comments = []
+
+        message = _compose_patrol_message(
+            keeper_binding, config, target_binding, res, comments, keeper_label,
+        )
+        source = f"[patrol] {label}"
+        if config.screener.enabled and not _screen_or_block(message, config.screener, source):
+            log.warning("[patrol] [%s] 被安全过滤跳过", label)
+            # 仍推进快照，避免下轮反复筛
+            state.mark_patrolled(key, res.updated_at, None)
+            continue
+
+        prev_session = (state.patrol.get(key) or {}).get("session_id") or ""
+        log.info("[patrol] [%s] 代人类 review，调用 keeper (session=%s)", label, prev_session)
+        keeper_timeout = max(
+            keeper_binding.effective_timeout(config.default_timeout_secs),
+            config.keeper_timeout_secs,
+        )
+        try:
+            reply = invoke_agent(
+                entry, message, prev_session,
+                from_user=config.agent_from_user,
+                default_timeout=keeper_timeout,
+            )
+        except Exception as e:
+            log.error("[patrol] [%s] keeper 调用失败: %s", label, e)
+            state.mark_patrolled(key, res.updated_at, prev_session or None)
+            continue
+
+        # keeper 的回复作为评论发到该 issue（带 marker，各项目自己的 agent 会跳过，不互相触发）
+        if reply.text:
+            body = f"{config.bot_marker}\n{visible_prefix}\n{reply.text}"
+            try:
+                keeper_src.post_comment(target_binding.repo, res, body)
+            except Exception as e:
+                log.warning("[patrol] [%s] 发评论失败: %s", label, e)
+        # 推进快照到「发评论后」的 updated_at，避免 keeper 自己的评论触发自己下轮重巡
+        fresh = keeper_src.get_issue(target_binding.repo, res.kind, res.number)
+        state.mark_patrolled(
+            key, (fresh.updated_at if fresh else res.updated_at),
+            reply.session_id or prev_session or None,
+        )
+        handled += 1
+    return handled
 
 
 def run_daemon(config_path: str) -> None:

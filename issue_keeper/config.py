@@ -13,6 +13,18 @@ from .screener import ScreenerConfig
 
 
 @dataclass
+class KeeperPatrolConfig:
+    """keeper 巡检配置：代人类 review / 主动分诊 / 出站通知。"""
+    enabled: bool = True
+    # 每 N 轮 daemon 跑一次巡检（默认 4 × poll_interval ≈ 20min），防每轮都打扰人类。
+    interval_cycles: int = 4
+    # inbox 停留超过此秒数的人提 issue 纳入巡检（人类没及时规划）；0 = 只巡检 review 状态。
+    stale_inbox_secs: int = 7200
+    # 每轮巡检最多处理多少条候选 issue（防爆工作堆积）。
+    max_per_cycle: int = 5
+
+
+@dataclass
 class RepoBinding:
     repo: str
     profile: str
@@ -39,6 +51,10 @@ class RepoBinding:
     poll_interval_secs: int | None = None
     session_prefix: str = "issue-keeper"
     timeout_secs: int | None = None
+    # 角色：'agent'（默认，负责本仓代码与 issue）/ 'keeper'（管理向，帮人类管 issue、
+    # 代理人类跨项目提问、回弹给人类时优先解答、必要时用 HitL 联系人类）。keeper 角色
+    # 在 keeper.py 里会拿到一套专属系统提示词，区别于普通代码 agent。
+    role: str = "agent"
 
     def effective_poll_interval(self, default: int) -> int:
         return self.poll_interval_secs if self.poll_interval_secs is not None else default
@@ -71,6 +87,12 @@ class Config:
         on_unsafe="skip", max_chars=8000,
     ))
     repos: list[RepoBinding] = field(default_factory=list)
+    # 单一人类模型：keeper 代谁 review / HitL 推给谁。所有人类都统一推给这一个人。
+    human_label: str = "human"
+    keeper_patrol: KeeperPatrolConfig = field(default_factory=KeeperPatrolConfig)
+    # keeper agent 的调用超时（秒）。keeper 可能用 HitL 等人类回复（最长 1 小时），
+    # 所以默认比普通 agent（default_timeout_secs）大。仅对 role=keeper 的绑定生效。
+    keeper_timeout_secs: int = 3900
 
     @property
     def state_path(self) -> Path:
@@ -172,6 +194,7 @@ def _load_repos_from_db(internal_db: str, agent_env: dict[str, str]) -> list[Rep
                 monitor_prs=bool(m.get("monitor_prs", False)),
                 env=env,
                 internal_db=internal_db,
+                role=m.get("role") or "agent",
             )
         )
     return repos
@@ -211,6 +234,18 @@ def load_config(path: str | os.PathLike) -> Config:
 
     repos = _load_repos_from_db(internal_db, agent_env)
 
+    # 单一人类标签（keeper 代人类 review / HitL 推送对象）
+    human_label = (raw.get("human_label") or "human").strip() or "human"
+
+    # keeper 巡检配置
+    patrol_raw = raw.get("keeper_patrol") or {}
+    patrol = KeeperPatrolConfig(
+        enabled=bool(patrol_raw.get("enabled", True)),
+        interval_cycles=max(1, int(patrol_raw.get("interval_cycles", 4))),
+        stale_inbox_secs=max(0, int(patrol_raw.get("stale_inbox_secs", 7200))),
+        max_per_cycle=max(1, int(patrol_raw.get("max_per_cycle", 5))),
+    )
+
     cfg = Config(
         poll_interval_secs=int(raw.get("poll_interval_secs", 300)),
         state_file=_expand_path(state_file),
@@ -220,6 +255,9 @@ def load_config(path: str | os.PathLike) -> Config:
         default_review_agent=(raw.get("default_review_agent") or "").strip(),
         screener=screener,
         repos=repos,
+        human_label=human_label,
+        keeper_patrol=patrol,
+        keeper_timeout_secs=max(60, int(raw.get("keeper_timeout_secs", 3900))),
     )
 
     if cfg.poll_interval_secs <= 0:
