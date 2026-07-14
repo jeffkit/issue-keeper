@@ -280,7 +280,7 @@ python -m issue_keeper team list
 
 ```bash
 DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY python3 -m issue_keeper onboard \
-  /Users/kongjie/projects/<新项目目录> \
+  /path/to/<新项目目录> \
   --config config.yaml --agent-label <新项目>-agent --gen-intro --reload
 ```
 
