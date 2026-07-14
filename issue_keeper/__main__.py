@@ -52,7 +52,7 @@ def _run_keeper(args) -> int:
         print(f"完成，本轮处理 {handled} 条。")
         return 0
 
-    run_daemon(config)
+    run_daemon(args.config)
     return 0
 
 
@@ -253,40 +253,63 @@ def _add_internal_common(p: argparse.ArgumentParser) -> None:
 
 
 def _run_team(args) -> int:
-    """团队成员管理 CLI。"""
-    from .team import load_team, set_intro, sync_from_config, to_json
+    """项目绑定 + 团队介绍管理 CLI。数据存 internal.db 的 projects 表。"""
+    from .sources.internal import DEFAULT_DB
+    from .team import (add_project_to_db, import_from_config, load_team,
+                       remove_project_from_db, set_intro)
 
-    if args.team_cmd == "sync":
-        try:
-            config = load_config(args.config)
-        except Exception as e:
-            print(f"加载配置失败: {e}", file=sys.stderr)
-            return 2
-        members = sync_from_config(config, args.team)
-        print(f"已同步 {len(members)} 个团队成员到 {args.team or '~/.issue-keeper/team.json'}：")
+    db_path = args.db or str(DEFAULT_DB)
+
+    if args.team_cmd == "import":
+        members = import_from_config(args.config, db_path)
+        print(f"已从 {args.config} 迁移 {len(members)} 个项目绑定到 db（{db_path}）：")
         for m in members:
             intro_tag = "（有介绍）" if m.intro else "（无介绍）"
             print(f"  {m.agent_label:20} 项目={m.project}  {intro_tag}")
         return 0
 
+    if args.team_cmd == "add":
+        env: dict[str, str] = {}
+        for kv in args.env or []:
+            if "=" in kv:
+                k, v = kv.split("=", 1)
+                env[k.strip()] = v
+        add_project_to_db(
+            db_path, repo=args.repo, agent_label=args.agent_label, cwd=args.cwd,
+            profile=args.profile, source=args.source,
+            github_token=args.github_token,
+            monitor_prs=args.monitor_prs, env=env or None,
+        )
+        print(f"已写入项目绑定: repo={args.repo}, agent_label={args.agent_label}, cwd={args.cwd}")
+        return 0
+
+    if args.team_cmd == "remove":
+        ok = remove_project_from_db(db_path, repo=args.repo)
+        if ok:
+            print(f"已从 db 删除项目绑定: {args.repo}（其 issue 保留）")
+            return 0
+        print(f"未找到项目: {args.repo}", file=sys.stderr)
+        return 1
+
     if args.team_cmd == "set-intro":
-        m = set_intro(args.agent_label, args.intro, args.team)
-        if m is None:
-            print(f"找不到 agent_label={args.agent_label}，请先 `team sync` 生成花名册",
+        name = set_intro(args.agent_label, args.intro, db_path)
+        if name is None:
+            print(f"找不到 agent_label={args.agent_label}，请先 `team add` 添加项目",
                   file=sys.stderr)
             return 1
-        print(f"已设置 {m.agent_label} 的介绍（{len(m.intro)} 字）")
+        print(f"已设置 {args.agent_label}（项目 {name}）的介绍（{len(args.intro)} 字）")
         return 0
 
     if args.team_cmd == "list":
-        members = load_team(args.team)
+        members = load_team(db_path)
         if not members:
-            print("团队为空。请先 `team sync --config config.yaml` 生成花名册。")
+            print("db 里还没有项目绑定。用 `team add` 添加，或 `team import -c 旧config.yaml` 迁移。")
             return 0
-        print(f"团队成员（共 {len(members)} 个，来源 {args.team or '~/.issue-keeper/team.json'}）：")
+        print(f"项目绑定 + 团队（共 {len(members)} 个，db {db_path}）：")
         for m in members:
+            prs = " [监控PR]" if m.monitor_prs else ""
             print(f"\n  {m.agent_label}")
-            print(f"    项目: {m.project}")
+            print(f"    项目: {m.project}  profile={m.profile}  source={m.source}{prs}")
             if m.cwd:
                 print(f"    工作目录: {m.cwd}")
             print(f"    介绍: {m.intro or '（待生成）'}")
@@ -296,10 +319,14 @@ def _run_team(args) -> int:
 
 
 def _run_onboard(args) -> int:
-    """把一个新项目 onboard 进 issue-keeper 协同：加 binding + team sync + 可选生成介绍 + 可选重载 keeper。"""
+    """把一个新项目 onboard 进 issue-keeper 协同：写 db 绑定 + 可选生成介绍 + 可选重载 keeper。
+
+    db 是单一配置源，写入后 keeper 下一轮 live-reload 即生效（--reload 仅用于立即重载或 keeper 异常时）。
+    """
     import os
     from pathlib import Path
-    from .team import add_binding_to_config, set_intro, sync_from_config
+    from .sources.internal import DEFAULT_DB
+    from .team import add_project_to_db, set_intro
 
     project_path = Path(args.project_path).expanduser().resolve()
     if not project_path.is_dir():
@@ -307,23 +334,16 @@ def _run_onboard(args) -> int:
         return 1
     repo = args.repo or project_path.name
     agent_label = args.agent_label or f"{repo}-agent"
+    db_path = args.db or str(DEFAULT_DB)
 
-    # 1) 往 config.yaml 加 binding
-    try:
-        add_binding_to_config(
-            args.config, repo=repo, agent_label=agent_label, cwd=str(project_path),
-            profile=args.profile,
-        )
-    except ValueError as e:
-        print(f"跳过加 binding: {e}", file=sys.stderr)
-    print(f"已往 {args.config} 追加 binding: repo={repo}, agent_label={agent_label}, cwd={project_path}")
+    # 1) 写 db 绑定（单一配置源）
+    add_project_to_db(
+        db_path, repo=repo, agent_label=agent_label, cwd=str(project_path),
+        profile=args.profile,
+    )
+    print(f"已写入 db 绑定: repo={repo}, agent_label={agent_label}, cwd={project_path}（db: {db_path}）")
 
-    # 2) team sync（从 config 重建花名册，保留已有介绍）
-    config = load_config(args.config)
-    members = sync_from_config(config, args.team)
-    print(f"team sync 完成，共 {len(members)} 个成员")
-
-    # 3) 可选：生成自我介绍
+    # 2) 可选：生成自我介绍
     if args.gen_intro:
         if not os.environ.get("DEEPSEEK_API_KEY"):
             print("未设置 DEEPSEEK_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
@@ -344,7 +364,7 @@ def _run_onboard(args) -> int:
             try:
                 reply = invoke_agent(entry, prompt, "", from_user="onboard", default_timeout=180)
                 intro = (reply.text or "").strip()
-                set_intro(agent_label, intro, args.team)
+                set_intro(agent_label, intro, db_path)
                 print(f"已生成并写入介绍（{len(intro)} 字）")
             except Exception as e:
                 print(f"介绍生成失败: {e}", file=sys.stderr)
@@ -389,35 +409,48 @@ def main(argv: list[str] | None = None) -> int:
     dash_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
     dash_parser.add_argument("--agent-label", default="dashboard",
                              help="dashboard 在 db 里发评论/改状态时用的身份（默认 dashboard）")
-    dash_parser.add_argument("--team",
-                             help=f"团队成员 JSON 路径（默认 {Path.home()}/.issue-keeper/team.json）")
 
-    # 团队成员管理
-    team_parser = subparsers.add_parser("team", help="管理团队成员（agent 花名册 + 介绍）")
-    team_parser.add_argument("--team",
-                             help=f"team.json 路径（默认 {Path.home()}/.issue-keeper/team.json）")
+    # 团队成员 + 项目绑定管理（数据存 internal.db 的 projects 表，单一配置源）
+    team_parser = subparsers.add_parser("team", help="管理项目绑定 + 团队介绍（存 internal.db，keeper 单一配置源）")
+    team_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
     team_sub = team_parser.add_subparsers(dest="team_cmd", required=True)
 
-    p_sync = team_sub.add_parser("sync", help="从 config.yaml 同步 agent 花名册（保留已有介绍）")
-    p_sync.add_argument("--config", "-c", required=True)
+    p_import = team_sub.add_parser("import", help="一次性把旧 config.yaml 的 repos 段迁进 db")
+    p_import.add_argument("--config", "-c", required=True, help="旧版 config.yaml 路径")
+
+    p_add = team_sub.add_parser("add", help="新增/更新一个项目绑定到 db")
+    p_add.add_argument("repo", help="项目名（binding.repo）")
+    p_add.add_argument("--agent-label", required=True, help="agent 身份标签")
+    p_add.add_argument("--cwd", required=True, help="agent 工作目录")
+    p_add.add_argument("--profile", default="claude-code", help="agentproc profile（默认 claude-code）")
+    p_add.add_argument("--source", default="internal", help="issue 来源（默认 internal）")
+    p_add.add_argument("--github-token", default="",
+                       help="source=github_token 时的 PAT，支持 ${VAR} 占位")
+    p_add.add_argument("--monitor-prs", action="store_true", help="是否监控 PR")
+    p_add.add_argument("--env", action="append", default=[],
+                       help="项目级 env 覆盖，格式 KEY=VALUE（可重复；密钥用 ${VAR} 占位）")
+
+    p_remove = team_sub.add_parser("remove", help="从 db 删除一个项目绑定（不删 issue）")
+    p_remove.add_argument("repo", help="项目名")
 
     p_intro = team_sub.add_parser("set-intro", help="设置某 agent 的自我介绍")
     p_intro.add_argument("agent_label", help="agent 身份标签")
     p_intro.add_argument("--intro", required=True, help="介绍正文")
 
-    p_list = team_sub.add_parser("list", help="列出团队成员")
+    p_list = team_sub.add_parser("list", help="列出项目绑定 + 团队介绍")
 
     # onboard：把一个新项目快速注册进协同
     onb_parser = subparsers.add_parser(
-        "onboard", help="把一个新项目 onboard 进 issue-keeper 协同（加 binding + team sync + 可选生成介绍 + 重载 keeper）")
+        "onboard", help="把一个新项目 onboard 进 issue-keeper 协同（写 db 绑定 + 可选生成介绍 + 可选重载 keeper）")
     onb_parser.add_argument("project_path", help="新项目目录路径（git 仓根）")
-    onb_parser.add_argument("--config", "-c", required=True, help="issue-keeper config.yaml 路径")
+    onb_parser.add_argument("--config", "-c", default="config.yaml",
+                            help="(已弃用，保留兼容) issue-keeper config.yaml 路径；绑定现在写 db")
     onb_parser.add_argument("--repo", help="项目名（默认取目录名）")
     onb_parser.add_argument("--agent-label", help="agent 身份标签（默认 <repo>-agent）")
     onb_parser.add_argument("--profile", default="claude-code", help="agentproc profile（默认 claude-code）")
-    onb_parser.add_argument("--team", help="team.json 路径（默认 ~/.issue-keeper/team.json）")
-    onb_parser.add_argument("--gen-intro", action="store_true", help="调 agent 自动生成自我介绍并写入 team.json")
-    onb_parser.add_argument("--reload", action="store_true", help="完成后重载 keeper daemon（macOS launchd）")
+    onb_parser.add_argument("--db", help=f"SQLite 路径（默认 {Path.home()}/.issue-keeper/internal.db）")
+    onb_parser.add_argument("--gen-intro", action="store_true", help="调 agent 自动生成自我介绍并写入 db")
+    onb_parser.add_argument("--reload", action="store_true", help="立即重载 keeper daemon（macOS launchd）；不加重载则等下一轮 live-reload")
 
     # internal source 管理
     internal_parser = subparsers.add_parser("internal", help="管理 internal source 的 issue")
@@ -472,7 +505,7 @@ def main(argv: list[str] | None = None) -> int:
         from .sources.internal import DEFAULT_DB
         db_path = args.db or str(DEFAULT_DB)
         run_dashboard(db_path, host=args.host, port=args.port,
-                      agent_label=args.agent_label, team_path=args.team)
+                      agent_label=args.agent_label)
         return 0
     if args.cmd == "team":
         return _run_team(args)

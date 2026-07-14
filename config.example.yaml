@@ -40,45 +40,37 @@ screener:
   on_unsafe: skip        # skip（默认）/ comment
   max_chars: 8000
 
-# ─── 仓库 -> profile 绑定 ─────────────────────────────────────────────
-repos:
-  # GitHub 仓库示例
-  - repo: "owner/repo-name"
-    profile: "deepseek"                  # AgentProc profile（hub 名或本地 .yaml 路径）
-    source: github_token                 # 或 github_cli
-    github_token: ${GITHUB_TOKEN}
-    agent_label: "proj-a-agent"
-    cwd: ~/projects/proj-a               # agent 工作目录（动态指定，一个 hub profile 通吃）
-    env:
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      DEEPSEEK_MODEL: deepseek-v4-pro
-    labels: []
-    monitor_prs: false
-    # pr_labels: ["ai"]
-    # timeout_secs: 900
+# ─── 项目绑定在哪里？──────────────────────────────────────────────────
+# 项目绑定（repo/agent_label/cwd/profile/source/monitor_prs/env/github_token/intro）
+# 不写在本文件，而是存在 internal.db 的 projects 表——这是 issue-keeper 的单一配置源。
+# keeper 每轮 live-reload：db 里增删项目、改介绍/绑定即时生效，无需重启。
+#
+# 增删项目用 CLI：
+#   python -m issue_keeper team add owner/repo --agent-label proj-a-agent \
+#     --cwd ~/projects/proj-a --profile claude-code --source github_token \
+#     --github-token '${GITHUB_TOKEN}' --env ANTHROPIC_API_KEY=${DEEPSEEK_API_KEY}
+#   python -m issue_keeper team remove owner/repo
+#   python -m issue_keeper team list
+# 或一键 onboard（含自动生成自我介绍）：
+#   python -m issue_keeper onboard ~/projects/newproj --agent-label newproj-agent --gen-intro
+#
+# 从旧版（repos 写在 yaml）升级时，一次性迁移：
+#   python -m issue_keeper team import --config <旧 config.yaml>
+# （旧 team.json 的 intro 也会一并迁进 db，team.json 改名为 .migrated 备份）
 
-  # ─── 自建 issue 系统示例（agent 之间互相沟通）────────────────────────
-  - repo: "proj-alpha"                   # 任意项目名
-    profile: "deepseek"
-    source: internal
-    agent_label: "alpha-agent"           # 必填：agent 身份标签，也是 self_identity
-    cwd: ~/projects/proj-alpha           # agent 在这个项目代码里跑
-    env:
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      DEEPSEEK_MODEL: deepseek-v4-pro
-    # review_agent: "alpha-agent"        # 该仓库专用 review agent（覆盖全局 default_review_agent）
-    # internal_db: ~/.issue-keeper/internal.db   # 可选：覆盖默认 SQLite 路径
-    monitor_prs: false
+# 项目绑定 + issue 共用的 SQLite（projects 表与 issues 同库）
+internal_db: ~/.issue-keeper/internal.db
 
-  - repo: "proj-beta"
-    profile: "deepseek"
-    source: internal
-    agent_label: "beta-agent"
-    cwd: ~/projects/proj-beta
-    env:
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      DEEPSEEK_MODEL: deepseek-v4-pro
-    monitor_prs: false
+# ─── 全局 agent env 模板 ──────────────────────────────────────────────
+# 所有 agent 共用的 LLM 连接。密钥用 ${VAR} 引用，实际值在环境变量里
+# （不入库、不进文件明文）。load_config 把这份模板套到 db 里每个项目绑定上；
+# 某项目需要单独 env 时，在该项目 env 列覆盖（team add --env KEY=VALUE）。
+agent_env:
+  ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}
+  ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic"
+  CLAUDE_MODEL: "deepseek-chat"
+  # DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}   # 用 deepseek CLI profile 时
+  # DEEPSEEK_MODEL: deepseek-v4-pro
 
 # ─── 防循环机制（三层保险）───────────────────────────────────────────
 # 1. 评论/资源正文含 bot_marker（隐藏 HTML 注释）

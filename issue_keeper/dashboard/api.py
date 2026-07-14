@@ -116,42 +116,25 @@ def list_statuses() -> list[str]:
 
 
 @router.get("/team")
-def list_team(request: Request) -> list[dict[str, Any]]:
-    """列出团队成员（agent 花名册 + 自我介绍）。读 team.json。"""
-    from ..team import DEFAULT_TEAM_PATH, load_team
-
-    team_path = getattr(request.app.state, "team_path", None) or str(DEFAULT_TEAM_PATH)
-    members = load_team(team_path)
+def list_team(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
+    """列出团队成员（agent 花名册 + 自我介绍）。读 db 的 projects 表。"""
+    src = _source(ctx)
     return [
         {
-            "project": m.project,
-            "agent_label": m.agent_label,
-            "cwd": m.cwd,
-            "intro": m.intro,
+            "project": m["name"],
+            "agent_label": m["agent_label"],
+            "cwd": m["cwd"],
+            "intro": m["intro"],
         }
-        for m in members
+        for m in src.list_projects_meta()
     ]
 
 
 @router.get("/projects")
 def list_projects(ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
-    """列出所有项目及其 issue 计数。"""
-    import sqlite3
-
+    """列出所有项目及其 issue 计数（0 issue 项目也显示，读 projects 表）。"""
     src = _source(ctx)
-    conn = sqlite3.connect(src._db_path)  # noqa: SLF001
-    try:
-        rows = conn.execute(
-            "SELECT project, COUNT(*) AS n, "
-            "SUM(CASE WHEN status IN ('inbox','todo','doing','review') THEN 1 ELSE 0 END) AS open_n "
-            "FROM issues GROUP BY project ORDER BY project"
-        ).fetchall()
-    finally:
-        conn.close()
-    return [
-        {"project": r[0], "total": int(r[1] or 0), "open": int(r[2] or 0)}
-        for r in rows
-    ]
+    return src.list_projects_with_counts()
 
 
 @router.get("/projects/{project}/issues")

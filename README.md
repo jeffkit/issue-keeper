@@ -79,13 +79,11 @@ keeper 在处理 issue 时自动推状态：
 - **人提的 issue** → 由配置的 `review_agent` 先 review；需要人二次 review 时人接手
 
 ```yaml
-# 全局默认 review agent
+# config.yaml 里的全局默认 review agent
 default_review_agent: "reviewer-agent"
-
-repos:
-  - repo: "proj-a"
-    review_agent: "proj-a-reviewer"   # 覆盖全局
 ```
+
+> per-repo `review_agent` 覆盖暂未入库（db `projects` 表未存该字段），目前用全局 `default_review_agent`。确需 per-project review agent 可后续加列。
 
 ### 角色区分（actor_type）
 
@@ -259,32 +257,37 @@ python -m issue_keeper dashboard --port 8080 --db /path/to/internal.db --agent-l
 
 ### 团队成员（team）
 
-多项目协作时，dashboard 的「团队成员」页展示参与工作的所有 agent 及其自我介绍。数据存在 `~/.issue-keeper/team.json`（独立于 internal.db），由 `team` CLI 子命令维护：
+多项目协作时，dashboard 的「团队成员」页展示参与工作的所有 agent 及其自我介绍。数据存在 `internal.db` 的 `projects` 表——既是团队介绍、也是项目绑定的**单一配置源**。`team` CLI 维护：
 
 ```bash
-# 从 config.yaml 同步 agent 花名册（project/agent_label/cwd），保留已有介绍
-python -m issue_keeper team sync --config config.yaml
+# 新增/更新项目绑定（写 db；on conflict 保留已写好的 intro）
+python -m issue_keeper team add proj-a --agent-label proj-a-agent --cwd ~/projects/proj-a
 
 # 给某个 agent 写自我介绍（dashboard 团队页展示）
 python -m issue_keeper team set-intro agentproc-agent --intro "我是 ..."
 
-# 列出当前团队
+# 列出项目绑定 + 团队介绍
 python -m issue_keeper team list
+
+# 从旧版 config.yaml（repos 段）一次性迁移进 db
+python -m issue_keeper team import --config <旧 config.yaml>
 ```
 
-介绍最好由 agent 自己生成（最准确）：可以直接经 `invoke_agent` 调一次 agent 让它读自己项目仓库后写一段 100-200 字介绍，再用 `team set-intro` 写入。dashboard 的 `GET /api/team` 读 team.json（默认路径，可用 `dashboard --team <path>` 覆盖）。
+介绍最好由 agent 自己生成（最准确）：经 `invoke_agent` 调一次 agent 让它读自己项目仓库后写一段 100-200 字介绍，再用 `team set-intro` 写入（`onboard --gen-intro` 自动做这步）。dashboard 的 `GET /api/team` 与 `GET /api/projects` 都直接读 `projects` 表（`/api/projects` LEFT JOIN issue 计数，0 issue 的项目也显示）。
+
+> 旧版本用 `~/.issue-keeper/team.json` 存介绍。`team import` 时若发现旧 team.json，会把 intro 一次性迁进 db，并把 team.json 改名为 `team.json.migrated` 保留备份。
 
 ### onboarding 新项目（onboard）
 
-把一个新项目快速注册进协同，一条命令完成「加 binding → team sync → 生成介绍 → 重载 keeper」：
+把一个新项目快速注册进协同，一条命令完成「写 db 绑定 + 生成介绍」：
 
 ```bash
 DEEPSEEK_API_KEY=$DEEPSEEK_API_KEY python3 -m issue_keeper onboard \
   /path/to/<新项目目录> \
-  --config config.yaml --agent-label <新项目>-agent --gen-intro --reload
+  --agent-label <新项目>-agent --gen-intro
 ```
 
-参数：`--repo`（项目名，默认取目录名）、`--agent-label`（默认 `<repo>-agent`）、`--profile`（默认 `claude-code`）、`--gen-intro`（调 agent 自动写介绍）、`--reload`（完成后重载 keeper daemon）。会往 config.yaml 的 `repos` 追加一条 binding（复用 `_agent_env` anchor），并同步 team.json。
+参数：`--repo`（项目名，默认取目录名）、`--agent-label`（默认 `<repo>-agent`）、`--profile`（默认 `claude-code`）、`--gen-intro`（调 agent 自动写介绍并写入 db）、`--reload`（立即重载 keeper daemon；不加重载则等下一轮 live-reload 自动生效）。直接写 db 的 `projects` 表，keeper 下一轮自动接手。
 
 ### 人类如何参与协同
 
@@ -326,7 +329,7 @@ dashboard 不依赖 `config.yaml`，直接用 `--db` 指向 internal source 的 
 
 ## 配置
 
-复制 `config.example.yaml` 为 `config.yaml`，按需修改：
+`config.yaml` 只放**引导 + 全局旋钮 + screener + 全局 agent env 模板**。项目绑定（repo/agent_label/cwd/profile/source/monitor_prs/env/intro）存在 `internal.db` 的 `projects` 表——这是 issue-keeper 的**单一配置源**，keeper 每轮 live-reload，db 改动即时生效。
 
 ```yaml
 poll_interval_secs: 300
@@ -334,6 +337,9 @@ state_file: ~/.issue-keeper/state.json
 bot_marker: "<!-- issue-keeper-bot -->"
 default_timeout_secs: 600
 agent_from_user: "issue-keeper"
+default_review_agent: ""        # 留空：人提的 issue 处理完停在 review 等人接手
+
+internal_db: ~/.issue-keeper/internal.db   # 项目绑定 + issue 共用库
 
 screener:
   enabled: true
@@ -344,22 +350,33 @@ screener:
   on_unsafe: skip
   max_chars: 8000
 
-repos:
-  - repo: "owner/repo-name"
-    profile: "deepseek"                 # AgentProc profile（hub 名或本地路径）
-    source: github_token                # 或 github_cli / internal
-    github_token: ${GITHUB_TOKEN}       # source=github_token 时需要
-    agent_label: "proj-a-agent"         # 可见前缀里的身份标签
-    cwd: ~/projects/proj-a              # agent 工作目录（动态指定，不用每项目建 profile）
-    env:                                # 传给 agent 子进程的 env（支持 ${VAR} 插值）
-      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
-      DEEPSEEK_MODEL: deepseek-v4-pro
-    labels: []
-    monitor_prs: false
-    # pr_labels: ["ai"]
-    # poll_interval_secs: 600
-    # timeout_secs: 900
+# 所有 agent 共用的 LLM 连接（密钥 ${VAR} 引用，实际值在环境变量）。
+# load_config 把这份模板套到 db 里每个项目绑定上；某项目要单独 env 时在其 env 列覆盖。
+agent_env:
+  ANTHROPIC_API_KEY: ${DEEPSEEK_API_KEY}
+  ANTHROPIC_BASE_URL: "https://api.deepseek.com/anthropic"
+  CLAUDE_MODEL: "deepseek-chat"
 ```
+
+项目绑定用 CLI 管理（写 db）：
+
+```bash
+# 新增/更新一个项目绑定（internal source）
+python -m issue_keeper team add proj-a --agent-label proj-a-agent \
+  --cwd ~/projects/proj-a --profile claude-code
+
+# github source 也支持（github_token 用 ${VAR} 占位）
+python -m issue_keeper team add owner/repo --agent-label proj-a-agent \
+  --cwd ~/projects/proj-a --source github_token --github-token '${GITHUB_TOKEN}' \
+  --monitor-prs --env ANTHROPIC_API_KEY=${DEEPSEEK_API_KEY}
+
+python -m issue_keeper team remove proj-a
+python -m issue_keeper team list
+```
+
+从旧版（`repos:` 写在 yaml）升级，一次性迁移：`python -m issue_keeper team import --config <旧 config.yaml>`（旧 team.json 的 intro 也会一并迁进 db，team.json 改名 `.migrated` 备份）。
+
+> db `projects` 表目前存：name / agent_label / cwd / profile / source / github_token / monitor_prs / env / intro。少数旧字段（per-repo `labels` / `pr_labels` / `review_agent` / `timeout_secs`）暂未入库，用全局默认；确需 per-project 差异可后续加列。
 
 ### AgentProc profile
 

@@ -104,6 +104,20 @@ CREATE TABLE IF NOT EXISTS status_history (
     comment     TEXT,
     created_at  TEXT    NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS projects (
+    name         TEXT PRIMARY KEY,           -- = binding.repo
+    agent_label  TEXT NOT NULL DEFAULT '',
+    cwd          TEXT NOT NULL DEFAULT '',
+    profile      TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT 'internal',
+    github_token TEXT NOT NULL DEFAULT '',   -- github_token source 用，${VAR} 占位
+    monitor_prs  INTEGER NOT NULL DEFAULT 0,
+    env          TEXT NOT NULL DEFAULT '',   -- JSON：项目级 env 覆盖（${VAR} 占位，不存明文密钥）
+    intro        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
 """
 
 _SCHEMA_INDEXES = """
@@ -201,6 +215,16 @@ class InternalSource(IssueSource):
         icols = {row["name"] for row in conn.execute("PRAGMA table_info(issues)").fetchall()}
         if "labels" not in icols:
             conn.execute("ALTER TABLE issues ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'")
+
+        # projects 表：补 monitor_prs / env（旧库可能已建了 projects 但缺这两列）
+        pcols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+        if pcols:
+            if "monitor_prs" not in pcols:
+                conn.execute("ALTER TABLE projects ADD COLUMN monitor_prs INTEGER NOT NULL DEFAULT 0")
+            if "env" not in pcols:
+                conn.execute("ALTER TABLE projects ADD COLUMN env TEXT NOT NULL DEFAULT ''")
+            if "github_token" not in pcols:
+                conn.execute("ALTER TABLE projects ADD COLUMN github_token TEXT NOT NULL DEFAULT ''")
 
     def _row_to_resource(self, row: sqlite3.Row) -> Resource:
         return Resource(
@@ -495,3 +519,137 @@ class InternalSource(IssueSource):
                 finally:
                     conn.close()
         return ok
+
+    # ── projects 表（项目元数据 + agent 介绍）─────────────────────────────
+
+    def upsert_project(self, *, name: str, agent_label: str = "",
+                       cwd: str = "", profile: str = "", source: str = "internal",
+                       github_token: str = "",
+                       monitor_prs: bool = False,
+                       env: dict[str, str] | None = None) -> None:
+        """upsert 一行 projects。重跑时保留已有 intro；绑定字段（含 github_token/env）会覆盖。"""
+        now = _now_iso()
+        env_json = json.dumps(env, ensure_ascii=False) if env else ""
+        with self._lock:
+            conn = self._conn()
+            try:
+                conn.execute(
+                    "INSERT INTO projects "
+                    "(name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET "
+                    "agent_label = excluded.agent_label, cwd = excluded.cwd, "
+                    "profile = excluded.profile, source = excluded.source, "
+                    "github_token = excluded.github_token, "
+                    "monitor_prs = excluded.monitor_prs, env = excluded.env, "
+                    "updated_at = excluded.updated_at",
+                    [name, agent_label, cwd, profile, source, github_token,
+                     1 if monitor_prs else 0, env_json, now, now],
+                )
+            finally:
+                conn.close()
+
+    def delete_project(self, name: str) -> bool:
+        """删除一个项目绑定（不删它的 issue）。返回是否命中。"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute("DELETE FROM projects WHERE name = ?", [name])
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def set_project_intro(self, name: str, intro: str) -> bool:
+        """设置某项目的 agent 介绍。返回是否命中。"""
+        now = _now_iso()
+        with self._lock:
+            conn = self._conn()
+            try:
+                cur = conn.execute(
+                    "UPDATE projects SET intro = ?, updated_at = ? WHERE name = ?",
+                    [intro, now, name],
+                )
+                return cur.rowcount > 0
+            finally:
+                conn.close()
+
+    def set_project_intro_by_label(self, agent_label: str, intro: str) -> str | None:
+        """按 agent_label 找项目并设 intro。返回被更新的 project name，未命中返回 None。"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                row = conn.execute(
+                    "SELECT name FROM projects WHERE agent_label = ?",
+                    [agent_label],
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None
+        self.set_project_intro(row["name"], intro)
+        return row["name"]
+
+    def list_projects_meta(self) -> list[dict[str, Any]]:
+        """所有项目元数据 + 介绍（不含 issue 计数）。按 name 排序。"""
+        with self._lock:
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    "SELECT name, agent_label, cwd, profile, source, github_token, monitor_prs, env, intro "
+                    "FROM projects ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["monitor_prs"] = bool(d.get("monitor_prs", 0))
+            raw_env = d.get("env") or ""
+            try:
+                d["env"] = json.loads(raw_env) if raw_env else {}
+            except (json.JSONDecodeError, TypeError):
+                d["env"] = {}
+            out.append(d)
+        return out
+
+    def list_projects_with_counts(self) -> list[dict[str, Any]]:
+        """项目列表 + issue 计数。按 name 排序。
+
+        包含两类项目：
+        - projects 表里的项目（有元数据/介绍，LEFT JOIN issue 计数，0 issue 也显示）
+        - 只在 issues 表出现、还没 sync 进 projects 表的项目（元数据为空，兼容旧行为）
+        """
+        open_ph = "','".join(ACTIVE_STATUSES)
+        with self._lock:
+            conn = self._conn()
+            try:
+                rows = conn.execute(
+                    f"SELECT * FROM ("
+                    f"  SELECT p.name AS project, p.agent_label AS agent_label, p.intro AS intro, "
+                    f"         COUNT(i.id) AS total, "
+                    f"         SUM(CASE WHEN i.status IN ('{open_ph}') THEN 1 ELSE 0 END) AS open_n "
+                    f"  FROM projects p "
+                    f"  LEFT JOIN issues i ON i.project = p.name AND i.kind = 'issue' "
+                    f"  GROUP BY p.name "
+                    f"  UNION ALL "
+                    f"  SELECT i2.project AS project, '' AS agent_label, '' AS intro, "
+                    f"         COUNT(*) AS total, "
+                    f"         SUM(CASE WHEN i2.status IN ('{open_ph}') THEN 1 ELSE 0 END) AS open_n "
+                    f"  FROM issues i2 "
+                    f"  WHERE i2.kind = 'issue' AND i2.project NOT IN (SELECT name FROM projects) "
+                    f"  GROUP BY i2.project "
+                    f") ORDER BY project"
+                ).fetchall()
+            finally:
+                conn.close()
+        return [
+            {
+                "project": r["project"],
+                "agent_label": r["agent_label"] or "",
+                "intro": r["intro"] or "",
+                "total": int(r["total"] or 0),
+                "open": int(r["open_n"] or 0),
+            }
+            for r in rows
+        ]
+

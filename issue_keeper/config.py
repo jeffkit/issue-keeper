@@ -143,39 +143,45 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
     return cfg
 
 
+def _load_repos_from_db(internal_db: str, agent_env: dict[str, str]) -> list[RepoBinding]:
+    """项目绑定从 db 的 projects 表加载（单一源）。
+
+    每个绑定的 env = 全局 agent_env 模板 + 该项目 env 列的覆盖（都已展开 ${VAR}）。
+    internal_db 用全局路径（projects 表与 issue 同库）。
+    """
+    from .sources.internal import InternalSource
+
+    loader_binding = RepoBinding(
+        repo="", profile="", source="internal",
+        agent_label="config-loader", internal_db=internal_db,
+    )
+    src = InternalSource(binding=loader_binding)
+    repos: list[RepoBinding] = []
+    for m in src.list_projects_meta():
+        # 项目 env 列存的是 ${VAR} 占位，这里展开后合并到全局模板（项目覆盖全局）
+        proj_env = {str(k): _expand_env(v) for k, v in (m.get("env") or {}).items()}
+        env = {**agent_env, **proj_env}
+        repos.append(
+            RepoBinding(
+                repo=m["name"],
+                profile=m.get("profile") or "claude-code",
+                source=m.get("source") or "internal",
+                agent_label=m.get("agent_label") or "",
+                github_token=_expand_env(m.get("github_token") or ""),
+                cwd=m.get("cwd") or "",
+                monitor_prs=bool(m.get("monitor_prs", False)),
+                env=env,
+                internal_db=internal_db,
+            )
+        )
+    return repos
+
+
 def load_config(path: str | os.PathLike) -> Config:
     p = Path(path).expanduser()
     if not p.exists():
         raise FileNotFoundError(f"配置文件不存在: {p}")
     raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-
-    repos: list[RepoBinding] = []
-    for item in raw.get("repos", []) or []:
-        if not isinstance(item, dict):
-            raise ValueError(f"repos 条目必须是映射: {item!r}")
-        repo = (item.get("repo") or "").strip()
-        profile = (item.get("profile") or "").strip()
-        if not repo or not profile:
-            raise ValueError("每个 repos 条目必须提供非空的 repo 和 profile")
-        repos.append(
-            RepoBinding(
-                repo=repo,
-                profile=profile,
-                labels=list(item.get("labels") or []),
-                monitor_prs=bool(item.get("monitor_prs", False)),
-                pr_labels=list(item.get("pr_labels") or []),
-                source=(item.get("source") or "github_cli").strip() or "github_cli",
-                agent_label=(item.get("agent_label") or "").strip(),
-                github_token=_expand_env(item.get("github_token") or ""),
-                internal_db=_expand_env(item.get("internal_db") or ""),
-                cwd=os.path.expanduser(_expand_env(item.get("cwd") or "")),
-                env={str(k): _expand_env(v) for k, v in (item.get("env") or {}).items()},
-                review_agent=(item.get("review_agent") or "").strip(),
-                poll_interval_secs=item.get("poll_interval_secs"),
-                session_prefix=(item.get("session_prefix") or "issue-keeper").strip() or "issue-keeper",
-                timeout_secs=item.get("timeout_secs"),
-            )
-        )
 
     state_file = raw.get("state_file") or "~/.issue-keeper/state.json"
 
@@ -191,6 +197,19 @@ def load_config(path: str | os.PathLike) -> Config:
             "    enabled: false\n"
         )
     screener = _load_screener(screener_raw)
+
+    # 全局 agent env 模板（所有 agent 共用的 LLM 连接，密钥用 ${VAR} 引用）
+    agent_env_raw = raw.get("agent_env") or {}
+    if not isinstance(agent_env_raw, dict):
+        raise ValueError("agent_env 必须是映射（key: value）")
+    agent_env = {str(k): _expand_env(v) for k, v in agent_env_raw.items()}
+
+    # 项目绑定所在 db（projects 表 + issue 同库）
+    internal_db = os.path.expanduser(
+        _expand_env(raw.get("internal_db") or "~/.issue-keeper/internal.db")
+    )
+
+    repos = _load_repos_from_db(internal_db, agent_env)
 
     cfg = Config(
         poll_interval_secs=int(raw.get("poll_interval_secs", 300)),

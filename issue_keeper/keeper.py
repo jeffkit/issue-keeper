@@ -18,7 +18,7 @@ import logging
 import time
 from datetime import datetime
 
-from .config import Config, RepoBinding
+from .config import Config, RepoBinding, load_config
 from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
 from .screener import ScreenerConfig, screen as screen_text
 from .sources import IssueSource, Resource, make_source
@@ -438,8 +438,13 @@ def run_once(config: Config) -> int:
     return total
 
 
-def run_daemon(config: Config) -> None:
-    """常驻轮询。"""
+def run_daemon(config_path: str) -> None:
+    """常驻轮询。每轮重新 load_config，使 db 里项目绑定/全局旋钮的改动即时生效。"""
+    try:
+        config = load_config(config_path)
+    except Exception as e:
+        log.error("启动加载配置失败，退出: %s", e)
+        return
     log.info(
         "issue-keeper daemon 启动，监控 %d 个仓库，轮询间隔 %ds，screener=%s",
         len(config.repos), config.poll_interval_secs,
@@ -448,6 +453,7 @@ def run_daemon(config: Config) -> None:
     while True:
         start = datetime.now()
         try:
+            config = load_config(config_path)  # live-reload：db 为单一配置源
             handled = run_once(config)
             log.info("本轮完成，处理 %d 条，耗时 %.1fs", handled, (datetime.now() - start).total_seconds())
         except Exception as e:
