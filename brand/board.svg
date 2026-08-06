@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 640" width="960" height="640">
+  <defs>
+    <linearGradient id="shG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3D5AF1"/><stop offset="1" stop-color="#1E2A52"/>
+    </linearGradient>
+    <symbol id="mkColor" viewBox="0 0 64 64">
+      <path d="M12 8 L52 8 L52 24 C52 40 42 50 32 56 C22 50 12 40 12 24 Z" fill="url(#shG)"/>
+      <path d="M18 20 A6 6 0 0 1 24 14 H40 A6 6 0 0 1 46 20 V30 A6 6 0 0 1 40 36 H30 L26 42 V36 H24 A6 6 0 0 1 18 30 Z" fill="#FFFFFF"/>
+      <path d="M26 24 L31 29 L40 19" fill="none" stroke="#1FE0C4" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="mkInk" viewBox="0 0 64 64">
+      <path d="M12 8 L52 8 L52 24 C52 40 42 50 32 56 C22 50 12 40 12 24 Z" fill="#131C33"/>
+      <path d="M18 20 A6 6 0 0 1 24 14 H40 A6 6 0 0 1 46 20 V30 A6 6 0 0 1 40 36 H30 L26 42 V36 H24 A6 6 0 0 1 18 30 Z" fill="#FFFFFF"/>
+      <path d="M26 24 L31 29 L40 19" fill="none" stroke="#1FE0C4" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <symbol id="mkWhite" viewBox="0 0 64 64">
+      <path d="M12 8 L52 8 L52 24 C52 40 42 50 32 56 C22 50 12 40 12 24 Z" fill="#FFFFFF"/>
+      <path d="M18 20 A6 6 0 0 1 24 14 H40 A6 6 0 0 1 46 20 V30 A6 6 0 0 1 40 36 H30 L26 42 V36 H24 A6 6 0 0 1 18 30 Z" fill="#1E2A52"/>
+      <path d="M26 24 L31 29 L40 19" fill="none" stroke="#1FE0C4" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+
+  <!-- canvas -->
+  <rect width="960" height="640" fill="#F4F6FB"/>
+
+  <!-- header -->
+  <use href="#mkColor" x="48" y="40" width="40" height="40"/>
+  <text x="100" y="62" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="22" font-weight="700" fill="#131C33">issue-keeper</text>
+  <text x="100" y="84" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="13" fill="#6B7280">Logo System · Brand marks &amp; usage</text>
+
+  <!-- hero card -->
+  <rect x="48" y="120" width="392" height="300" rx="18" fill="#FFFFFF" stroke="#E5E9F2" stroke-width="1.5"/>
+  <use href="#mkColor" x="150" y="170" width="180" height="180"/>
+  <text x="244" y="382" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="15" font-weight="600" fill="#131C33">Primary Mark</text>
+  <text x="244" y="404" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#6B7280">Full color · gradient shield</text>
+
+  <!-- concept note -->
+  <text x="48" y="452" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="13" font-weight="600" fill="#131C33">Concept</text>
+  <text x="48" y="480" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12.5" fill="#4B5563">Shield = the security screener (keeper)</text>
+  <text x="48" y="502" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12.5" fill="#4B5563">Bubble = an issue / comment thread</text>
+  <text x="48" y="524" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12.5" fill="#4B5563">Teal check = agent's safe, verified reply</text>
+  <text x="48" y="546" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12.5" fill="#4B5563">Blue = trust · Teal = automation</text>
+
+  <!-- lockup card -->
+  <rect x="468" y="120" width="444" height="150" rx="18" fill="#FFFFFF" stroke="#E5E9F2" stroke-width="1.5"/>
+  <use href="#mkColor" x="496" y="150" width="80" height="80"/>
+  <text x="600" y="205" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="30" font-weight="700" letter-spacing="-0.5" fill="#131C33">issue-<tspan fill="#3D5AF1">keeper</tspan></text>
+  <text x="496" y="252" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="12" fill="#6B7280">Horizontal lockup · mark + wordmark</text>
+
+  <!-- variations card -->
+  <rect x="468" y="290" width="444" height="130" rx="18" fill="#FFFFFF" stroke="#E5E9F2" stroke-width="1.5"/>
+  <text x="492" y="318" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="13" font-weight="600" fill="#131C33">Monochrome &amp; App Icon</text>
+  <use href="#mkColor" x="500" y="338" width="64" height="64"/>
+  <use href="#mkInk" x="588" y="338" width="64" height="64"/>
+  <rect x="676" y="338" width="64" height="64" rx="14" fill="#1E2A52"/>
+  <use href="#mkWhite" x="676" y="338" width="64" height="64"/>
+  <rect x="764" y="338" width="64" height="64" rx="14" fill="#3D5AF1"/>
+  <use href="#mkWhite" x="764" y="338" width="64" height="64"/>
+
+  <!-- palette card -->
+  <rect x="468" y="440" width="444" height="160" rx="18" fill="#FFFFFF" stroke="#E5E9F2" stroke-width="1.5"/>
+  <text x="492" y="470" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="13" font-weight="600" fill="#131C33">Color Palette</text>
+  <rect x="492" y="492" width="90" height="56" rx="8" fill="#131C33"/>
+  <rect x="596" y="492" width="90" height="56" rx="8" fill="#3D5AF1"/>
+  <rect x="700" y="492" width="90" height="56" rx="8" fill="#1E2A52"/>
+  <rect x="804" y="492" width="90" height="56" rx="8" fill="#1FE0C4"/>
+  <text x="537" y="566" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="10" fill="#6B7280">#131C33</text>
+  <text x="641" y="566" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="10" fill="#6B7280">#3D5AF1</text>
+  <text x="745" y="566" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="10" fill="#6B7280">#1E2A52</text>
+  <text x="849" y="566" text-anchor="middle" font-family="'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="10" fill="#6B7280">#1FE0C4</text>
+</svg>

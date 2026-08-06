@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="shG" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3D5AF1"/>
+      <stop offset="1" stop-color="#1E2A52"/>
+    </linearGradient>
+  </defs>
+  <!-- guardian shield (the security screener / keeper) -->
+  <path d="M12 8 L52 8 L52 24 C52 40 42 50 32 56 C22 50 12 40 12 24 Z" fill="url(#shG)"/>
+  <!-- subtle top sheen -->
+  <path d="M12 8 L52 8 L52 15 C40 21 24 21 12 15 Z" fill="#FFFFFF" opacity="0.10"/>
+  <!-- issue / comment bubble -->
+  <path d="M18 20 A6 6 0 0 1 24 14 H40 A6 6 0 0 1 46 20 V30 A6 6 0 0 1 40 36 H30 L26 42 V36 H24 A6 6 0 0 1 18 30 Z" fill="#FFFFFF"/>
+  <!-- teal check = agent's safe, verified reply -->
+  <path d="M26 24 L31 29 L40 19" fill="none" stroke="#1FE0C4" stroke-width="3.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
