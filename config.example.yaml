@@ -49,6 +49,12 @@ keeper_timeout_secs: 3900
 # provider: openai     —— OpenAI 兼容（DeepSeek / OpenAI / Moonshot 等）。默认。
 # provider: anthropic  —— Anthropic messages API。
 #
+# backend: classic     —— 内置实现（支持 openai / anthropic 两种协议）。默认。
+# backend: decision    —— 复用 plaita-nodes 的 DecisionNode：封闭决策空间
+#                         {safe, unsafe} + 置信度门控；低于 min_confidence 按
+#                         不安全处理（fail-safe，与 classic「模棱两可→保守」等价）。
+#                         仅支持 provider: openai，需要安装 plaita-nodes。
+#
 # fail-safe：必须显式声明 screener.enabled。不写 screener 段 = 启动报错。
 screener:
   enabled: true
@@ -58,6 +64,8 @@ screener:
   model: deepseek-chat
   on_unsafe: skip        # skip（默认）/ comment
   max_chars: 8000
+  # backend: decision
+  # min_confidence: 0.8  # 仅 decision 后端生效
 
 # ─── 项目绑定在哪里？──────────────────────────────────────────────────
 # 项目绑定（repo/agent_label/cwd/profile/source/monitor_prs/env/github_token/intro）

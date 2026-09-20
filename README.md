@@ -137,6 +137,9 @@ GitHub issue/PR 是公开输入面，任何人都能在里面塞内容诱导 age
 - **双协议支持**：
   - `provider: openai`（默认）—— OpenAI 兼容协议，支持 **DeepSeek**（推荐）/ OpenAI / Moonshot / Together 等。
   - `provider: anthropic` —— Anthropic messages API（GLM anthropic 兼容端点等）。
+- **两种后端**（`screener.backend`）：
+  - `classic`（默认）—— 本模块内置实现，支持上述双协议；输出 `{safe, reason}`。
+  - `decision` —— 复用 [plaita-nodes](../plaita-nodes) 的 **DecisionNode** 结构化决策原子：封闭决策空间 `{safe, unsafe}` + 置信度。低于 `min_confidence`（默认 0.8）按不安全处理——把 classic 提示词里「模棱两可→保守」量化为可调阈值。仅支持 `provider: openai`，需安装 plaita-nodes；判定结果带 `confidence` 字段（Verdict），可观测可审计。
 - **凭据复用**：可以直接配 `api_key`/`base_url`/`model`（推荐 DeepSeek），也可以用 `credentials_from_profile` 复用某个 AgentProc profile 的凭据。
 - **fail-safe**：必须显式声明 `screener.enabled`。不写 `screener` 段、或 `enabled: true` 但缺凭据，程序都拒绝启动。
 - **判定不安全时**：

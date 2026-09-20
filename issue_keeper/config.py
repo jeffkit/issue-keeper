@@ -129,6 +129,13 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
     if provider not in ("openai", "anthropic"):
         raise ValueError("screener.provider 只能是 'openai' 或 'anthropic'")
 
+    backend = (raw.get("backend") or "classic").strip().lower()
+    if backend not in ("classic", "decision"):
+        raise ValueError("screener.backend 只能是 'classic' 或 'decision'")
+    min_confidence = float(raw.get("min_confidence", 0.8))
+    if not 0 < min_confidence <= 1:
+        raise ValueError("screener.min_confidence 需在 (0, 1] 区间")
+
     api_key = _expand_env(raw.get("api_key") or "").strip() or None
     base_url = _expand_env(raw.get("base_url") or "").strip() or None
     model = _expand_env(raw.get("model") or "").strip() or None
@@ -145,6 +152,12 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
 
     max_chars = int(raw.get("max_chars", 8000))
 
+    if backend == "decision" and provider == "anthropic":
+        # 放在 credentials_from_profile 推断之后：profile 也可能推出 anthropic
+        raise ValueError(
+            "screener.backend=decision 暂只支持 provider: openai"
+            "（anthropic 协议请用 backend: classic）")
+
     cfg = ScreenerConfig(
         enabled=enabled,
         provider=provider,
@@ -153,6 +166,8 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
         model=model,
         on_unsafe=on_unsafe,
         max_chars=max_chars,
+        backend=backend,
+        min_confidence=min_confidence,
     )
 
     if cfg.enabled:
