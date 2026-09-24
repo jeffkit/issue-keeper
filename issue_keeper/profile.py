@@ -90,8 +90,8 @@ def _build_command(entry: ProfileEntry, session_id: str,
                    default_timeout: int = 600) -> list[str]:
     """构造 agentproc 调用命令（不含 message，message 通过 stdin 传入）。
 
-    hub 名：agentproc hub run <name> --stdin [--cwd <path>] [--session <id>] [--from <user>]
-    本地：  agentproc --profile <path>   --stdin [--cwd <path>] [--session <id>] [--from <user>]
+    hub 名：agentproc hub run <name> --stdin [--cwd <path>] [--session <id>]
+    本地：  agentproc --profile <path>   --stdin [--cwd <path>] [--session <id>]
 
     message 通过 stdin 传给 agentproc 的 --stdin，避免命令行长度限制。
 
@@ -114,8 +114,8 @@ def _build_command(entry: ProfileEntry, session_id: str,
         cmd += ["--cwd", entry.cwd]
     if session_id:
         cmd += ["--session", session_id]
-    if from_user:
-        cmd += ["--from", from_user]
+    # from_user 不再传给 agentproc：0.14 CLI 已移除 --from（agent 身份由
+    # 回复正文里的 bot marker / 可见前缀承载，见 README「可见前缀与 agent 身份」）。
     # binding.env 经 --env 透传给 agent（绕过 env_allowlist 过滤）
     for k, v in entry.env.items():
         cmd += ["--env", f"{k}={v}"]
