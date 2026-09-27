@@ -12,7 +12,7 @@ from collections import Counter
 
 LEDGER = pathlib.Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
 KLOG = pathlib.Path("~/.issue-keeper/keeper.log").expanduser()
-OUT = pathlib.Path("~/.issue-keeper/pipeline/report-latest.md")
+OUT = pathlib.Path("~/.issue-keeper/pipeline/report-latest.md").expanduser()
 
 
 def load_runs(days: int = 7):
