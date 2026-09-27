@@ -53,6 +53,20 @@ keeper_timeout_secs: 3900
 # backend: decision    —— 复用 plaita-nodes 的 DecisionNode：封闭决策空间
 #                         {safe, unsafe} + 置信度门控；低于 min_confidence 按
 #                         不安全处理（fail-safe，与 classic「模棱两可→保守」等价）。
+# backend: flow        —— 判定配置来自 plaita-console 上一条已发布的 flow
+#                         定义（supervisor 自迭代管线管着它的版本与质量）。
+#                         按 refresh_secs TTL 拉取并落盘缓存，本地 DecisionNode
+#                         执行——判定路径不依赖 console 在线；console 不可达时
+#                         用 stale 缓存，连缓存都没有则回退下方本地凭据。
+#                         定义里的 $ENV.X 从 daemon 进程环境展开。
+#
+# flow 后端示例：
+# console:
+#   url: https://console.example.cc
+#   api_key: ${PLAITA_CONSOLE_ADMIN_API_KEY}
+#   flow_id: issue-screener
+#   refresh_secs: 300
+#   cache_path: ~/.issue-keeper/screener-flow.json   # 可省
 #                         仅支持 provider: openai，需要安装 plaita-nodes。
 #
 # fail-safe：必须显式声明 screener.enabled。不写 screener 段 = 启动报错。

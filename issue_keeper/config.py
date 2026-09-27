@@ -130,8 +130,8 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
         raise ValueError("screener.provider 只能是 'openai' 或 'anthropic'")
 
     backend = (raw.get("backend") or "classic").strip().lower()
-    if backend not in ("classic", "decision"):
-        raise ValueError("screener.backend 只能是 'classic' 或 'decision'")
+    if backend not in ("classic", "decision", "flow"):
+        raise ValueError("screener.backend 只能是 'classic'、'decision' 或 'flow'")
     min_confidence = float(raw.get("min_confidence", 0.8))
     if not 0 < min_confidence <= 1:
         raise ValueError("screener.min_confidence 需在 (0, 1] 区间")
@@ -158,6 +158,10 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
             "screener.backend=decision 暂只支持 provider: openai"
             "（anthropic 协议请用 backend: classic）")
 
+    console = raw.get("console") or {}
+    if not isinstance(console, dict):
+        raise ValueError("screener.console 需要是映射（url/api_key/flow_id/refresh_secs/cache_path）")
+
     cfg = ScreenerConfig(
         enabled=enabled,
         provider=provider,
@@ -168,15 +172,28 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
         max_chars=max_chars,
         backend=backend,
         min_confidence=min_confidence,
+        console_url=_expand_env(console.get("url") or "").strip() or None,
+        console_api_key=_expand_env(console.get("api_key") or "").strip() or None,
+        console_flow_id=(console.get("flow_id") or "issue-screener").strip(),
+        console_refresh_secs=int(console.get("refresh_secs", 300)),
+        console_cache_path=_expand_env(console.get("cache_path") or "").strip() or None,
     )
 
     if cfg.enabled:
-        missing = [k for k in ("api_key", "base_url", "model") if not getattr(cfg, k)]
-        if missing:
-            raise ValueError(
-                f"screener.enabled=true 但缺少: {', '.join(missing)}。"
-                f"请配置 screener.api_key/base_url/model，或 screener.credentials_from_profile。"
-            )
+        if backend == "flow":
+            missing = [k for k in ("console_url", "console_api_key") if not getattr(cfg, k)]
+            if missing:
+                raise ValueError(
+                    f"screener.backend=flow 但缺少: {', '.join(missing)}。"
+                    f"请在 screener.console 下配置 url 与 api_key。"
+                )
+        else:
+            missing = [k for k in ("api_key", "base_url", "model") if not getattr(cfg, k)]
+            if missing:
+                raise ValueError(
+                    f"screener.enabled=true 但缺少: {', '.join(missing)}。"
+                    f"请配置 screener.api_key/base_url/model，或 screener.credentials_from_profile。"
+                )
     return cfg
 
 

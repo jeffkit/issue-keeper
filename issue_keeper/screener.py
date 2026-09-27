@@ -6,11 +6,16 @@
 实现要点（安全模型）：
 - screener 只发一次 HTTP POST，从不 spawn 子进程、从不读写本地文件（除自身模块加载）
 - 完全不依赖 bridge / profile / claude-code，因此不存在「配错 cwd 就越权」
-- 两种后端（screener.backend）：
+- 三种后端（screener.backend）：
     * classic  —— 本模块内置实现。支持 openai 兼容与 anthropic 两种协议。
     * decision —— 复用 plaita-nodes 的 DecisionNode（结构化决策：封闭决策空间
       {safe, unsafe} + 置信度门控）。低置信按不安全处理（fail-safe 与 classic
       的「模棱两可→保守」等价，且量化为阈值）。仅支持 openai 兼容端点。
+    * flow     —— 判定配置来自 plaita-console 里一条已发布的 flow 定义
+      （supervisor 自迭代管线的产物）：按 TTL 拉取最新已发布版本（semver 最高者）
+      并落盘缓存；本地仍用 DecisionNode 执行，判定路径不依赖 console 在线。
+      console 不可达时用 stale 缓存；连缓存都没有时回退本地 classic/decision
+      凭据（建议照常配置）。定义中的 $ENV.X 从本进程环境展开。
 - 凭据来源：可从 bridge profile YAML 抠出，也可在 config 直接写。
 
 classic 判定输出：严格 JSON {safe: bool, reason: str}，由 _extract_json 解析。
@@ -22,6 +27,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -66,8 +73,14 @@ class ScreenerConfig:
     model: str | None
     on_unsafe: str  # "skip" | "comment"
     max_chars: int  # 单条文本喂给 screener 的最大字符数，避免超长 issue 爆 token
-    backend: str = "classic"  # "classic" | "decision"
+    backend: str = "classic"  # "classic" | "decision" | "flow"
     min_confidence: float = 0.8  # decision 后端：低于此置信度按不安全处理
+    # flow 后端：判定配置的来源（plaita-console）
+    console_url: str | None = None
+    console_api_key: str | None = None  # X-Admin-API-Key
+    console_flow_id: str = "issue-screener"
+    console_refresh_secs: int = 300  # 已发布定义的拉取 TTL；TTL 内只用本地缓存
+    console_cache_path: str | None = None  # 默认 ~/.issue-keeper/screener-flow.json
 
 
 @dataclass
@@ -308,12 +321,178 @@ def _screen_decision(text: str, cfg: ScreenerConfig, *, source_label: str) -> Ve
     return Verdict(safe=safe, reason=reason, raw=out["raw"], confidence=confidence)
 
 
+# ---------------------------------------------------------------------------
+# flow 后端：判定配置来自 plaita-console 的已发布 flow 定义（supervisor 管线）
+# ---------------------------------------------------------------------------
+
+_FLOW_ENV_RE = re.compile(r"^\$ENV\.(\w+)$")
+
+
+def _semver_key(version: str):
+    parts = re.findall(r"\d+", str(version or ""))
+    return tuple(int(x) for x in parts[:3]) or (0, 0, 0)
+
+
+def _resolve_flow_field(value: Any, text: str) -> Any:
+    """解析 flow 定义节点字段里的两种表达式：$ENV.X（本进程环境）与 $INPUT.*
+    （待判定文本）。其余原样返回。"""
+    if isinstance(value, str):
+        if value.startswith("$INPUT"):
+            return text
+        m = _FLOW_ENV_RE.match(value)
+        if m:
+            return os.environ.get(m.group(1))
+    return value
+
+
+def _flow_cache_path(cfg: ScreenerConfig) -> Path:
+    if cfg.console_cache_path:
+        return Path(cfg.console_cache_path).expanduser()
+    return Path.home() / ".issue-keeper" / "screener-flow.json"
+
+
+def _load_flow_cache(cfg: ScreenerConfig) -> dict[str, Any] | None:
+    path = _flow_cache_path(cfg)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("definition"):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_flow_cache(cfg: ScreenerConfig, version: str, definition: str) -> None:
+    path = _flow_cache_path(cfg)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"flow_id": cfg.console_flow_id, "version": version,
+                        "definition": definition, "fetched_at": time.time()},
+                       ensure_ascii=False),
+            encoding="utf-8")
+    except OSError as exc:
+        log.warning("screener(flow) 缓存写入失败 %s: %s", path, exc)
+
+
+def _fetch_published_definition(cfg: ScreenerConfig) -> tuple[str, str]:
+    """拉 console 上 semver 最高的已发布版本。网络/认证失败抛异常由调用方兜底。"""
+    headers = {"X-Admin-API-Key": cfg.console_api_key or ""}
+    base = (cfg.console_url or "").rstrip("/")
+
+    def _get(path: str) -> dict[str, Any]:
+        req = urllib.request.Request(f"{base}{path}", headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp)
+
+    flow = _get(f"/api/flows/{cfg.console_flow_id}")
+    published = [v for v in flow.get("versions", []) if v.get("status") == "published"]
+    if not published:
+        raise ValueError(f"flow {cfg.console_flow_id} 没有已发布版本")
+    current = max(published, key=lambda v: _semver_key(v.get("version", "")))
+    detail = _get(f"/api/flows/{cfg.console_flow_id}/versions/{current['version']}")
+    definition = detail.get("definition") or ""
+    if not definition:
+        raise ValueError(f"flow {cfg.console_flow_id}@{current['version']} 定义为空")
+    return str(current["version"]), definition
+
+
+def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> dict[str, Any] | None:
+    """从定义里取出 decision 节点配置并解析表达式；找不到 decision 节点返回 None。"""
+    try:
+        data = json.loads(definition)
+    except ValueError:
+        log.error("screener(flow) 定义不是合法 JSON")
+        return None
+    for node in data.get("nodes", []):
+        if node.get("type") != "decision":
+            continue
+        min_conf = node.get("min_confidence", cfg.min_confidence)
+        try:
+            min_conf = float(min_conf)
+        except (TypeError, ValueError):
+            min_conf = cfg.min_confidence
+        return {
+            "question": _resolve_flow_field(node.get("question"), text),
+            "choices": node.get("choices") or {},
+            "api_base": _resolve_flow_field(node.get("api_base"), text),
+            "api_key": _resolve_flow_field(node.get("api_key"), text),
+            "model": _resolve_flow_field(node.get("model"), text),
+            "min_confidence": min_conf,
+            "on_low_confidence": node.get("on_low_confidence", "error"),
+        }
+    return None
+
+
+def _screen_flow(text: str, cfg: ScreenerConfig, *, source_label: str) -> Verdict:
+    """flow 后端：TTL 拉取已发布定义（失败退 stale 缓存，再退本地凭据），
+    本地 DecisionNode 执行。任何一步失败都向更保守的方向降级。"""
+    cached = _load_flow_cache(cfg)
+    version: str | None = None
+    definition: str | None = None
+    if cached and time.time() - float(cached.get("fetched_at") or 0) < cfg.console_refresh_secs:
+        version = str(cached.get("version"))
+        definition = str(cached.get("definition"))
+    else:
+        try:
+            version, definition = _fetch_published_definition(cfg)
+            _save_flow_cache(cfg, version, definition)
+            log.info("screener(flow) 已刷新判定配置 [%s]: %s@%s", source_label,
+                     cfg.console_flow_id, version)
+        except Exception as exc:  # noqa: BLE001 —— 网络错误不阻塞判定
+            if cached:
+                version = str(cached.get("version"))
+                definition = str(cached.get("definition"))
+                log.warning("screener(flow) 拉取失败，使用 stale 缓存 %s@%s [%s]: %s",
+                            cfg.console_flow_id, version, source_label, exc)
+            else:
+                log.error("screener(flow) 拉取失败且无缓存，回退本地凭据 [%s]: %s",
+                          source_label, exc)
+
+    if definition:
+        dcfg = _flow_decision_config(definition, text, cfg)
+        if dcfg is not None:
+            node = _DecisionNode(
+                id="screener",
+                input=_truncate(text, cfg.max_chars),
+                provider="llm",
+                timeout_secs=30,
+                **dcfg,
+            )
+            try:
+                out = node.execute(_PassThroughExecution())
+            except Exception as exc:  # noqa: BLE001 —— fail-safe：低置信/网络/解析异常一律不安全
+                log.error("screener(flow) 判定失败，按不安全处理 %s@%s [%s]: %s",
+                          cfg.console_flow_id, version, source_label, exc)
+                return Verdict(safe=False, reason=f"flow 后端: {exc}")
+            safe = out["choice"] == "safe"
+            confidence = float(out["confidence"])
+            log.debug("[%s] screener(flow): %s@%s choice=%s confidence=%.2f",
+                      source_label, cfg.console_flow_id, version,
+                      out["choice"], confidence)
+            reason = "" if safe else f"判定为注入风险（置信度 {confidence:.2f}）"
+            return Verdict(safe=safe, reason=reason, raw=out["raw"], confidence=confidence)
+        log.error("screener(flow) 定义中没有 decision 节点，回退本地凭据 [%s]", source_label)
+
+    # 兜底：用本地 classic/decision 凭据继续判定（配置了才可用）
+    if cfg.api_key and cfg.base_url and cfg.model:
+        fallback_backend = "decision" if _DecisionNode is not None else "classic"
+        local = ScreenerConfig(**{**cfg.__dict__,
+                                  "backend": fallback_backend,
+                                  "console_url": None, "console_api_key": None})
+        return screen(text, local, source_label=f"{source_label}|flow-fallback")
+    return Verdict(safe=False, reason="flow 后端不可用且无本地回退凭据")
+
+
 def screen(text: str, cfg: ScreenerConfig, *, source_label: str = "") -> Verdict:
     """对一段文本做安全判定。
 
     text 是发给主 agent 之前的完整消息（已经组装好标题/作者/正文/链接）。
     任何失败（HTTP 错误、解析失败、超时）都按不安全处理（fail-safe）。
     """
+    if cfg.backend == "flow":
+        return _screen_flow(text, cfg, source_label=source_label)
+
     if not cfg.api_key or not cfg.base_url or not cfg.model:
         log.error("screener 配置不完整（缺 api_key/base_url/model），按不安全处理 [%s]", source_label)
         return Verdict(safe=False, reason="screener 未配置完整凭据")
