@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 
+from .reply import ReplyPolishConfig
 from .screener import ScreenerConfig
 
 
@@ -109,6 +110,9 @@ class Config:
     author_allowlist: list = field(default_factory=list)
     # 同作者每日最多触发次数（读 pipeline runs.jsonl 台账，防资源滥用）
     author_daily_limit: int = 3
+    # 回评礼仪化：agent 原始输出发布前消毒 + LLM 改写为 issue 礼仪评论。
+    # 连接字段缺省继承 screener 的 LLM 凭据（零配置可用）。
+    reply_polish: ReplyPolishConfig = field(default_factory=ReplyPolishConfig)
 
     @property
     def state_path(self) -> Path:
@@ -248,6 +252,26 @@ def _load_repos_from_db(internal_db: str, agent_env: dict[str, str]) -> list[Rep
     return repos
 
 
+def _load_reply_polish(raw: dict[str, Any], screener: ScreenerConfig) -> ReplyPolishConfig:
+    """解析 reply_polish 段。连接字段未显式配置时继承 screener 的 LLM 凭据。"""
+    rp_raw = raw.get("reply_polish") or {}
+    if not isinstance(rp_raw, dict):
+        raise ValueError("reply_polish 必须是映射（enabled/provider/api_key/base_url/model/…）")
+    provider = str(rp_raw.get("provider") or screener.provider or "openai").strip().lower()
+    if provider not in ("openai", "anthropic"):
+        raise ValueError("reply_polish.provider 只能是 'openai' 或 'anthropic'")
+    return ReplyPolishConfig(
+        enabled=bool(rp_raw.get("enabled", True)),
+        provider=provider,
+        api_key=_expand_env(rp_raw.get("api_key") or "").strip() or screener.api_key,
+        base_url=_expand_env(rp_raw.get("base_url") or "").strip() or screener.base_url,
+        model=_expand_env(rp_raw.get("model") or "").strip() or screener.model,
+        max_chars=max(1000, int(rp_raw.get("max_chars", 16000))),
+        timeout_secs=max(10, int(rp_raw.get("timeout_secs", 60))),
+        min_chars=max(0, int(rp_raw.get("min_chars", 120))),
+    )
+
+
 def load_config(path: str | os.PathLike) -> Config:
     p = Path(path).expanduser()
     if not p.exists():
@@ -323,6 +347,7 @@ def load_config(path: str | os.PathLike) -> Config:
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
         author_daily_limit=max(1, int(raw.get("author_daily_limit", 3))),
+        reply_polish=_load_reply_polish(raw, screener),
     )
 
     if cfg.poll_interval_secs <= 0:

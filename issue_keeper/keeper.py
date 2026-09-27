@@ -20,6 +20,7 @@ from datetime import datetime
 
 from .config import Config, RepoBinding, load_config
 from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
+from .reply import polish
 from .screener import ScreenerConfig, screen as screen_text
 from .sources import IssueSource, Resource, make_source
 from .state import State, load_state, save_state
@@ -34,8 +35,10 @@ _UNSAFE_COMMENT_BODY = (
 # 给 agent 的系统提示，告诉它角色和能力。不提 stdout / 协议细节。
 _AGENT_PREAMBLE = (
     "你是 issue-keeper 调用的 agent，负责处理下面的 issue/PR。"
-    "你的回复会被原样作为评论发到该 issue/PR 上，所以请直接说话——"
-    "不要写「回复草稿」「以下是回复」这类元描述，不要解释你要怎么回复，直接给出回复内容。\n"
+    "你的回复将作为评论发布到该 issue/PR 上（发布前会做隐私消毒），所以请直接给出"
+    "可发布的最终内容——不要写「回复草稿」「以下是回复」这类元描述，不要叙述你的"
+    "工作过程（不要「我先…然后…现在我将…」），不要出现本机绝对路径或任何密钥，"
+    "直接给结论、事实与下一步。\n"
     "你有 bash 等工具能力（在当前工作目录下运行）。如果需要跨项目沟通，"
     "可以用 bash 调用 issue-keeper 的 CLI 给别的项目提 issue：\n"
     "  python -m issue_keeper internal create <项目名> --title \"标题\" --body \"正文\" --author {agent_label}\n"
@@ -49,7 +52,9 @@ _AGENT_PREAMBLE = (
 # keeper 由 daemon 驱动，会响应 issue 变更事件——这点区别于「只在对话时工作」的交互式 agent。
 _KEEPER_PREAMBLE = (
     "你是 issue-keeper 的「keeper」——本协同系统的管理向 agent（不是改本仓代码的代码 agent）。"
-    "你的回复会被原样作为评论发到对应 issue 上，请直接说话，不要写「回复草稿」「以下是回复」这类元描述。\n"
+    "你的回复将作为评论发布到对应 issue 上（发布前会做隐私消毒），请直接给出可发布的"
+    "最终内容，不要写「回复草稿」「以下是回复」这类元描述，不要叙述工作过程，"
+    "不要出现本机绝对路径或任何密钥。\n"
     "你有 bash 工具能力（工作目录是 issue-keeper 仓）。你的核心职责：\n"
     "1. 帮人类管理这些 issue：分类、规划、驱动状态流转（用 `python -m issue_keeper internal move ...`），"
     "在 issue-keeper 项目里执行管理类诉求（如「把某项目加入协同」「更新某 agent 介绍」→ 调 `onboard`/`team` CLI）。\n"
@@ -153,16 +158,25 @@ def _is_bot_output(body: str, bot_marker: str, visible_prefix: str) -> bool:
     return False
 
 
-def _post_agent_reply(
+def _publish_reply(
     source: IssueSource, binding: RepoBinding, res: Resource,
-    reply: AgentReply, bot_marker: str, visible_prefix: str,
+    raw_text: str, config: Config, visible_prefix: str, *,
+    source_label: str = "",
 ) -> None:
-    if not reply.text:
-        log.warning("[%s %s#%d] agent 返回空回复，跳过发评论", binding.repo, res.kind, res.number)
+    """发布一条 agent 回复：礼仪化（消毒 + LLM 改写）后套防循环头发评论。
+
+    agent 的原始输出可能带工作过程叙述 / 本机路径 / 重复段落，不适合直接公开
+    （见 reply.py）——发布前统一过 reply.polish。改写是尽力而为：任何失败都
+    降级为消毒后的原文，除空回复外总会发出。
+    """
+    label = source_label or f"{binding.repo} {res.kind}#{res.number}"
+    if not raw_text or not raw_text.strip():
+        log.warning("[%s] agent 返回空回复，跳过发评论", label)
         return
-    body = f"{bot_marker}\n{visible_prefix}\n{reply.text}"
+    text = polish(raw_text, config.reply_polish, source_label=label)
+    body = f"{config.bot_marker}\n{visible_prefix}\n{text}"
     source.post_comment(binding.repo, res, body)
-    log.info("[%s %s#%d] 已发表 agent 评论（%d 字符）", binding.repo, res.kind, res.number, len(reply.text))
+    log.info("[%s] 已发表 agent 评论（礼仪化 %d → %d 字符）", label, len(raw_text), len(text))
 
 
 def _post_unsafe_notice(
@@ -352,7 +366,7 @@ def _process_resource(
                 return 0
             if reply.session_id:
                 it.session_id = reply.session_id
-            _post_agent_reply(src, binding, res, reply, config.bot_marker, visible_prefix)
+            _publish_reply(src, binding, res, reply.text or "", config, visible_prefix)
             it.processed = True
             handled += 1
 
@@ -411,7 +425,7 @@ def _process_resource(
             break
         if reply.session_id:
             it.session_id = reply.session_id
-        _post_agent_reply(src, binding, res, reply, config.bot_marker, visible_prefix)
+        _publish_reply(src, binding, res, reply.text or "", config, visible_prefix)
         it.processed_comment_ids.add(c.id)
         handled += 1
 
@@ -600,7 +614,8 @@ def _compose_patrol_message(
         f"2. 若确实需要人拍板→用 hitl 的 send_and_wait_reply 给人类发**一个**聚焦问题"
         f"（最多等约 1 小时），拿到回复后再 move/comment。一条 issue 最多发一次 HitL，别刷屏。\n"
         f"3. 也可先 comment 补一条分诊/澄清再决定。\n"
-        f"你的最终回复会被原样作为评论发到该 issue（用你的 keeper 身份），直接给动作结论，不要写草稿。"
+        f"你的最终回复会作为评论发到该 issue（用你的 keeper 身份，发布前做隐私消毒），"
+        f"直接给动作结论，不要写草稿、不要叙述过程。"
     )
 
 
@@ -684,12 +699,11 @@ def keeper_patrol(
             continue
 
         # keeper 的回复作为评论发到该 issue（带 marker，各项目自己的 agent 会跳过，不互相触发）
-        if reply.text:
-            body = f"{config.bot_marker}\n{visible_prefix}\n{reply.text}"
-            try:
-                keeper_src.post_comment(target_binding.repo, res, body)
-            except Exception as e:
-                log.warning("[patrol] [%s] 发评论失败: %s", label, e)
+        try:
+            _publish_reply(keeper_src, target_binding, res, reply.text or "", config,
+                           visible_prefix, source_label=f"[patrol] {label}")
+        except Exception as e:
+            log.warning("[patrol] [%s] 发评论失败: %s", label, e)
         # 推进快照到「发评论后」的 updated_at，避免 keeper 自己的评论触发自己下轮重巡
         fresh = keeper_src.get_issue(target_binding.repo, res.kind, res.number)
         state.mark_patrolled(

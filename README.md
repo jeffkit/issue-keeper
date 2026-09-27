@@ -9,7 +9,7 @@
 3. 发现新 issue/PR 或新评论时：
    - **第一步：安全过滤（screener）**——在 keeper 进程内发一次纯 HTTP 的 LLM 调用，判定内容是否含指令注入 / 越权诱导。这一层不起子进程、不读写本地文件，架构上保证无本地权限。
    - **第二步：调主 agent**——判定安全后，通过 `agentproc` CLI 调用对应 profile 的 agent（动态指定 `--cwd`，会话自动续接）。agent 有 bash 等工具能力，能直接读写代码、调用 issue-keeper CLI 跨项目提 issue。
-4. 把 agent 的回复作为评论发回对应 issue/PR。
+4. 把 agent 的回复礼仪化后作为评论发回对应 issue/PR（`issue_keeper/reply.py`）：agent 的原始输出常带工作过程叙述、本机绝对路径甚至重复段落，不适合直接公开——发布前先确定性消毒（本机路径 / 密钥赋值 → `[REDACTED-*]`），再用一次廉价 LLM 调用改写成 issue 礼仪的评论（结论先行、只留结果与事实、去重）。改写是尽力而为：任何失败都降级为消毒后的原文，绝不阻塞或吞掉回评（`reply_polish:` 配置，连接字段缺省继承 screener 凭据）。
 5. 状态持久化到本地 JSON，记录已处理的资源 / 评论 / agent 会话，重启不重复处理。
 
 ## 防循环（三层保险）

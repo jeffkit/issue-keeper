@@ -554,13 +554,17 @@ def issue_pipeline(INPUT):
         repo=INPUT.main_clone,
         timeout_secs=180,
         prompt=(
-            "为 GitHub issue 写处理完成评论（直接给正文）。素材（自己读文件，不要臆造）："
+            "为 GitHub issue 写处理完成评论（直接给正文）。这是对外发布的最终评论，"
+            "不是工作汇报。素材（自己读文件，不要臆造）："
             "调查 {% $INPUT.artifact_dir %}/01-investigation.md、计划与实施记录 {% $INPUT.artifact_dir %}/02-plan.md。"
             "事实：本仓测试命令={% $INPUT.test_command %}（为空则如实注明「本仓未配置统一测试命令，"
             "质量门为独立 review」）；质量门 passed={% $NODE.gate.passed %}；分支 {% $INPUT.branch_name %}；"
             "推送 pushed={% $NODE.deliver.pushed %}；合并备注 {% $NODE.merge.note %}。"
-            "内容：根因/方案一句话、改动文件清单、测试情况、在哪 review。"
-            "首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内，不要出现任何本机路径或凭据信息。"
+            "issue 礼仪：结论先行（做了什么 + commit/分支/PR 等可核验引用）；"
+            "只写根因/方案要点、改动文件清单、测试情况、在哪 review；"
+            "不要叙述工作过程（不要「我先调查…然后实现…」这类经过），"
+            "不要写内部状态（如「本地未推送」），不要出现任何本机路径或凭据信息。"
+            "首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。"
         ),
     )
     post = CODE.python(

@@ -20,11 +20,13 @@ Dashboard 提供 REST + 前端看板。
 - `issue_keeper/__main__.py` — CLI 入口（`python -m issue_keeper`）
 - `issue_keeper/keeper.py` — 主循环与 Agent 调用
 - `issue_keeper/screener.py` — 安全过滤层
+- `issue_keeper/reply.py` — 回评礼仪化（发布前消毒 + LLM 改写，防过程叙述/隐私外泄）
 - `issue_keeper/config.py` / `team.py` — 配置与项目绑定
 - `issue_keeper/sources/` — `github.py` / `internal.py`
 - `issue_keeper/dashboard/` — FastAPI 看板 API
 - `frontend/src/` — 看板前端
-- `config.example.yaml` — 全局配置模板（screener / patrol 等）
+- `flows/` — issue-pipeline flow（pipeline_mode 时新 issue 首响应的 plaita 管线）
+- `config.example.yaml` — 全局配置模板（screener / patrol / reply_polish 等）
 - `tests/` — pytest
 
 ## 开发约定

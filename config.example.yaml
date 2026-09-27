@@ -42,6 +42,24 @@ keeper_patrol:
 # 所以默认 65min，比普通 agent 的 default_timeout_secs 大。仅对 role=keeper 的绑定生效。
 keeper_timeout_secs: 3900
 
+# ─── 回评礼仪化（reply_polish）────────────────────────────────────────
+# agent 的原始回复不适合直接公开：常带工作过程叙述（「我先…然后…」）、内部状态、
+# 本机绝对路径甚至重复段落。发布前做两层处理（issue_keeper/reply.py）：
+#   1. 确定性消毒：本机绝对路径 / 密钥赋值 → [REDACTED-*]（永远执行，含礼仪化关闭时）
+#   2. LLM 改写：一次廉价调用把原文改写成 issue 礼仪的评论（结论先行、只留结果
+#      与事实、去重）。任何失败都降级为消毒后的原文——绝不阻塞或吞掉回评。
+# 连接字段（provider/api_key/base_url/model）缺省继承 screener 的凭据，零配置可用；
+# 下方注释值即为默认。
+reply_polish:
+  enabled: true
+  # provider: openai          # openai | anthropic
+  # api_key: ${DEEPSEEK_API_KEY}
+  # base_url: "https://api.deepseek.com/v1"
+  # model: deepseek-chat
+  # max_chars: 16000          # 喂给改写调用的最大字符数
+  # timeout_secs: 60
+  # min_chars: 120            # 短于此的原文跳过改写（只消毒）
+
 # ─── 安全过滤层（screener）────────────────────────────────────────────
 # 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。
 # 这一层在 keeper 进程内完成，不起子进程、无本地权限。
