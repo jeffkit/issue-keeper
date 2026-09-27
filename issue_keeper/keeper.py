@@ -289,6 +289,13 @@ def _process_resource(
             # 自己（当前账号）提的 issue 也不自己回自己
             log.info("[%s] %s 由当前账号 %s 创建，跳过首次回复", label, kind, me)
             it.processed = True
+        elif not _author_allowed(config, res.author):
+            # 作者 allowlist：非名单内作者不触发 agent（防注入骚扰/资源滥用，S7）
+            log.info("[%s] %s 作者 %s 不在 allowlist，跳过首次回复", label, kind, res.author)
+            it.processed = True
+        elif _author_over_limit(config, res.author):
+            log.info("[%s] %s 作者 %s 今日触发次数已达上限，跳过", label, kind, res.author)
+            it.processed = True
         else:
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
@@ -302,6 +309,33 @@ def _process_resource(
             # 调 agent 前推到 doing
             _safe_move(src, binding, res, "doing", actor=_agent_label(binding, config),
                        actor_type="agent", comment="开始处理")
+
+            # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
+            if config.pipeline_mode:
+                pres = _invoke_pipeline(config, binding, res, label)
+                if pres is None:
+                    _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
+                               actor_type="agent", comment="管线异常，回退")
+                    return 0
+                if not pres.get("comment_posted"):
+                    # D1/D2 兜底：管线没发出任何回评 → keeper 补一条（带 bot marker 防循环）
+                    try:
+                        src.post_comment(
+                            binding.repo, res,
+                            f"{config.bot_marker}\n[issue-pipeline] 管线异常终止"
+                            f"（status={pres.get('status')}，未发出回评），请人工查看。")
+                    except Exception as e:
+                        log.error("[%s] 兜底回评失败: %s", label, e)
+                it.processed = True
+                handled += 1
+                status = pres.get("status", "")
+                if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
+                    _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
+                               actor_type="agent", comment=f"pipeline {status}，待人工")
+                else:
+                    _safe_move(src, binding, res, "review", actor=_agent_label(binding, config),
+                               actor_type="agent", comment=f"pipeline {status}，待 review")
+                return handled
 
             log.info("[%s] 新 %s，调用 agent (profile=%s)", label, kind, binding.profile)
             try:
@@ -687,3 +721,127 @@ def run_daemon(config_path: str) -> None:
         except Exception as e:
             log.exception("本轮扫描异常: %s", e)
         time.sleep(config.poll_interval_secs)
+
+
+def _author_allowed(config, author: str | None) -> bool:
+    """作者 allowlist：空名单=全放行；大小写不敏感。"""
+    if not config.author_allowlist:
+        return True
+    if not author:
+        return False
+    allowed = {a.lower() for a in config.author_allowlist}
+    return author.lower() in allowed
+
+
+def _author_over_limit(config, author: str | None) -> bool:
+    """同作者每日触发次数限制（读 pipeline runs.jsonl 台账；台账缺失视为未超限）。"""
+    import json
+    import time
+    from pathlib import Path
+    if not author or config.author_daily_limit <= 0:
+        return False
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    if not ledger.exists():
+        return False
+    today = time.strftime("%Y-%m-%d")
+    n = 0
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if (rec.get("author") or "").lower() == author.lower() \
+                    and str(rec.get("ts", "")).startswith(today):
+                n += 1
+    except Exception:
+        return False
+    return n >= config.author_daily_limit
+
+
+def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
+    """以子进程跑 issue-pipeline flow（bridge），返回 RESULT dict；异常返回 None。
+
+    子进程 start_new_session + 超时 killpg：flow 内部还会再起 recursive/claude
+    子树，超时必须连整棵树一起清（2026-09-27 孤儿事故）。
+    """
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    bridge = Path(config.pipeline_bridge).expanduser()
+    if not bridge.exists():
+        log.error("[%s] pipeline bridge 不存在: %s", label, bridge)
+        return None
+
+    slug = binding.repo.split("/")[-1]
+    artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{res.number}").expanduser()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    body_file = artifact_dir / "00-issue.md"
+    body_file.write_text((res.body or "")[:16000], encoding="utf-8")
+
+    payload = {
+        "repo_full": binding.repo,
+        "issue_number": res.number,
+        "title": res.title or "",
+        "author": res.author or "",
+        "body_file": str(body_file),
+        "screener_verdict": "safe",
+        "main_clone": binding.cwd,
+        "worktree_dir": f"{binding.cwd}/.worktrees/issue-{res.number}",
+        "branch_name": f"pipeline/issue-{res.number}",
+        "artifact_dir": str(artifact_dir),
+        "test_command": config.pipeline_test_commands.get(binding.repo, ""),
+        "review_mode": config.pipeline_review_mode,
+        "push_mode": config.pipeline_push_mode,
+    }
+
+    log.info("[%s] 提交 issue-pipeline run (push_mode=%s, review_mode=%s)",
+             label, payload["push_mode"], payload["review_mode"])
+    t0 = time.time()
+    proc = subprocess.Popen(
+        [sys.executable, str(bridge)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(
+            input=json.dumps(payload, ensure_ascii=False),
+            timeout=config.pipeline_timeout_secs,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+        log.error("[%s] pipeline 超时（%ss），进程组已清", label, config.pipeline_timeout_secs)
+        return None
+
+    if proc.returncode != 0:
+        log.error("[%s] pipeline bridge 退出码 %s: %s", label, proc.returncode,
+                  (err or "")[-400:])
+        return None
+
+    status, posted, duration = None, None, round(time.time() - t0, 1)
+    for line in (out or "").splitlines():
+        if line.startswith("RESULT "):
+            try:
+                pres = json.loads(line[len("RESULT "):])
+                status = pres.get("status")
+                posted = pres.get("comment_posted")
+            except Exception:
+                pass
+    if status is None:
+        log.error("[%s] pipeline 无 RESULT 输出", label)
+        return None
+    log.info("[%s] pipeline 完成: status=%s comment_posted=%s 耗时=%ss",
+             label, status, posted, duration)
+    return {"status": status, "comment_posted": posted}

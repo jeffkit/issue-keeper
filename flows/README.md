@@ -1,0 +1,98 @@
+# issue-pipeline —— issue-keeper 的 plaita 化管线（@flow 源码 + 生成 JSON）
+
+> v0.2.1，2026-09-27。经三方独立审查（plaita DSL 严谨性 / 编排设计缺陷 / 运维安全）
+> 后定稿。**审查主体是 `issue_pipeline_flow.py`（@flow 源码），JSON 是编译产物不要手改**：
+>
+> ```bash
+> python3 flows/build_issue_pipeline.py     # 需 PYTHONPATH 含 plaita 与 plaita-nodes/src
+> ```
+>
+> 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓、全节点有出边 ✓。未做端到端真跑。
+
+## 管线形状（v0.2.1，编译后 61 节点）
+
+```
+screener闸(INPUT.screener_verdict != safe → 拒评短路)
+└─ triage(agent, 查重+定级, 正文只经 body_file)
+   ├─ blocked(依赖未就绪/已有在途) → 回评 → END
+   ├─ invalid(已在 main 修复/无需改动) → 回评 → END        ← #17 重派问题根治
+   └─ actionable
+      └─ git pull --ff-only（clone 新鲜度）
+         └─ worktree add（并发隔离）
+            └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
+               └─ plan(agent 10min) → 02-plan.md（含 COMMIT_MESSAGE）
+                  └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
+                     └─ implement(agent 30min, 禁 .github/**, 不 commit/push)
+                        └─ 无改动 → 回评 → END
+                           └─ review(agent=deepseek-flash 独立审查, 解析失败=abort)
+                              ├─ abort → 回评 → END
+                              ├─ fix → fix_review(实施方按指令修)
+                              └─ approve ▼
+                                 gate(INPUT.test_command, 20min)  ← per-repo 配置，非写死
+                                 ├─ fail → fix_test(15min) → retest
+                                 │           └─ 仍 fail → 回评「在本地 worktree 未推送」→ END
+                                 └─ pass → diff护栏(.github/**、>800行 → 待人工)
+                                    └─ document → deliver(幂等 commit/push)
+                                       └─ push_mode=main → ff-only 合并（带 fetch 重试）
+                                          └─ reply(消毒+去重) → kanban → END
+```
+
+## 对三方审查的处置
+
+**已落进 flow**：screener 结论消费（入口闸）、body 不进 prompt（body_file 引用）、
+独立 review（deepseek-flash 异构模型 + fail-safe abort）、质量门命令参数化、
+HITL 条件化+未批准即停、partial/hold 如实「未推送」、deliver/回评幂等（标记去重+
+ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害前消毒
+（本机路径/密钥模式 → [REDACTED]）、git pull 同步、triage 区分 invalid/blocked-in-flight、
+解析失败 fail-safe（triage→blocked 人工复核；review→abort）。
+
+**部署强制项（README 职责，不落 flow）**：
+1. 默认 `push_mode: branch`；`main` 模式必须 HITL 可用（HITL_BASE_URL/HITL_URL 已配），
+   否则注册时拒绝。
+2. 作者 allowlist + 同作者限频 + 全局并发 1-2（keeper 提交 run 前检查）。
+3. agent 子进程降权：env 白名单（剔 GH_TOKEN/SSH_AUTH_SOCK）、评论出口用独立低权限
+   token、~/.ssh 与 ~/.flowcast 对 agent 进程不可读。
+4. runner 启动：`register_code_node(default_backend="subprocess")`；所有 code 节点已显式
+   `sandbox_backend="unsafe"`（本机可信部署；多租户环境必须另行收窄）。
+
+**留给后续立项（flow 之外）**：
+- keeper 接线：`_process_resource` 改为向 console 提 issue-pipeline run + 轮询终态；
+  **终态 error 且 issue 无评论 → keeper 发 fallback 回评**（引擎层异常不进 flow 业务出害口）。
+- agentproc/agent_run 超时 killpg（孤儿根治，今天实测三次 3600s 超时全部留孤儿）。
+- per-repo 队列化（同仓并发 1-2）+ 单 run SLA 告警；共享 CARGO_TARGET_DIR/sccache
+  降冷构建成本。
+- 大题拆分：#25/#26/#29 这类 refactor milestone 在 screener 或提示词层拆小。
+
+## 输入契约（keeper → run）
+
+```json
+{
+  "repo_full": "jeffkit/recursive", "issue_number": 17,
+  "title": "...", "author": "okguitar",
+  "body_file": "<artifact_dir>/00-issue.md",       // keeper 预写并截断(8-16KB)
+  "screener_verdict": "safe",                      // 入口闸，非 safe 直接拒
+  "main_clone": "/Users/kong/projects/infra4agent/recursive",
+  "worktree_dir": "<main_clone>/.worktrees/issue-17",
+  "branch_name": "issue-17",
+  "artifact_dir": "/Users/kong/.issue-keeper/pipeline/recursive-17",
+  "test_command": "cargo test --workspace",        // per-repo；空=跳过质量门并注明
+  "review_mode": "auto",                           // auto | human（human 且 high 才 HITL）
+  "push_mode": "branch"                            // branch(默认) | main
+}
+```
+
+返回（end output）：`{status: done|rejected|blocked|invalid|nochange|abort|partial|
+guarded|onhold, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
+keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警。
+
+## 已知缺口（按优先级）
+
+1. **引擎层异常（agentrun 超时/非零退出、code 节点抛错）默认 abort 终态且当前不可续跑**，
+   不经过业务出害口——「必有回评」的最终兜底在 keeper（见上），长期应推动 plaita 支持
+   error 态续跑或 per-node errorHandler。
+2. **agentproc 超时不 kill 进程组**（孤儿）——agentproc/agent_run 层修复，上线前必须。
+3. 段级 checkpoint = 节点级持久化；30min 的 implement 段内部无 checkpoint，重投整段重跑
+   （幂等护栏已覆盖副作用）。
+4. 修复回环仅一轮（fix_test→retest）；更长回环用 loop 节点 + 迭代上限（v0.3）。
+5. 未做端到端真跑；首跑建议草稿 issue + 注册 dry-run 变体 flow 版本
+   （注意 dry_run 是 globalContext 而非输入参数，run 参数传不进去）。

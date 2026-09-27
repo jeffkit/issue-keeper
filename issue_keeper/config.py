@@ -93,6 +93,22 @@ class Config:
     # keeper agent 的调用超时（秒）。keeper 可能用 HitL 等人类回复（最长 1 小时），
     # 所以默认比普通 agent（default_timeout_secs）大。仅对 role=keeper 的绑定生效。
     keeper_timeout_secs: int = 3900
+    # ── plaita 管线模式（v0.2.1，2026-09-27）─────────────────────────
+    # true 时新 issue 首响应交给 issue-pipeline flow（flows/pipeline_bridge.py
+    # 子进程），单体 claude CLI 路径保留为回退。评论层处理仍走 legacy。
+    pipeline_mode: bool = False
+    pipeline_bridge: Path = Path(
+        "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py")
+    # 桥子进程整跑超时（秒）：到点 killpg 整个进程组（agent 子树一并清）
+    pipeline_timeout_secs: int = 5400
+    pipeline_push_mode: str = "branch"     # branch | main（main 需自行接受直推风险）
+    pipeline_review_mode: str = "auto"     # auto | human（human 且 risk=high 才 HITL）
+    # repo_full → 质量门命令（如 "cargo test --workspace"）；缺省/空 = 跳过门禁并注明
+    pipeline_test_commands: dict = field(default_factory=dict)
+    # 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）
+    author_allowlist: list = field(default_factory=list)
+    # 同作者每日最多触发次数（读 pipeline runs.jsonl 台账，防资源滥用）
+    author_daily_limit: int = 3
 
     @property
     def state_path(self) -> Path:
@@ -278,6 +294,13 @@ def load_config(path: str | os.PathLike) -> Config:
         max_per_cycle=max(1, int(patrol_raw.get("max_per_cycle", 5))),
     )
 
+    pipeline_test_raw = raw.get("pipeline_test_commands") or {}
+    if not isinstance(pipeline_test_raw, dict):
+        raise ValueError("pipeline_test_commands 必须是映射（repo_full: 测试命令）")
+    allowlist_raw = raw.get("author_allowlist") or []
+    if not isinstance(allowlist_raw, list):
+        raise ValueError("author_allowlist 必须是列表")
+
     cfg = Config(
         poll_interval_secs=int(raw.get("poll_interval_secs", 300)),
         state_file=_expand_path(state_file),
@@ -290,6 +313,16 @@ def load_config(path: str | os.PathLike) -> Config:
         human_label=human_label,
         keeper_patrol=patrol,
         keeper_timeout_secs=max(60, int(raw.get("keeper_timeout_secs", 3900))),
+        pipeline_mode=bool(raw.get("pipeline_mode", False)),
+        pipeline_bridge=_expand_path(
+            raw.get("pipeline_bridge")
+            or "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py"),
+        pipeline_timeout_secs=max(300, int(raw.get("pipeline_timeout_secs", 5400))),
+        pipeline_push_mode=(raw.get("pipeline_push_mode") or "branch").strip(),
+        pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
+        pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
+        author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
+        author_daily_limit=max(1, int(raw.get("author_daily_limit", 3))),
     )
 
     if cfg.poll_interval_secs <= 0:
