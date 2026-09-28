@@ -118,7 +118,7 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
   + `git status -uall` 再动笔、条目必须如实描述本次 diff、拿不准就 SKIP。
 - **recursive 的质量门由空转真**：`pipeline_test_commands["jeffkit/recursive"]` 原本是空串，
   gate 节点跑 `true` 恒过——回评里的「质量门已通过」其实只来自 agent 自述。现在设为
-  `cargo fmt --all --check && cargo test --workspace --no-fail-fast`（门预算 1200s；失败会走
+  `cargo fmt --all --check && cargo test --workspace --no-fail-fast`（门预算 2400s——v1.0.6 由 1200s 上调，因为门现在真跑全量测试而 worktree 的 target/ 可能还冷；失败会走
   `fix_test`/如实回评，不会静默放行）。若开始超时，收窄成按 crate 的 `-p` 列表。
 
 ## 输入契约（keeper → run）

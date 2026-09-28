@@ -474,7 +474,7 @@ def issue_pipeline(INPUT):
         command=prep.cmd,
         gate_name="repo-tests",
         cwd=INPUT.worktree_dir,
-        timeout_secs=1200,
+        timeout_secs=2400,
         max_retries=0,
     )
     if gate.passed != True:
@@ -492,7 +492,7 @@ def issue_pipeline(INPUT):
             command=prep.cmd,
             gate_name="repo-tests-retest",
             cwd=INPUT.worktree_dir,
-            timeout_secs=1200,
+            timeout_secs=2400,
             max_retries=0,
         )
         if retest.passed != True:

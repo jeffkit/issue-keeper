@@ -260,7 +260,7 @@
    "command": "$NODE.prep.cmd",
    "gate_name": "repo-tests",
    "cwd": "$INPUT.worktree_dir",
-   "timeout_secs": 1200,
+   "timeout_secs": 2400,
    "max_retries": 0,
    "next": "_n8",
    "source_line": 473
@@ -446,7 +446,7 @@
    "command": "$NODE.prep.cmd",
    "gate_name": "repo-tests-retest",
    "cwd": "$INPUT.worktree_dir",
-   "timeout_secs": 1200,
+   "timeout_secs": 2400,
    "max_retries": 0,
    "next": "_n12",
    "source_line": 491
