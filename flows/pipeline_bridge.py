@@ -84,28 +84,6 @@ def ensure_tool_path() -> str:
     return os.pathsep.join(added)
 
 
-def ensure_shared_cargo_target(payload: dict) -> str:
-    """让管线复用主 clone 的 cargo `target/`，别在每个 worktree 里冷编译。
-
-    2026-09-28 实测：#19/#30/#40 三个 run 的 worktree 各自烘出 9.3G / 4.6G / 7.2G
-    的 `target/`，单跑 3000+ 秒里大半是编译（investigate 1444s、implement 1800s 被掐），
-    而主 clone 的 39G `target/` 本来就是热的。指向它之后 agent 段与质量门复用依赖，
-    只重编 workspace 内的 crate。
-
-    显式设了 `CARGO_TARGET_DIR` 就尊重显式值（人工调试用）。生效返回路径，未生效返回 ""。
-    """
-    if os.environ.get("CARGO_TARGET_DIR", "").strip():
-        return ""
-    main_clone = str(payload.get("main_clone") or "").strip()
-    if not main_clone:
-        return ""
-    if not (pathlib.Path(main_clone) / "Cargo.toml").is_file():
-        return ""
-    target = pathlib.Path(main_clone) / "target"
-    os.environ["CARGO_TARGET_DIR"] = str(target)
-    return str(target)
-
-
 ensure_sandbox_timeout()
 
 import plaita_nodes  # noqa: F401,E402
@@ -362,6 +340,18 @@ def _slim_input(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if k not in ("console", "observability_redis")}
 
 
+# ⚠️ 不要再让管线共用主 clone 的 CARGO_TARGET_DIR（v1.0.8 试过，已回滚）
+# 2026-09-28 曾把 CARGO_TARGET_DIR 指到 <main_clone>/target 想让 worktree 复用热依赖，
+# 2026-09-29 实测发现它会**链接到另一个 checkout 的库**：同一工作区在两个目录下共用
+# target 时，集成测试目标（tests/*.rs）拿到的是 main clone 的 lib rlib，于是
+# `cargo test --workspace` 在 worktree 里报 4 个假的 E0599
+# （no method named `with_wall_timeout_secs` found for struct `AgentTool`——那个方法
+# 明明就在 worktree 的 src/tools/agent.rs 里）。换私有 target 立刻编过（2m22s）。
+# 假失败只是表象，真正危险的是对称情形：**可能拿旧库判绿**，让门测到错的代码。
+# 正确做法：每个 worktree 用自己的 target/（跨 run 复用会自然变热），
+# 并用提示词限制 agent 的自检范围，而不是共用 target。
+
+
 def main() -> None:
     t0 = time.time()
     payload = json.load(sys.stdin)
@@ -371,11 +361,6 @@ def main() -> None:
     if added_path:
         print(f"[bridge] PATH 补齐: {added_path}（launchd 的 keeper 没有 ~/.cargo/bin）",
               file=sys.stderr)
-    shared_target = ensure_shared_cargo_target(payload)
-    if shared_target:
-        print(f"[bridge] CARGO_TARGET_DIR={shared_target}"
-              "（复用主 clone 已烘热的依赖，避免每个 worktree 冷编译）", file=sys.stderr)
-
     console = payload.get("console") or {}
     definition, flow_source, flow_version = resolve_definition(console if console.get("url") else None)
     if flow_source != "local":
