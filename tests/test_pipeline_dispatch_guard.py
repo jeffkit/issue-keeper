@@ -25,6 +25,7 @@ from issue_keeper.config import Config, RepoBinding
 from issue_keeper.keeper import (
     ALREADY_RUNNING,
     _author_over_limit,
+    _global_pipeline_in_flight,
     _invoke_pipeline,
     _pid_alive,
     _pipeline_in_flight,
@@ -250,3 +251,65 @@ def test_reopen_unknown_repo_raises(tmp_path):
                  state_file=tmp_path / "state.json")
     with pytest.raises(ValueError):
         reopen_issues(cfg, "x/y", [1])
+
+
+# ── 全局并发闸（跨进程）：README 部署强制项 #2 的落地 ────────────────
+# keeper 自身串行，但第二个实例 / `--once` 补跑脚本会绕过它：2026-09-28 两个进程
+# 各派一个 run，抢同一个 main clone 做 ff 合并与 push，还互相抢 CPU 顶出 agent 超时。
+
+def test_global_slot_detects_live_holder(tmp_path):
+    root = tmp_path / "pipeline"
+    root.mkdir()
+    art = root / "b-7"
+    art.mkdir()
+    (root / ".pipeline.lock").write_text(str(os.getpid()))
+    assert _global_pipeline_in_flight(art) == os.getpid()
+
+
+def test_global_slot_clears_stale_holder(tmp_path):
+    root = tmp_path / "pipeline"
+    root.mkdir()
+    art = root / "b-7"
+    art.mkdir()
+    (root / ".pipeline.lock").write_text(str(_dead_pid()))
+    assert _global_pipeline_in_flight(art) is None
+    assert not (root / ".pipeline.lock").exists()
+
+
+def test_dispatch_deferred_when_global_slot_taken(tmp_path, monkeypatch):
+    """别的 issue 在跑 → 本轮不派发，也不动产物。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text("raise SystemExit(1)\n", encoding="utf-8")
+    root = tmp_path / ".issue-keeper" / "pipeline"
+    root.mkdir(parents=True)
+    (root / ".pipeline.lock").write_text(str(os.getpid()), encoding="utf-8")
+
+    out = _invoke_pipeline(
+        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
+        _res(number=7), "a/b issue#7",
+    )
+
+    assert out == {"status": ALREADY_RUNNING, "comment_posted": True}
+    assert not (root / "b-7" / "00-issue.md").exists()
+
+
+def test_both_locks_released_after_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "print('RESULT ' + json.dumps({'status': 'done', 'comment_posted': True}))\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / ".issue-keeper" / "pipeline"
+
+    out = _invoke_pipeline(
+        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p", cwd=str(tmp_path)),
+        _res(number=7), "a/b issue#7",
+    )
+
+    assert out == {"status": "done", "comment_posted": True}
+    assert not (root / ".pipeline.lock").exists()
+    assert not (root / "b-7" / "run.lock").exists()

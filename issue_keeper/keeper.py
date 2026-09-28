@@ -939,7 +939,15 @@ def _author_over_limit(config, author: str | None) -> bool:
 # 于是同一个 issue 两个 run 并行（#45 实证：02-plan.md 里留下两份「实施记录」，
 # 且残留的 run 在 push_mode=main 下仍可能往 main 推）。
 # 锁文件里放 bridge 的 pid：pid 活着就跳过本轮派发；pid 死了视为陈旧锁清掉。
+#
+# 两级锁：
+#   run.lock                        每 issue 一把（同 issue 不并发）
+#   .pipeline.lock（pipeline 根目录）全局单槽位（跨进程全局并发 1）
+# 全局槽位是 README「部署强制项 #2：全局并发 1-2」的落地——keeper 自身是串行的，
+# 但第二个实例/`--once` 补跑脚本会绕过它：2026-09-28 实证两个进程各派一个 run，
+# 抢同一个 main clone 做 ff 合并与 push，还互相抢 CPU 把 agent 顶到超时。
 PIPELINE_LOCK_NAME = "run.lock"
+GLOBAL_LOCK_NAME = ".pipeline.lock"
 ALREADY_RUNNING = "already_running"
 
 
@@ -963,9 +971,8 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _pipeline_in_flight(artifact_dir: Path) -> int | None:
-    """返回仍在跑的 bridge pid；顺带清理陈旧/损坏的锁文件。"""
-    lock = artifact_dir / PIPELINE_LOCK_NAME
+def _lock_holder(lock: Path) -> int | None:
+    """锁文件里的 pid 还活着就返回它；陈旧/损坏的锁顺手清掉并返回 None。"""
     if not lock.exists():
         return None
     holder = _read_pipeline_lock(lock)
@@ -973,6 +980,16 @@ def _pipeline_in_flight(artifact_dir: Path) -> int | None:
         return holder
     lock.unlink(missing_ok=True)
     return None
+
+
+def _pipeline_in_flight(artifact_dir: Path) -> int | None:
+    """同一 issue 是否已有 run 在跑。"""
+    return _lock_holder(artifact_dir / PIPELINE_LOCK_NAME)
+
+
+def _global_pipeline_in_flight(artifact_dir: Path) -> int | None:
+    """是否有任何 run 在跑（跨进程全局并发闸）。"""
+    return _lock_holder(artifact_dir.parent / GLOBAL_LOCK_NAME)
 
 
 def _release_pipeline_lock(lock: Path, pid: int) -> None:
@@ -1005,6 +1022,13 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     # 互斥检查必须在写 00-issue.md 之前——在跑的 run 正用着这份产物。
+    # 先看全局槽位：别的 issue 在跑也一律不派发（全局并发 1，跨进程）。
+    global_holder = _global_pipeline_in_flight(artifact_dir)
+    if global_holder is not None:
+        log.warning("[%s] 已有另一个 pipeline run 在跑 (pid=%s)，本轮不派发（全局并发 1）",
+                    label, global_holder)
+        return {"status": ALREADY_RUNNING, "comment_posted": True}
+
     holder = _pipeline_in_flight(artifact_dir)
     if holder is not None:
         log.warning("[%s] 同 issue 已有 pipeline run 在跑 (pid=%s)，跳过本轮派发", label, holder)
@@ -1048,12 +1072,14 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         text=True, start_new_session=True,
     )
     # 锁里写 bridge 的 pid 而不是 keeper 自己的：keeper 被重启后 bridge 还活着，
-    # 新实例据此就能发现「这个 issue 已经有人在跑」。
+    # 新实例据此就能发现「已经有人在跑」。两把：本 issue 一把 + 全局槽位一把。
     lock = artifact_dir / PIPELINE_LOCK_NAME
-    try:
-        lock.write_text(str(proc.pid), encoding="utf-8")
-    except OSError as e:
-        log.warning("[%s] 写 pipeline 互斥锁失败（并发保护失效）: %s", label, e)
+    global_lock = artifact_dir.parent / GLOBAL_LOCK_NAME
+    for lk in (lock, global_lock):
+        try:
+            lk.write_text(str(proc.pid), encoding="utf-8")
+        except OSError as e:
+            log.warning("[%s] 写 pipeline 锁失败（%s，并发保护失效）: %s", label, lk.name, e)
     try:
         out, err = proc.communicate(
             input=json.dumps(payload, ensure_ascii=False),
@@ -1072,6 +1098,7 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         return None
     finally:
         _release_pipeline_lock(lock, proc.pid)
+        _release_pipeline_lock(global_lock, proc.pid)
 
     if proc.returncode != 0:
         log.error("[%s] pipeline bridge 退出码 %s: %s", label, proc.returncode,
