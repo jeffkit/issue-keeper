@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 
+import pytest
+
 from issue_keeper.config import Config, RepoBinding
 from issue_keeper.keeper import (
     ALREADY_RUNNING,
@@ -28,9 +30,10 @@ from issue_keeper.keeper import (
     _pipeline_in_flight,
     _process_resource,
     _release_pipeline_lock,
+    reopen_issues,
 )
 from issue_keeper.sources import Resource
-from issue_keeper.state import RepoState
+from issue_keeper.state import RepoState, State, load_state, save_state
 
 
 def _res(number: int = 5, author: str = "bob", status: str = "inbox",
@@ -207,3 +210,43 @@ def test_allowlist_skip_still_consumes_first_reply(tmp_path, monkeypatch):
     )
 
     assert rs.item("5").processed is True
+
+
+# ── 人工重派入口 reopen（同一次事故的结构性缺口）────────────────────
+# 日限误跳过/引擎异常之后，keeper 原先没有任何手段让一条 processed 的 issue
+# 再进队，只能绕过 keeper 跑 ad-hoc 脚本（还会丢掉兜底回评）。
+
+def test_reopen_puts_consumed_issue_back(tmp_path):
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                 state_file=tmp_path / "state.json")
+    st = State()
+    it = st.repo("a-b").item("5")
+    it.processed = True
+    it.processed_comment_ids.add("IC_1")
+    save_state(cfg.state_path, st)
+
+    changed = reopen_issues(cfg, "a/b", [5, 6])
+
+    assert changed == [5]                      # 6 号本就没被消费，不动
+    it2 = load_state(cfg.state_path).repo("a-b").item("5")
+    assert it2.processed is False
+    assert "IC_1" in it2.processed_comment_ids  # 评论级进度保留，旧评论不重答
+
+
+def test_reopen_clears_security_block(tmp_path):
+    """被 screener 拦下的 issue 人工重派：放开重新走一遍（正文会重新过闸）。"""
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                 state_file=tmp_path / "state.json")
+    st = State()
+    st.repo("a-b").item("9").blocked = True
+    save_state(cfg.state_path, st)
+
+    assert reopen_issues(cfg, "a/b", [9]) == [9]
+    assert load_state(cfg.state_path).repo("a-b").item("9").blocked is False
+
+
+def test_reopen_unknown_repo_raises(tmp_path):
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                 state_file=tmp_path / "state.json")
+    with pytest.raises(ValueError):
+        reopen_issues(cfg, "x/y", [1])

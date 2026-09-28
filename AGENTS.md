@@ -48,6 +48,9 @@ cp config.example.yaml config.yaml   # 再填 screener / agent_env
 python -m issue_keeper keep --config config.yaml --once
 python -m issue_keeper keep --config config.yaml
 
+# 人工重派：把被消费掉的 issue 放回队列（日限误跳/引擎异常/孤儿 run 之后用）
+python -m issue_keeper reopen --config config.yaml jeffkit/recursive 41 42
+
 python -m issue_keeper team list
 python -m issue_keeper onboard ~/projects/foo --agent-label foo-agent --gen-intro
 

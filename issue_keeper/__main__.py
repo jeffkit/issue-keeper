@@ -27,7 +27,23 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .keeper import run_daemon, run_once
+from .keeper import reopen_issues, run_daemon, run_once
+
+
+def _run_reopen(args) -> int:
+    """把已消费的 issue 放回队列；keeper 下一轮就会重新派发。"""
+    try:
+        config = load_config(args.config)
+        changed = reopen_issues(config, args.repo, args.numbers)
+    except Exception as e:
+        print(f"reopen 失败: {e}", file=sys.stderr)
+        return 2
+    skipped = [n for n in args.numbers if n not in changed]
+    if changed:
+        print(f"已重新入队（keeper 下一轮会重新派发）: {changed}")
+    if skipped:
+        print(f"无需改动（本就没被消费）: {skipped}")
+    return 0
 
 
 def _run_keeper(args) -> int:
@@ -413,6 +429,13 @@ def main(argv: list[str] | None = None) -> int:
     keeper_parser.add_argument("--log-level", default="INFO",
                                choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 
+    # 人工重派：把被消费掉的 issue 放回队列（keeper 唯一的「再进队」入口）
+    reopen_parser = subparsers.add_parser(
+        "reopen", help="把已消费的 issue 重新放回队列（清 processed/blocked）")
+    reopen_parser.add_argument("--config", "-c", required=True)
+    reopen_parser.add_argument("repo", help="repo 标识（如 jeffkit/recursive）")
+    reopen_parser.add_argument("numbers", type=int, nargs="+", help="issue 编号")
+
     # dashboard（Web 看板，读 internal.db）
     dash_parser = subparsers.add_parser("dashboard", help="启动 Web 看板（读 internal source）")
     dash_parser.add_argument("--port", type=int, default=7433)
@@ -518,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "keep":
         return _run_keeper(args)
+    if args.cmd == "reopen":
+        return _run_reopen(args)
     if args.cmd == "internal":
         return _run_internal(args)
     if args.cmd == "dashboard":

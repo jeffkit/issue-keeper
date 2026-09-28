@@ -862,6 +862,33 @@ def run_daemon(config_path: str) -> None:
         time.sleep(config.poll_interval_secs)
 
 
+def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
+    """把已消费的 issue 重新放回队列（清 processed/blocked），返回实际改动的编号。
+
+    存在的理由：keeper 此前没有任何手段让一条 processed 的 issue 再进队——
+    日限误跳过、引擎异常终态、孤儿 run 之后，只能靠绕过 keeper 的临时脚本重派
+    （2026-09-28 的 /tmp/run_batch_41_44.py 就是这么来的，代价是丢掉 keeper 的
+    兜底回评与看板联动）。只清 processed/blocked/wakeup_deps：评论级进度
+    （processed_comment_ids）保留，免得把已经答过的旧评论再答一遍。
+    """
+    binding = next((b for b in config.repos if b.repo == repo), None)
+    if binding is None:
+        raise ValueError(f"配置里没有 repo 绑定: {repo}")
+    state = load_state(config.state_path)
+    rs = state.repo(binding.repo_slug)
+    changed: list[int] = []
+    for n in numbers:
+        it = rs.item(str(n))
+        if it.processed or it.blocked:
+            it.processed = False
+            it.blocked = False
+            it.wakeup_deps = []
+            changed.append(n)
+    if changed:
+        save_state(config.state_path, state)
+    return changed
+
+
 def _author_allowed(config, author: str | None) -> bool:
     """作者 allowlist：空名单=全放行；大小写不敏感。"""
     if not config.author_allowlist:
