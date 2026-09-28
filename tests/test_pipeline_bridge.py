@@ -106,3 +106,20 @@ def test_shared_cargo_target_skips_missing_main_clone(monkeypatch):
     monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
     assert bridge.ensure_shared_cargo_target({}) == ""
     assert bridge.ensure_shared_cargo_target({"main_clone": ""}) == ""
+
+
+# ── PATH 补齐（2026-09-28：launchd 的 keeper PATH 没有 ~/.cargo/bin，gate 找不到 cargo）──
+
+def test_tool_path_adds_cargo_bin_when_missing(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    added = bridge.ensure_tool_path()
+    assert "cargo" in added
+    assert os.environ["PATH"].split(os.pathsep)[0].endswith(".cargo/bin")
+
+
+def test_tool_path_is_idempotent(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    bridge.ensure_tool_path()
+    before = os.environ["PATH"]
+    assert bridge.ensure_tool_path() == ""
+    assert os.environ["PATH"] == before

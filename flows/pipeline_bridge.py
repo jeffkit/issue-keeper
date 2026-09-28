@@ -56,6 +56,34 @@ def ensure_sandbox_timeout(default_secs: int = SANDBOX_TIMEOUT_DEFAULT_SECS) -> 
         os.environ["PLAITA_SANDBOX_TIMEOUT"] = str(default_secs)
 
 
+def ensure_tool_path() -> str:
+    """把常用工具目录补进 PATH（launchd 起的 keeper 没有它们）。
+
+    2026-09-28：keeper 由 launchd 启动，PATH 只有 /opt/homebrew/bin:/Users/kong/.local/bin:
+    /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin —— **没有 ~/.cargo/bin**；而 plaita 的
+    subprocess 沙箱只继承 env 白名单里的 PATH（plaita/node/code.py），于是 gate 节点跑
+    `cargo fmt --all --check && cargo test ...` 直接
+    FileNotFoundError: [Errno 2] No such file or directory: 'cargo'（#40 的 run 就这么死在
+    最后一步，它的实现其实已经过 review+fix_review）。agent 段没事是因为 agent 的 shell
+    会读 profile 自己把 ~/.cargo/bin 加回来。
+
+    返回补进去的目录（冒号分隔），无需补时返回 ""。
+    """
+    home = pathlib.Path.home()
+    wanted = [
+        str(home / ".cargo" / "bin"),
+        str(home / ".local" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    added = [p for p in wanted if p not in parts and pathlib.Path(p).is_dir()]
+    if not added:
+        return ""
+    os.environ["PATH"] = os.pathsep.join(added + parts)
+    return os.pathsep.join(added)
+
+
 def ensure_shared_cargo_target(payload: dict) -> str:
     """让管线复用主 clone 的 cargo `target/`，别在每个 worktree 里冷编译。
 
@@ -339,6 +367,10 @@ def main() -> None:
     payload = json.load(sys.stdin)
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
+    added_path = ensure_tool_path()
+    if added_path:
+        print(f"[bridge] PATH 补齐: {added_path}（launchd 的 keeper 没有 ~/.cargo/bin）",
+              file=sys.stderr)
     shared_target = ensure_shared_cargo_target(payload)
     if shared_target:
         print(f"[bridge] CARGO_TARGET_DIR={shared_target}"

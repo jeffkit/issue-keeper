@@ -118,7 +118,7 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
   + `git status -uall` 再动笔、条目必须如实描述本次 diff、拿不准就 SKIP。
 - **recursive 的质量门由空转真**：`pipeline_test_commands["jeffkit/recursive"]` 原本是空串，
   gate 节点跑 `true` 恒过——回评里的「质量门已通过」其实只来自 agent 自述。现在设为
-  `cargo fmt --all --check && cargo test --workspace --no-fail-fast`（v1.0.8：bridge 把 CARGO_TARGET_DIR 指向主 clone 的 target/，worktree 不再冷编译整个 workspace——#19/#30/#40 三跑都因此被节点预算掐死；agent 预算 investigate 2100 / plan 1200 / implement 3000 / review 2400，keeper 整跑上限 21600s。门预算 2400s——v1.0.6 由 1200s 上调，因为门现在真跑全量测试而 worktree 的 target/ 可能还冷；失败会走
+  `cargo fmt --all --check && cargo test --workspace --no-fail-fast`（v1.0.9：bridge 补齐 PATH（launchd 的 keeper 没有 ~/.cargo/bin，gate 跑 cargo 直接 FileNotFoundError——#40 就这么死在最后一步）；review/fix_review 提示词明确「不要重复跑全量测试」（门会跑），预算 2700s。v1.0.8：bridge 把 CARGO_TARGET_DIR 指向主 clone 的 target/，worktree 不再冷编译整个 workspace——#19/#30/#40 三跑都因此被节点预算掐死；agent 预算 investigate 2100 / plan 1200 / implement 3000 / review 2400，keeper 整跑上限 21600s。门预算 2400s——v1.0.6 由 1200s 上调，因为门现在真跑全量测试而 worktree 的 target/ 可能还冷；失败会走
   `fix_test`/如实回评，不会静默放行）。若开始超时，收窄成按 crate 的 `-p` 列表。
 
 ## 输入契约（keeper → run）
