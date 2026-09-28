@@ -23,7 +23,7 @@
   - 成功回评尾部由管线追加核验行（分支/推送/合并事实），落地判定不信 agent 自由文本
   - triage 前置依赖预检（正文 #N 引用 → gh 查状态注入）；依赖未合入 main → 硬判据
     blocked，明令禁止就地实现依赖
-  - code 节点显式 sandbox_backend="unsafe"（本机可信部署；多租户必须另行收窄，见 README）
+  - code 节点显式 sandbox_backend="subprocess"（本机可信部署；多租户必须另行收窄，见 README）
 已知边界（flows/README.md「已知缺口」）：引擎层节点异常默认 abort 终态且不可续跑——
 「终态 error 必有回评」由 keeper 侧兜底（轮询终态+无评论→补 fallback 评论）；
 agentproc 超时不 killpg 的孤儿问题需在 agentproc/agent_run 层修。
@@ -38,7 +38,7 @@ def issue_pipeline(INPUT):
     # ── 0. 入口安全闸：screener 未判 safe 一律不进 agent 段 ──
     if INPUT.screener_verdict != "safe":
         reject = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    return {'text': '该 issue 未通过自动安全初筛（screener_verdict=' + str(input.get('v')) + '），已停止自动处理，请人工查看。'}\n"
@@ -46,7 +46,7 @@ def issue_pipeline(INPUT):
             input={"v": INPUT.screener_verdict},
         )
         post_reject = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import subprocess\n"
@@ -62,7 +62,7 @@ def issue_pipeline(INPUT):
 
     # ── 0.5 依赖预检：解析正文 #N 引用，查各自状态（机器判定，不靠 agent 自查）──
     deps = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import json, re, subprocess\n"
@@ -125,7 +125,7 @@ def issue_pipeline(INPUT):
         ),
     )
     parsed = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import json\n"
@@ -159,7 +159,7 @@ def issue_pipeline(INPUT):
             ),
         )
         post_blocked = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import re, subprocess\n"
@@ -189,7 +189,7 @@ def issue_pipeline(INPUT):
             ),
         )
         post_invalid = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import re, subprocess\n"
@@ -250,7 +250,7 @@ def issue_pipeline(INPUT):
         ),
     )
     risk_gate = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    return {'need_human': input.get('mode') == 'human' and input.get('risk') == 'high'}\n"
@@ -274,7 +274,7 @@ def issue_pipeline(INPUT):
                 ),
             )
             post_hold = CODE.python(
-                sandbox_backend="unsafe",
+                sandbox_backend="subprocess",
                 code=(
                     "def run(input):\n"
                     "    import re, subprocess\n"
@@ -306,7 +306,7 @@ def issue_pipeline(INPUT):
         ),
     )
     check = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import subprocess\n"
@@ -333,7 +333,7 @@ def issue_pipeline(INPUT):
             ),
         )
         post_nochange = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import re, subprocess\n"
@@ -371,7 +371,7 @@ def issue_pipeline(INPUT):
         ),
     )
     verdict = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import json\n"
@@ -401,7 +401,7 @@ def issue_pipeline(INPUT):
             ),
         )
         post_abort = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import re, subprocess\n"
@@ -433,7 +433,7 @@ def issue_pipeline(INPUT):
 
     # ── 6. 质量门：命令来自 INPUT.test_command（per-repo 绑定），留空跑 true 恒过并注明 ──
     prep = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    cmd = (input.get('cmd') or '').strip()\n"
@@ -480,7 +480,7 @@ def issue_pipeline(INPUT):
                 ),
             )
             post_partial = CODE.python(
-                sandbox_backend="unsafe",
+                sandbox_backend="subprocess",
                 code=(
                     "def run(input):\n"
                     "    import re, subprocess\n"
@@ -500,7 +500,7 @@ def issue_pipeline(INPUT):
 
     # ── 7. diff 护栏：敏感路径/超大 diff → 停机待人工，不进 deliver ──
     guard = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import subprocess\n"
@@ -534,7 +534,7 @@ def issue_pipeline(INPUT):
             ),
         )
         post_guard = CODE.python(
-            sandbox_backend="unsafe",
+            sandbox_backend="subprocess",
             code=(
                 "def run(input):\n"
                 "    import re, subprocess\n"
@@ -563,7 +563,7 @@ def issue_pipeline(INPUT):
         ),
     )
     deliver = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import subprocess, re\n"
@@ -585,7 +585,7 @@ def issue_pipeline(INPUT):
                "branch_name": INPUT.branch_name, "issue_number": INPUT.issue_number},
     )
     merge = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    if input.get('push_mode') != 'main':\n"
@@ -624,7 +624,7 @@ def issue_pipeline(INPUT):
         ),
     )
     post = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import re, subprocess\n"
@@ -648,7 +648,7 @@ def issue_pipeline(INPUT):
                "merged_note": merge.note},
     )
     kanban = CODE.python(
-        sandbox_backend="unsafe",
+        sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
             "    import subprocess\n"

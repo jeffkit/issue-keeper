@@ -54,8 +54,12 @@ triage 区分 invalid/blocked-in-flight、
 2. 作者 allowlist + 同作者限频 + 全局并发 1-2（keeper 提交 run 前检查）。
 3. agent 子进程降权：env 白名单（剔 GH_TOKEN/SSH_AUTH_SOCK）、评论出口用独立低权限
    token、~/.ssh 与 ~/.flowcast 对 agent 进程不可读。
-4. runner 启动：`register_code_node(default_backend="subprocess")`；所有 code 节点已显式
-   `sandbox_backend="unsafe"`（本机可信部署；多租户环境必须另行收窄）。
+4. runner 启动：`register_code_node(default_backend="subprocess")`；flow 里所有 code 节点
+   **显式**声明 `sandbox_backend="subprocess"`（这些节点要跑 git/gh/文件 IO，需要网络+FS，
+   docker 档会跑不了；显式声明也让运营者改 default_backend 不会悄悄改变本 flow）。
+   单节点墙钟由 bridge 进程的 `PLAITA_SANDBOX_TIMEOUT` 提供（`pipeline_bridge.
+   ensure_sandbox_timeout`，默认 900s）。多租户部署用
+   `register_code_node(allowed_backends=(...))` 收窄，白名单外的档位在解析期硬失败。
 
 **留给后续立项（flow 之外）**：
 - keeper 接线：`_process_resource` 改为向 console 提 issue-pipeline run + 轮询终态；
@@ -128,7 +132,8 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
   `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
   改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
   semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
-  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.1**（1.0.1：review/fix_review 600→1800s）。
+  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.2**（1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式
+   `sandbox_backend="subprocess"`——编译器修好后节点级字段才真正进 IR）。
 - **观测上报**：`payload.observability_redis` 非空时，每次 run 写
   `plaita:execution:{id}`（console 执行列表/详情可见，30 天过期）+ 逐节点
   publish `plaita:execution:events:{id}`（`/executions/{id}/stream` SSE 实时
@@ -152,13 +157,17 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
    commit 进 origin/main——即清 processed 重跑，治「blocked 即永久沉默」）。**未做**：
    批次指挥 LLM（隐式依赖/并行分组/umbrella 上下文注入 triage INPUT），应做成
    plaita flow 走 console 发布流，与 supervisor 方向同构。
-5. **`sandbox_backend` 没进 IR（2026-09-28 发现，上游 plaita 的编译器）**：@flow 源码给
-   每个 code 节点都写了 `sandbox_backend="unsafe"`（本机可信部署的本意），但编译产物
-   （`issue-pipeline.flow.json` 与 console 已发布定义）里该字段是 `None`，运行期只能吃
-   `register_code_node(default_backend="subprocess")`——于是 deliver/merge 这类要跑
-   `git push` 的节点被 10s 墙钟掐死，#41（deliver）、#45 孤儿 run（merge）都是
-   「push 已成功、包装层被杀」的假失败。bridge 侧已兜底 `PLAITA_SANDBOX_TIMEOUT=900`
-   （见 `pipeline_bridge.ensure_sandbox_timeout`），**根因仍应修编译器**。
+5. ~~**`sandbox_backend` 没进 IR**~~ **已修（2026-09-28）**：@flow 源码里的节点级字段
+   曾被编译器静默丢弃——`plaita/dsl/codeflow/_nodes.py` 的 CODE 分支只搬
+   `code`/`language`/`input`，`sandbox_backend` 一律丢，编译产物里是 `None`，运行期只能
+   吃 `register_code_node(default_backend=...)`。deliver/merge 这类要跑 `git push` 的
+   code 节点因此被默认 subprocess 后端的 **10s** 墙钟掐死（#41 死在 deliver、#45 的孤儿
+   run 死在 merge，都是「push 其实已成功、包装层被杀」的假失败）。
+   修复：plaita `fix/codeflow-code-node-fields`（CODE 分支透传 `sandbox_backend` + 回归
+   测试）；bridge 侧另留 `PLAITA_SANDBOX_TIMEOUT=900` 兜底
+   （`pipeline_bridge.ensure_sandbox_timeout`）。flow 源码同步改为显式
+   `sandbox_backend="subprocess"`（声明实际在跑的档位，而不是依赖运营者默认），
+   重建后发布 console **v1.0.2**。
 6. **deliver 早退不 commit（2026-09-28 发现）**：`deliver` 见分支已在远端就直接返回
    `pushed=True`，跳过 `git add/commit/push`——重复投递时工作区里新产生的改动被静默
    丢弃（#45：第二份 run 的改动没进任何提交，只留在 worktree）。重跑语义要么先比

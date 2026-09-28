@@ -33,6 +33,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "triage",
    "source_line": 64
   },
@@ -54,6 +55,7 @@
    "input": {
     "text": "$NODE.triage.text"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n2",
    "source_line": 127
   },
@@ -143,6 +145,7 @@
     "mode": "$INPUT.review_mode",
     "risk": "$NODE.parsed.risk"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n4",
    "source_line": 252
   },
@@ -177,6 +180,7 @@
     "worktree_dir": "$INPUT.worktree_dir",
     "impl_text": "$NODE.implement.text"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n5",
    "source_line": 308
   },
@@ -210,6 +214,7 @@
    "input": {
     "text": "$NODE.review.text"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n6",
    "source_line": 373
   },
@@ -245,6 +250,7 @@
    "input": {
     "cmd": "$INPUT.test_command"
    },
+   "sandbox_backend": "subprocess",
    "next": "gate",
    "source_line": 435
   },
@@ -279,6 +285,7 @@
    "input": {
     "worktree_dir": "$INPUT.worktree_dir"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n9",
    "source_line": 502
   },
@@ -315,6 +322,7 @@
     "branch_name": "$INPUT.branch_name",
     "issue_number": "$INPUT.issue_number"
    },
+   "sandbox_backend": "subprocess",
    "next": "merge",
    "source_line": 565
   },
@@ -328,6 +336,7 @@
     "main_clone": "$INPUT.main_clone",
     "branch_name": "$INPUT.branch_name"
    },
+   "sandbox_backend": "subprocess",
    "next": "reply",
    "source_line": 587
   },
@@ -355,6 +364,7 @@
     "pushed": "$NODE.deliver.pushed",
     "merged_note": "$NODE.merge.note"
    },
+   "sandbox_backend": "subprocess",
    "next": "kanban",
    "source_line": 626
   },
@@ -367,6 +377,7 @@
     "repo_full": "$INPUT.repo_full",
     "issue_number": "$INPUT.issue_number"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n10",
    "source_line": 650
   },
@@ -405,6 +416,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n11",
    "source_line": 536
   },
@@ -472,6 +484,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n13",
    "source_line": 482
   },
@@ -516,6 +529,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n14",
    "source_line": 403
   },
@@ -550,6 +564,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n15",
    "source_line": 335
   },
@@ -604,6 +619,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n17",
    "source_line": 276
   },
@@ -638,6 +654,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n18",
    "source_line": 191
   },
@@ -672,6 +689,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n19",
    "source_line": 161
   },
@@ -693,6 +711,7 @@
    "input": {
     "v": "$INPUT.screener_verdict"
    },
+   "sandbox_backend": "subprocess",
    "next": "post_reject",
    "source_line": 40
   },
@@ -707,6 +726,7 @@
     "issue_number": "$INPUT.issue_number",
     "repo_full": "$INPUT.repo_full"
    },
+   "sandbox_backend": "subprocess",
    "next": "_n20",
    "source_line": 48
   },
