@@ -102,6 +102,14 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
 `tests/test_flow_verdict_parser.py`（含 #43 原文形态 + 反证旧写法失败）。
 已发布 console **v1.0.3**。
 
+第二轮（同一 issue 重派）又被自己挡住：triage 的查重会 `gh issue view --json comments`，
+把**本管线自己上一轮的 abort 回评**当成「已有在途处理」→ 36 秒判 blocked，重派永远
+开不了工。修复：triage 提示词明确「带 `<!-- issue-keeper-bot -->` / `<!-- issue-pipeline -->`
+标记的评论是本管线自己的历史记录，不算 in-flight；判在途只认远端分支 / 未合并 PR /
+人类认领」。同批把 investigate 预算 900 → **1800s**（#41 连续两轮卡在 900s：调研段要先立
+失败测试再跑 cargo，而 worktree 的 `target/` 是空的，冷构建常十几分钟；#42 同节点 381s）。
+两处一并发布 console **v1.0.4**。
+
 ## 输入契约（keeper → run）
 
 ```json
