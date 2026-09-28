@@ -358,6 +358,11 @@ def process_repo(
         if kind == "issue":
             resources = _dependency_first_order(resources, rs)
 
+        # 候选清单落 DEBUG：排查「这一轮为什么没处理某条」时，第一件事就是确认
+        # 它有没有进候选（2026-09-28 有过一轮逐条静默跳过、事后无法复盘的情况）。
+        log.debug("[%s] %s 候选 %d 条，未处理: %s", binding.repo, kind, len(resources),
+                  [r.number for r in resources if not rs.item(r.resource_key).processed])
+
         for res in resources:
             handled += _process_resource(
                 src, binding, config, screener, entry, rs, res, me, timeout, visible_prefix
