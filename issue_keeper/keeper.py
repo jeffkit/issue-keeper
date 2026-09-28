@@ -817,6 +817,16 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         "review_mode": config.pipeline_review_mode,
         "push_mode": config.pipeline_push_mode,
     }
+    # 混合形态（2026-09-28）：定义源 console + 执行观测上报。bridge 侧对两者都
+    # fail-open——拉不到定义退 stale 缓存/本地文件，Redis 不可达静默跳过上报。
+    pc = config.pipeline.console
+    if pc.url and pc.api_key:
+        payload["console"] = {
+            "url": pc.url, "api_key": pc.api_key, "flow_id": pc.flow_id,
+            "refresh_secs": pc.refresh_secs, "cache_path": pc.cache_path,
+        }
+    if config.pipeline.observability_redis:
+        payload["observability_redis"] = config.pipeline.observability_redis
 
     log.info("[%s] 提交 issue-pipeline run (push_mode=%s, review_mode=%s)",
              label, payload["push_mode"], payload["review_mode"])

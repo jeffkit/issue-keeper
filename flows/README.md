@@ -98,7 +98,13 @@ triage 区分 invalid/blocked-in-flight、
   "artifact_dir": "/Users/kong/.issue-keeper/pipeline/recursive-17",
   "test_command": "cargo test --workspace",        // per-repo；空=跳过质量门并注明
   "review_mode": "auto",                           // auto | human（human 且 high 才 HITL）
-  "push_mode": "branch"                            // branch(默认) | main
+  "push_mode": "branch",                           // branch(默认) | main
+  "console": {                                     // 可选（混合形态）；缺省=纯本地定义
+    "url": "http://127.0.0.1:8123", "api_key": "...",
+    "flow_id": "issue-pipeline", "refresh_secs": 300,
+    "cache_path": "~/.issue-keeper/pipeline/flow-cache.json"
+  },
+  "observability_redis": "redis://localhost:6379/0" // 可选；非空才上报 console 观测面
 }
 ```
 
@@ -110,6 +116,27 @@ keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须�
 `posted`——`pipeline_bridge.py` 在出口统一补齐别名（缺 `comment_posted` 时用 `posted`
 填充，引擎异常无 `posted` 则为 false）。keeper 侧兼容双读。早退终态已发回评 ≠ 故障，
 告警文案区分「引擎异常无回评」与「终态但回评未发出」（issue #1 误报修复）。
+
+## 混合形态：定义与观测归 console，执行留本地（2026-09-28）
+
+console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节点边界生效且首节点
+不可取消——真机验证见验证记录），故**执行不迁 console**；killpg 孤儿清理语义
+留在 keeper。bridge 新增两条 console 集成（均 fail-open，缺配置=旧行为）：
+
+- **定义源**：`payload.console` 有 url+api_key 时拉 console 已发布定义（semver
+  最高），TTL 内用缓存；console 不可达退 stale 缓存；缓存也没有退仓内
+  `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
+  改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
+  semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
+  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.0**。
+- **观测上报**：`payload.observability_redis` 非空时，每次 run 写
+  `plaita:execution:{id}`（console 执行列表/详情可见，30 天过期）+ 逐节点
+  publish `plaita:execution:events:{id}`（`/executions/{id}/stream` SSE 实时
+  推送）；nodes 轨迹含每节点 status/duration_ms/input/output（长串截断 2KB）。
+  Langfuse 另需进程 env `LANGFUSE_PUBLIC_KEY`（trace id = 执行 id）。
+  console 侧展示需其进程配 `PLAITA_CONSOLE_NODE_MODULES=plaita_nodes`
+  （2026-09-28 已配进 `~/.plaita-console/env.sh` 并重启生效，否则定义校验
+  拒收 code 节点）。
 
 ## 已知缺口（按优先级）
 

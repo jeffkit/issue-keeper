@@ -60,6 +60,24 @@ reply_polish:
   # timeout_secs: 60
   # min_chars: 120            # 短于此的原文跳过改写（只消毒）
 
+# ─── issue-pipeline 混合形态（pipeline）────────────────────────────────
+# 定义与观测归 plaita-console，执行留本地 bridge（flows/pipeline_bridge.py，
+# killpg 孤儿清理语义不外迁——console cancel 不杀进程树，2026-09-28 真机验证）。
+# 整段缺省 = 纯本地模式：bridge 直接用仓内 flows/issue-pipeline.flow.json、不上报。
+pipeline:
+  console:
+    # 定义源：bridge 按 TTL 拉取 console 上 semver 最高的已发布 issue-pipeline 定义；
+    # console 不可达退 stale 缓存，缓存也没有退仓内本地文件（三级 fail-open）。
+    url: ${PLAITA_CONSOLE_URL}
+    api_key: ${PLAITA_CONSOLE_ADMIN_API_KEY}
+    flow_id: issue-pipeline
+    refresh_secs: 300
+    cache_path: ~/.issue-keeper/pipeline/flow-cache.json
+  # 执行观测上报：指向 console 所用 Redis（非空才上报）。bridge 把每次 run 写进
+  # plaita:execution:{id}（30 天过期）+ 逐节点 publish SSE 频道，console 执行页
+  # 可见节点级 trace；Langfuse 另需进程 env LANGFUSE_PUBLIC_KEY（trace id = 执行 id）。
+  # observability_redis: redis://localhost:6379/0
+
 # ─── 安全过滤层（screener）────────────────────────────────────────────
 # 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。
 # 这一层在 keeper 进程内完成，不起子进程、无本地权限。

@@ -26,6 +26,29 @@ class KeeperPatrolConfig:
 
 
 @dataclass
+class PipelineConsoleConfig:
+    """issue-pipeline 定义源（console）：混合形态下定义归 console、本地文件兜底。
+
+    url 为空 = 不接 console，bridge 直接用仓内 issue-pipeline.flow.json（旧行为）。
+    """
+    url: str = ""
+    api_key: str = ""
+    flow_id: str = "issue-pipeline"
+    # 已发布定义的拉取 TTL（秒）；TTL 内用本地缓存，失败退 stale 缓存。
+    refresh_secs: int = 300
+    cache_path: str = "~/.issue-keeper/pipeline/flow-cache.json"
+
+
+@dataclass
+class PipelineConfig:
+    """issue-pipeline 管线运行配置（混合形态，2026-09-28）。"""
+    console: PipelineConsoleConfig = field(default_factory=PipelineConsoleConfig)
+    # 非空时 bridge 把执行上报进 console 观测面（写 plaita:execution:{id} 键 +
+    # SSE pubsub 频道）。指向 console 所用 Redis，如 redis://localhost:6379/0。
+    observability_redis: str = ""
+
+
+@dataclass
 class RepoBinding:
     repo: str
     profile: str
@@ -110,6 +133,8 @@ class Config:
     author_allowlist: list = field(default_factory=list)
     # 同作者每日最多触发次数（读 pipeline runs.jsonl 台账，防资源滥用）
     author_daily_limit: int = 3
+    # 混合形态（定义归 console + 观测进 console，执行留本地 bridge）
+    pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     # 回评礼仪化：agent 原始输出发布前消毒 + LLM 改写为 issue 礼仪评论。
     # 连接字段缺省继承 screener 的 LLM 凭据（零配置可用）。
     reply_polish: ReplyPolishConfig = field(default_factory=ReplyPolishConfig)
@@ -272,6 +297,27 @@ def _load_reply_polish(raw: dict[str, Any], screener: ScreenerConfig) -> ReplyPo
     )
 
 
+def _load_pipeline(raw: dict) -> PipelineConfig:
+    """解析 pipeline 段（混合形态：定义源 console + 观测上报 Redis）。url 缺省=纯本地模式。"""
+    p = raw.get("pipeline") or {}
+    if not isinstance(p, dict):
+        raise ValueError("pipeline 需要是映射（console / observability_redis）")
+    console_raw = p.get("console") or {}
+    if not isinstance(console_raw, dict):
+        raise ValueError("pipeline.console 需要是映射（url/api_key/flow_id/refresh_secs/cache_path）")
+    return PipelineConfig(
+        console=PipelineConsoleConfig(
+            url=_expand_env(console_raw.get("url") or "").strip(),
+            api_key=_expand_env(console_raw.get("api_key") or "").strip(),
+            flow_id=(console_raw.get("flow_id") or "issue-pipeline").strip(),
+            refresh_secs=max(30, int(console_raw.get("refresh_secs", 300))),
+            cache_path=_expand_env(console_raw.get("cache_path") or "").strip()
+            or "~/.issue-keeper/pipeline/flow-cache.json",
+        ),
+        observability_redis=_expand_env(p.get("observability_redis") or "").strip(),
+    )
+
+
 def load_config(path: str | os.PathLike) -> Config:
     p = Path(path).expanduser()
     if not p.exists():
@@ -348,6 +394,7 @@ def load_config(path: str | os.PathLike) -> Config:
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
         author_daily_limit=max(1, int(raw.get("author_daily_limit", 3))),
         reply_polish=_load_reply_polish(raw, screener),
+        pipeline=_load_pipeline(raw),
     )
 
     if cfg.poll_interval_secs <= 0:
