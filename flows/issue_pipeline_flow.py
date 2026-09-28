@@ -154,7 +154,7 @@ def issue_pipeline(INPUT):
         reply_blocked = AGENTRUN(
             agent="glm-turbo",
             repo=INPUT.main_clone,
-            timeout_secs=180,
+            timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写简短中文评论（直接给正文）：暂不开工。"
                 "原因：{% $NODE.parsed.blockers %}。如是依赖未就绪，说明开工前置条件与方向"
@@ -185,7 +185,7 @@ def issue_pipeline(INPUT):
         reply_invalid = AGENTRUN(
             agent="glm-turbo",
             repo=INPUT.main_clone,
-            timeout_secs=180,
+            timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写简短中文评论（直接给正文）：无需新代码改动。"
                 "原因：{% $NODE.parsed.notes %}。若已有修复给出 commit/PR 链接。纯文本 2-5 句，"
@@ -273,7 +273,7 @@ def issue_pipeline(INPUT):
             reply_hold = AGENTRUN(
                 agent="glm-turbo",
                 repo=INPUT.main_clone,
-                timeout_secs=180,
+                timeout_secs=600,
                 prompt=(
                     "为 GitHub issue 写评论（直接给正文）：该 issue 风险评级 high，实施计划已完成但未获人工批准，"
                     "自动管线暂缓实施。计划摘要见 {% $INPUT.artifact_dir %}/02-plan.md。请人工确认后重启处理。"
@@ -335,7 +335,7 @@ def issue_pipeline(INPUT):
         reply_nochange = AGENTRUN(
             agent="glm-turbo",
             repo=INPUT.main_clone,
-            timeout_secs=180,
+            timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写简短中文评论（直接给正文）：调查后无需/无法产生代码改动。"
                 "调查要点见 {% $INPUT.artifact_dir %}/01-investigation.md，实施反馈：{% $NODE.check.impl_summary %}。"
@@ -429,7 +429,7 @@ def issue_pipeline(INPUT):
         reply_abort = AGENTRUN(
             agent="glm-turbo",
             repo=INPUT.main_clone,
-            timeout_secs=180,
+            timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写评论（直接给正文）：独立审查判定实现不宜继续"
                 "（原因：{% $NODE.verdict.notes %}）。工作区保留在本地 {% $INPUT.branch_name %} 未推送，"
@@ -509,7 +509,7 @@ def issue_pipeline(INPUT):
             reply_partial = AGENTRUN(
                 agent="glm-turbo",
                 repo=INPUT.main_clone,
-                timeout_secs=180,
+                timeout_secs=600,
                 prompt=(
                     "为 GitHub issue 写诚实的中期评论（直接给正文）：实现已完成但全量测试两轮未过，"
                     "自动处理停止。改动保留在本地 worktree（分支 {% $INPUT.branch_name %}，尚未推送）。"
@@ -563,7 +563,7 @@ def issue_pipeline(INPUT):
         reply_guard = AGENTRUN(
             agent="glm-turbo",
             repo=INPUT.main_clone,
-            timeout_secs=180,
+            timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写评论（直接给正文）：实现已完成但改动越出计划边界，自动管线已停止推送，"
                 "请人工检查。越界文件：{% $NODE.guard.violations %}，oversized={% $NODE.guard.oversized %}。"
@@ -651,7 +651,7 @@ def issue_pipeline(INPUT):
     reply = AGENTRUN(
         agent="glm-turbo",
         repo=INPUT.main_clone,
-        timeout_secs=180,
+        timeout_secs=600,
         prompt=(
             "为 GitHub issue 写处理完成评论（直接给正文）。这是对外发布的最终评论，"
             "不是工作汇报。素材（自己读文件，不要臆造）："

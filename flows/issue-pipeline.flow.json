@@ -345,7 +345,7 @@
    "id": "reply",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写处理完成评论（直接给正文）。这是对外发布的最终评论，不是工作汇报。素材（自己读文件，不要臆造）：调查 {% $INPUT.artifact_dir %}/01-investigation.md、计划与实施记录 {% $INPUT.artifact_dir %}/02-plan.md。事实：本仓测试命令={% $INPUT.test_command %}（为空则如实注明「本仓未配置统一测试命令，质量门为独立 review」）；质量门 passed={% $NODE.gate.passed %}；分支 {% $INPUT.branch_name %}；推送 pushed={% $NODE.deliver.pushed %}；合并备注 {% $NODE.merge.note %}。issue 礼仪：结论先行（做了什么 + commit/分支/PR 等可核验引用）；只写根因/方案要点、改动文件清单、测试情况、在哪 review；不要叙述工作过程（不要「我先调查…然后实现…」这类经过），不要写内部状态（如「本地未推送」），不要出现任何本机路径或凭据信息。首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。",
    "next": "post",
    "source_line": 651
@@ -400,7 +400,7 @@
    "id": "reply_guard",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写评论（直接给正文）：实现已完成但改动越出计划边界，自动管线已停止推送，请人工检查。越界文件：{% $NODE.guard.violations %}，oversized={% $NODE.guard.oversized %}。分支 {% $INPUT.branch_name %} 保留在本地未推送。纯文本 4-8 句，不要出现任何本机路径或凭据信息。",
    "next": "post_guard",
    "source_line": 563
@@ -468,7 +468,7 @@
    "id": "reply_partial",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写诚实的中期评论（直接给正文）：实现已完成但全量测试两轮未过，自动处理停止。改动保留在本地 worktree（分支 {% $INPUT.branch_name %}，尚未推送）。只归纳失败模块与错误类型，不要贴原始测试输出。说明需人工接手的事项。纯文本 5-8 句，不要出现任何本机路径或凭据信息。",
    "next": "post_partial",
    "source_line": 509
@@ -513,7 +513,7 @@
    "id": "reply_abort",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写评论（直接给正文）：独立审查判定实现不宜继续（原因：{% $NODE.verdict.notes %}）。工作区保留在本地 {% $INPUT.branch_name %} 未推送，请人工定方向。纯文本 3-6 句，不要出现任何本机路径或凭据信息。",
    "next": "post_abort",
    "source_line": 429
@@ -548,7 +548,7 @@
    "id": "reply_nochange",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写简短中文评论（直接给正文）：调查后无需/无法产生代码改动。调查要点见 {% $INPUT.artifact_dir %}/01-investigation.md，实施反馈：{% $NODE.check.impl_summary %}。给出后续建议。纯文本 2-5 句，不要出现任何本机路径或凭据信息。",
    "next": "post_nochange",
    "source_line": 335
@@ -603,7 +603,7 @@
    "id": "reply_hold",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写评论（直接给正文）：该 issue 风险评级 high，实施计划已完成但未获人工批准，自动管线暂缓实施。计划摘要见 {% $INPUT.artifact_dir %}/02-plan.md。请人工确认后重启处理。纯文本 3-6 句，不要出现任何本机路径或凭据信息。",
    "next": "post_hold",
    "source_line": 273
@@ -638,7 +638,7 @@
    "id": "reply_invalid",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写简短中文评论（直接给正文）：无需新代码改动。原因：{% $NODE.parsed.notes %}。若已有修复给出 commit/PR 链接。纯文本 2-5 句，不要出现任何本机路径或凭据信息。",
    "next": "post_invalid",
    "source_line": 185
@@ -673,7 +673,7 @@
    "id": "reply_blocked",
    "agent": "glm-turbo",
    "repo": "$INPUT.main_clone",
-   "timeout_secs": 180,
+   "timeout_secs": 600,
    "prompt": "为 GitHub issue 写简短中文评论（直接给正文）：暂不开工。原因：{% $NODE.parsed.blockers %}。如是依赖未就绪，说明开工前置条件与方向（{% $NODE.parsed.acceptance_str %}）；如是已有在途处理，说明不重复开工。纯文本 3-6 句，不要出现任何本机路径或凭据信息。",
    "next": "post_blocked",
    "source_line": 154
