@@ -131,6 +131,9 @@ class Config:
     pipeline_test_commands: dict = field(default_factory=dict)
     # 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）
     author_allowlist: list = field(default_factory=list)
+    # 豁免作者日限的作者名单（大小写不敏感）：名单内作者触发次数不限。
+    # 典型用途：核心贡献者账号批量提 issue 时不被日限积压（2026-09-28 okguitar）。
+    author_daily_limit_exempt: list = field(default_factory=list)
     # 同作者每日最多触发次数（读 pipeline runs.jsonl 台账，防资源滥用）
     author_daily_limit: int = 3
     # 混合形态（定义归 console + 观测进 console，执行留本地 bridge）
@@ -392,6 +395,8 @@ def load_config(path: str | os.PathLike) -> Config:
         pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
+        author_daily_limit_exempt=[str(a).strip() for a in (raw.get("author_daily_limit_exempt") or [])
+                                   if str(a).strip()],
         author_daily_limit=max(1, int(raw.get("author_daily_limit", 3))),
         reply_polish=_load_reply_polish(raw, screener),
         pipeline=_load_pipeline(raw),

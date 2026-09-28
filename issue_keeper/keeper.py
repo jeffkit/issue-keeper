@@ -752,11 +752,14 @@ def _author_allowed(config, author: str | None) -> bool:
 
 
 def _author_over_limit(config, author: str | None) -> bool:
-    """同作者每日触发次数限制（读 pipeline runs.jsonl 台账；台账缺失视为未超限）。"""
+    """同作者每日触发次数限制（读 pipeline runs.jsonl 台账；台账缺失视为未超限）。
+    豁免名单（author_daily_limit_exempt）内的作者不受限（大小写不敏感）。"""
     import json
     import time
     from pathlib import Path
     if not author or config.author_daily_limit <= 0:
+        return False
+    if author.lower() in {a.lower() for a in config.author_daily_limit_exempt}:
         return False
     ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
     if not ledger.exists():

@@ -60,6 +60,16 @@ reply_polish:
   # timeout_secs: 60
   # min_chars: 120            # 短于此的原文跳过改写（只消毒）
 
+# ─── 触发门槛（防注入骚扰/资源滥用）──────────────────────────────────
+# 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）。
+# agent 自提 issue 的作者默认不在名单 → 静默跳过（S7 防滥用）。
+author_allowlist: ["okguitar", "kongjie", "jeffkit"]
+# 同作者每日触发次数上限（按 pipeline 台账计数；push_mode=main 的爆炸半径闸）。
+# 跳过会把该 issue 永久标记 processed（后续只看评论）——批量提 issue 前先调它。
+author_daily_limit: 3
+# 豁免日限的作者名单（大小写不敏感）：名单内作者触发次数不限。
+author_daily_limit_exempt: [okguitar]
+
 # ─── issue-pipeline 混合形态（pipeline）────────────────────────────────
 # 定义与观测归 plaita-console，执行留本地 bridge（flows/pipeline_bridge.py，
 # killpg 孤儿清理语义不外迁——console cancel 不杀进程树，2026-09-28 真机验证）。
