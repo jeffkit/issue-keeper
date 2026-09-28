@@ -17,6 +17,12 @@
   - deliver 前 diff 护栏（.github/**、超大 diff → 待人工）
   - 全部公开评论出害前消毒（本机路径/密钥模式 → [REDACTED]）+ <!-- issue-pipeline --> 去重
   - partial/hold 出害口如实说明「改动在本地 worktree，未推送」
+  - worktree 基线显式取 origin/main（fetch 后切分支——pull --ff-only 在本地 main 领先时
+    是 no-op，从本地 HEAD 切分支会把未推送提交夹带进管线分支）
+  - push_mode=main 时 ff 合并 origin/<branch>（不是 origin/main——合并错了对象 main 不含修复）
+  - 成功回评尾部由管线追加核验行（分支/推送/合并事实），落地判定不信 agent 自由文本
+  - triage 前置依赖预检（正文 #N 引用 → gh 查状态注入）；依赖未合入 main → 硬判据
+    blocked，明令禁止就地实现依赖
   - code 节点显式 sandbox_backend="unsafe"（本机可信部署；多租户必须另行收窄，见 README）
 已知边界（flows/README.md「已知缺口」）：引擎层节点异常默认 abort 终态且不可续跑——
 「终态 error 必有回评」由 keeper 侧兜底（轮询终态+无评论→补 fallback 评论）；
@@ -54,6 +60,44 @@ def issue_pipeline(INPUT):
         )
         return {"status": "rejected", "posted": post_reject.posted}
 
+    # ── 0.5 依赖预检：解析正文 #N 引用，查各自状态（机器判定，不靠 agent 自查）──
+    deps = CODE.python(
+        sandbox_backend="unsafe",
+        code=(
+            "def run(input):\n"
+            "    import json, re, subprocess\n"
+            "    try:\n"
+            "        body = open(input['body_file'], encoding='utf-8').read()\n"
+            "    except Exception:\n"
+            "        body = ''\n"
+            "    nums = []\n"
+            "    for m in re.finditer(r'#(\\d+)', body):\n"
+            "        n = int(m.group(1))\n"
+            "        if n != input['issue_number'] and n not in nums:\n"
+            "            nums.append(n)\n"
+            "    deps = []\n"
+            "    for n in nums[:8]:\n"
+            "        d = {'number': n}\n"
+            "        try:\n"
+            "            r = subprocess.run(['gh', 'issue', 'view', str(n), '-R', input['repo_full'], '--json', 'state,title'], capture_output=True, text=True, timeout=30)\n"
+            "            if r.returncode == 0:\n"
+            "                j = json.loads(r.stdout)\n"
+            "                d.update(kind='issue', state=j.get('state'), title=(j.get('title') or '')[:80])\n"
+            "            else:\n"
+            "                r2 = subprocess.run(['gh', 'pr', 'view', str(n), '-R', input['repo_full'], '--json', 'state,title'], capture_output=True, text=True, timeout=30)\n"
+            "                if r2.returncode == 0:\n"
+            "                    j = json.loads(r2.stdout)\n"
+            "                    d.update(kind='pr', state=j.get('state'), merged=(j.get('state') == 'MERGED'), title=(j.get('title') or '')[:80])\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        if 'kind' in d:\n"
+            "            deps.append(d)\n"
+            "    return {'deps_json': json.dumps(deps, ensure_ascii=False)}\n"
+        ),
+        input={"body_file": INPUT.body_file, "issue_number": INPUT.issue_number,
+               "repo_full": INPUT.repo_full},
+    )
+
     # ── 1. triage：查重 + 定级（正文只经 body_file，不进 prompt）──
     triage = AGENTRUN(
         agent="glm-turbo",
@@ -68,6 +112,11 @@ def issue_pipeline(INPUT):
             "判定规则：已在 main 修复或无需改动 → invalid（notes 给 sha/链接）；"
             "已有 PR/评论正在处理但未完成 → blocked 且 blockers 写 'in-flight: <链接>'；"
             "依赖其他 issue/PR 未就绪 → blocked 并列编号；其余 → actionable。\n"
+            "依赖门（硬判据，依据管线预检 {% $NODE.deps.deps_json %}，勿自行重查）："
+            "条目 kind=issue 且 state=OPEN，或 kind=pr 且 merged 非 true，都表示该依赖的实现尚未合入 main；"
+            "只要本 issue 的工作依赖这类条目 → 必须 verdict=blocked 并列编号，"
+            "严禁在本次处理中就地实现依赖项的功能（实现依赖=越权，会被审查叫停）。"
+            "仅当条目标题与本题明显无关（正文误引用）才可忽略，并在 notes 说明。\n"
             "risk=high 仅当涉及安全/数据删除/发布流程/大面积 API 变更；kind=bug|feature|docs|tracking；"
             "acceptance 给 2-4 条可验证标准；commit_message 给 conventional 风格建议（含 issue 号）。\n"
             "只输出一行严格 JSON："
@@ -158,14 +207,17 @@ def issue_pipeline(INPUT):
         )
         return {"status": "invalid", "posted": post_invalid.posted}
 
-    # ── 2. 同步远端 + 独立 worktree（main_clone 新鲜度不靠外部约定）──
+    # ── 2. 同步远端 + 独立 worktree（基线显式取 origin/main，防基线污染：
+    #        本地 main 领先 origin 时 pull --ff-only 是 no-op，从本地 HEAD 切分支
+    #        会把未推送提交打包进新分支——必须以 origin/main 为基）──
     git_sync = CAPTURE(
-        command=["git", "-C", INPUT.main_clone, "pull", "--ff-only", "origin"],
+        command=["git", "-C", INPUT.main_clone, "fetch", "origin", "--prune"],
         timeout_secs=180,
     )
     CAPTURE(
         id="wt_add",
-        command=["git", "-C", INPUT.main_clone, "worktree", "add", INPUT.worktree_dir, "-b", INPUT.branch_name],
+        command=["git", "-C", INPUT.main_clone, "worktree", "add", INPUT.worktree_dir,
+                 "-b", INPUT.branch_name, "origin/main"],
         timeout_secs=120,
     )
     investigate = AGENTRUN(
@@ -539,10 +591,10 @@ def issue_pipeline(INPUT):
             "    def sh(args, cwd=None):\n"
             "        return subprocess.run(args, cwd=cwd or mc, capture_output=True, text=True, timeout=300)\n"
             "    sh(['git', 'fetch', 'origin'])\n"
-            "    r1 = sh(['git', 'merge', '--ff-only', 'origin/main'])\n"
+            "    r1 = sh(['git', 'merge', '--ff-only', 'origin/' + br])\n"
             "    if r1.returncode != 0:\n"
             "        sh(['git', 'merge', '--abort'])\n"
-            "        return {'merged': False, 'note': 'ff 合并失败（main 已前进），分支已推送，请人工合并'}\n"
+            "        return {'merged': False, 'note': 'ff 合并失败（main 已前进或分支未推送），分支在远端，请人工合并'}\n"
             "    r2 = sh(['git', 'push', 'origin', 'HEAD:main'])\n"
             "    return {'merged': r2.returncode == 0,"
             " 'note': '已 ff 合并推送 main' if r2.returncode == 0 else '合并成功但推送失败'}\n"
@@ -576,6 +628,8 @@ def issue_pipeline(INPUT):
             "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
             "        t = re.sub(pat, rep, t)\n"
             "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
+            "    # 落地事实由管线追加（模板统一给出，agent 自由文本只讲技术内容）：\n"
+            "    t = t + '\\n\\n---\\n*管线核验：分支 ' + str(input.get('branch_name')) + ' · 推送=' + str(input.get('pushed')) + ' · ' + str(input.get('merged_note')) + '*'\n"
             "    p = input['artifact_dir'] + '/reply.md'\n"
             "    open(p, 'w', encoding='utf-8').write(t)\n"
             "    chk = subprocess.run(['gh', 'issue', 'view', str(input['issue_number']), '-R', input['repo_full'], '--json', 'comments', '--jq', '.comments | map(select(.body | contains(\"<!-- issue-pipeline -->\"))) | length'], capture_output=True, text=True, timeout=60)\n"
@@ -585,7 +639,9 @@ def issue_pipeline(INPUT):
             "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
         ),
         input={"text": reply.text, "artifact_dir": INPUT.artifact_dir,
-               "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+               "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full,
+               "branch_name": INPUT.branch_name, "pushed": deliver.pushed,
+               "merged_note": merge.note},
     )
     kanban = CODE.python(
         sandbox_backend="unsafe",

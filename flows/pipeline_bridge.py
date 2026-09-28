@@ -35,6 +35,15 @@ def append_ledger(record: dict) -> None:
         pass  # 台账失败不影响主管线
 
 
+def normalize_result(result: dict) -> dict:
+    """key 归一化：早退路径历史返回 posted，成功路径返回 comment_posted——
+    在出口统一补齐别名，keeper 兜底判定只看 comment_posted，
+    flow 新增早退路径不必各写各的（issue #1「未发出回评」误报根因）。"""
+    if "comment_posted" not in result:
+        result["comment_posted"] = result.get("posted", False)
+    return result
+
+
 def main() -> None:
     t0 = time.time()
     payload = json.load(sys.stdin)
@@ -48,6 +57,8 @@ def main() -> None:
     except Exception as e:  # 引擎层异常（含超时）：结构化为失败结果，让 keeper 兜底回评
         result = {"status": "engine_error", "error": str(e)[:500]}
         ok = False
+
+    result = normalize_result(result)
 
     append_ledger({
         "ts": started,

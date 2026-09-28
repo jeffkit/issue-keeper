@@ -13,28 +13,29 @@
 
 ```
 screener闸(INPUT.screener_verdict != safe → 拒评短路)
-└─ triage(agent, 查重+定级, 正文只经 body_file)
-   ├─ blocked(依赖未就绪/已有在途) → 回评 → END
-   ├─ invalid(已在 main 修复/无需改动) → 回评 → END        ← #17 重派问题根治
-   └─ actionable
-      └─ git pull --ff-only（clone 新鲜度）
-         └─ worktree add（并发隔离）
-            └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
-               └─ plan(agent 10min) → 02-plan.md（含 COMMIT_MESSAGE）
-                  └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
-                     └─ implement(agent 30min, 禁 .github/**, 不 commit/push)
-                        └─ 无改动 → 回评 → END
-                           └─ review(agent=deepseek-flash 独立审查, 解析失败=abort)
-                              ├─ abort → 回评 → END
-                              ├─ fix → fix_review(实施方按指令修)
-                              └─ approve ▼
-                                 gate(INPUT.test_command, 20min)  ← per-repo 配置，非写死
-                                 ├─ fail → fix_test(15min) → retest
-                                 │           └─ 仍 fail → 回评「在本地 worktree 未推送」→ END
-                                 └─ pass → diff护栏(.github/**、>800行 → 待人工)
-                                    └─ document → deliver(幂等 commit/push)
-                                       └─ push_mode=main → ff-only 合并（带 fetch 重试）
-                                          └─ reply(消毒+去重) → kanban → END
+└─ deps预检(正文 #N 引用 → gh 查 issue/PR 状态 → deps_json)
+   └─ triage(agent, 查重+定级, 正文只经 body_file；依赖门硬判据)
+      ├─ blocked(依赖未就绪/已有在途) → 回评 → END
+      ├─ invalid(已在 main 修复/无需改动) → 回评 → END        ← #17 重派问题根治
+      └─ actionable
+         └─ git fetch --prune（clone 新鲜度）
+            └─ worktree add（并发隔离，基线显式 origin/main，防夹带本地未推送提交）
+               └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
+                  └─ plan(agent 10min) → 02-plan.md（含 COMMIT_MESSAGE）
+                     └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
+                        └─ implement(agent 30min, 禁 .github/**, 不 commit/push)
+                           └─ 无改动 → 回评 → END
+                              └─ review(agent=deepseek-flash 独立审查, 解析失败=abort)
+                                 ├─ abort → 回评 → END
+                                 ├─ fix → fix_review(实施方按指令修)
+                                 └─ approve ▼
+                                    gate(INPUT.test_command, 20min)  ← per-repo 配置，非写死
+                                    ├─ fail → fix_test(15min) → retest
+                                    │           └─ 仍 fail → 回评「在本地 worktree 未推送」→ END
+                                    └─ pass → diff护栏(.github/**、>800行 → 待人工)
+                                       └─ document → deliver(幂等 commit/push)
+                                          └─ push_mode=main → fetch + ff 合并 origin/<branch> → push main
+                                             └─ reply(消毒+去重+管线核验尾行) → kanban → END
 ```
 
 ## 对三方审查的处置
@@ -43,7 +44,8 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
 独立 review（deepseek-flash 异构模型 + fail-safe abort）、质量门命令参数化、
 HITL 条件化+未批准即停、partial/hold 如实「未推送」、deliver/回评幂等（标记去重+
 ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害前消毒
-（本机路径/密钥模式 → [REDACTED]）、git pull 同步、triage 区分 invalid/blocked-in-flight、
+（本机路径/密钥模式 → [REDACTED]）、git fetch 同步（origin/main 基线）、
+triage 区分 invalid/blocked-in-flight、
 解析失败 fail-safe（triage→blocked 人工复核；review→abort）。
 
 **部署强制项（README 职责，不落 flow）**：
@@ -62,6 +64,25 @@ ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害�
 - per-repo 队列化（同仓并发 1-2）+ 单 run SLA 告警；共享 CARGO_TARGET_DIR/sccache
   降冷构建成本。
 - 大题拆分：#25/#26/#29 这类 refactor milestone 在 screener 或提示词层拆小。
+- umbrella tracking issue 注入 triage（依赖预检已覆盖 #N 引用；tracking 正文关联
+  需先约定 umbrella 标记元数据）。
+
+## issue #1 复盘处置（2026-09-28）
+
+1. **「未发出回评」误报**：早退路径返回 `posted` 而成功路径返回 `comment_posted`，
+   keeper 兜底判定只看后者 → 所有早退终态都被误报「管线异常终止」。修复：bridge 出口
+   key 归一化 + keeper 双读；兜底文案区分引擎异常与终态未回评。
+2. **基线污染**：`pull --ff-only` 在本地 main 领先 origin 时 no-op，worktree 从本地
+   HEAD 切分支夹带未推送提交（`origin/e2e/issue-34` 即此机制）。修复：fetch + 显式以
+   `origin/main` 为 worktree 基线。
+3. **merge 合并错对象**：push_mode=main 时 `merge --ff-only origin/main` 只同步了
+   main，分支内容从未进 main，却回报「已 ff 合并推送 main」。修复：ff 合并
+   `origin/<branch>`。
+4. **落地判定信 agent 自由文本**：成功回评尾部改由管线追加核验行（分支/推送/合并
+   事实，取自 deliver/merge 节点返回值），agent 自由文本只讲技术内容。
+5. **依赖门无输入可判**：新增 deps 预检节点（正文 #N 引用 → gh 查状态）注入 triage，
+   「依赖未合入 main → blocked + 禁止就地实现依赖」写成硬判据（误引用可在 notes
+   说明后忽略）。
 
 ## 输入契约（keeper → run）
 
@@ -84,6 +105,11 @@ ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害�
 返回（end output）：`{status: done|rejected|blocked|invalid|nochange|abort|partial|
 guarded|onhold, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
 keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警。
+
+**comment_posted 归一化**：成功路径直接返回 `comment_posted`；业务早退路径历史返回
+`posted`——`pipeline_bridge.py` 在出口统一补齐别名（缺 `comment_posted` 时用 `posted`
+填充，引擎异常无 `posted` 则为 false）。keeper 侧兼容双读。早退终态已发回评 ≠ 故障，
+告警文案区分「引擎异常无回评」与「终态但回评未发出」（issue #1 误报修复）。
 
 ## 已知缺口（按优先级）
 

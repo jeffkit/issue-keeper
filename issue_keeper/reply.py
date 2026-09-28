@@ -146,6 +146,8 @@ def polish(text: str, cfg: ReplyPolishConfig, *, source_label: str = "") -> str:
     if not cfg.enabled:
         return safe_text
     if len(safe_text) < cfg.min_chars:
+        log.info("[%s] reply_polish 原文 %d 字符 < %d，跳过改写（发布消毒原文）",
+                 source_label, len(safe_text), cfg.min_chars)
         return safe_text
     if not (cfg.api_key and cfg.base_url and cfg.model):
         log.warning("[%s] reply_polish 凭据不完整，跳过改写（已消毒原文）", source_label)
@@ -168,4 +170,5 @@ def polish(text: str, cfg: ReplyPolishConfig, *, source_label: str = "") -> str:
         log.warning("[%s] reply_polish 返回空改写，发布消毒原文", source_label)
         return safe_text
     # 改写结果也可能复述原文里的路径/密钥——再过一遍消毒
+    log.info("[%s] reply_polish 走 LLM 改写（%d → %d 字符）", source_label, len(safe_text), len(out))
     return sanitize(out)

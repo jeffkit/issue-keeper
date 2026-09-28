@@ -331,13 +331,17 @@ def _process_resource(
                     _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
                                actor_type="agent", comment="管线异常，回退")
                     return 0
-                if not pres.get("comment_posted"):
+                if not pres.get("comment_posted", pres.get("posted")):
                     # D1/D2 兜底：管线没发出任何回评 → keeper 补一条（带 bot marker 防循环）
+                    # key 双读兼容旧 bridge；文案区分引擎异常与「终态但回评未发出」
+                    if pres.get("status") == "engine_error":
+                        reason = "管线引擎异常终止（未发出回评）"
+                    else:
+                        reason = f"管线终态（status={pres.get('status')}），但未确认发出回评"
                     try:
                         src.post_comment(
                             binding.repo, res,
-                            f"{config.bot_marker}\n[issue-pipeline] 管线异常终止"
-                            f"（status={pres.get('status')}，未发出回评），请人工查看。")
+                            f"{config.bot_marker}\n[issue-pipeline] {reason}，请人工查看。")
                     except Exception as e:
                         log.error("[%s] 兜底回评失败: %s", label, e)
                 it.processed = True
