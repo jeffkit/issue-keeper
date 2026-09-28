@@ -128,7 +128,7 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
   `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
   改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
   semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
-  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.0**。
+  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.1**（1.0.1：review/fix_review 600→1800s）。
 - **观测上报**：`payload.observability_redis` 非空时，每次 run 写
   `plaita:execution:{id}`（console 执行列表/详情可见，30 天过期）+ 逐节点
   publish `plaita:execution:events:{id}`（`/executions/{id}/stream` SSE 实时
@@ -152,3 +152,21 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
    commit 进 origin/main——即清 processed 重跑，治「blocked 即永久沉默」）。**未做**：
    批次指挥 LLM（隐式依赖/并行分组/umbrella 上下文注入 triage INPUT），应做成
    plaita flow 走 console 发布流，与 supervisor 方向同构。
+5. **`sandbox_backend` 没进 IR（2026-09-28 发现，上游 plaita 的编译器）**：@flow 源码给
+   每个 code 节点都写了 `sandbox_backend="unsafe"`（本机可信部署的本意），但编译产物
+   （`issue-pipeline.flow.json` 与 console 已发布定义）里该字段是 `None`，运行期只能吃
+   `register_code_node(default_backend="subprocess")`——于是 deliver/merge 这类要跑
+   `git push` 的节点被 10s 墙钟掐死，#41（deliver）、#45 孤儿 run（merge）都是
+   「push 已成功、包装层被杀」的假失败。bridge 侧已兜底 `PLAITA_SANDBOX_TIMEOUT=900`
+   （见 `pipeline_bridge.ensure_sandbox_timeout`），**根因仍应修编译器**。
+6. **deliver 早退不 commit（2026-09-28 发现）**：`deliver` 见分支已在远端就直接返回
+   `pushed=True`，跳过 `git add/commit/push`——重复投递时工作区里新产生的改动被静默
+   丢弃（#45：第二份 run 的改动没进任何提交，只留在 worktree）。重跑语义要么先比
+   `HEAD` 与远端，要么无条件 commit 后再判 push。
+7. **`wt_add` 非幂等（2026-09-28 发现）**：`git worktree add <dir> -b <branch> origin/main`
+   在 worktree/分支已存在时失败，而 capture 节点对非零退出不中止流程——于是重投会
+   静默复用**旧的** worktree 基线（#45 的两份「实施记录」正是两个 run 挤在同一
+   worktree）。应在 `wt_add` 前判存在并显式 reset 到 `origin/main`。
+8. **keeper 串行阻塞（2026-09-28）**：`_invoke_pipeline` 同步等 bridge，单 run 最长
+   `pipeline_timeout_secs`（5400s），期间整个 17 仓轮询停摆（#45 实测卡 28 分钟）。
+   与第 4 条的 per-repo 队列化一并做。
