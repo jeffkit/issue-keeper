@@ -326,7 +326,7 @@ def _process_resource(
 
             # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
             if config.pipeline_mode:
-                pres = _invoke_pipeline(config, binding, res, label)
+                pres = _invoke_pipeline(src, config, binding, res, label)
                 if pres is None:
                     _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
                                actor_type="agent", comment="管线异常，回退")
@@ -343,7 +343,7 @@ def _process_resource(
                 it.processed = True
                 handled += 1
                 status = pres.get("status", "")
-                if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
+                if status in ("partial", "guarded", "onhold", "abort", "engine_error", "basemismatch"):
                     _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
                                actor_type="agent", comment=f"pipeline {status}，待人工")
                 else:
@@ -773,7 +773,47 @@ def _author_over_limit(config, author: str | None) -> bool:
     return n >= config.author_daily_limit
 
 
-def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
+def _dependency_payload(src, config, binding, res, artifact_dir) -> tuple:
+    """解析 issue 顶部「**依赖 issue**：#22、#25」行，拉取依赖 issue 状态与正文。
+
+    失败降级为空列表（不 block 主流程）。返回 (dependency_issues, umbrella_body_file)。
+    """
+    import re as _re
+
+    deps: list[dict] = []
+    umbrella = ""
+    notes = ""
+    body = res.body or ""
+    m = _re.search(r"^\*{0,2}依赖\s*issue\*{0,2}\s*[：:]\s*(.+)$", body, _re.M)
+    nums = [int(n) for n in (_re.findall(r"#(\d+)", m.group(1)) if m else [])]
+    for n in nums:
+        try:
+            dep = src.get_issue(binding.repo, res.kind, n)
+        except Exception as e:
+            notes += f"依赖 #{n} 拉取失败: {e}; "
+            continue
+        if dep is None:
+            notes += f"依赖 #{n} 不存在; "
+            continue
+        bf = artifact_dir / f"dep-{n}.md"
+        bf.write_text((dep.body or "")[:16000], encoding="utf-8")
+        deps.append({"number": n, "state": dep.state or "", "title": dep.title or "",
+                     "body_file": str(bf)})
+    umbrella_no = (config.pipeline_umbrella_issues or {}).get(binding.repo)
+    if umbrella_no:
+        try:
+            umb = src.get_issue(binding.repo, res.kind, umbrella_no)
+        except Exception as e:
+            notes += f"umbrella #{umbrella_no} 拉取失败: {e}; "
+            umb = None
+        if umb is not None:
+            umbrella = str(artifact_dir / "umbrella.md")
+            (artifact_dir / "umbrella.md").write_text((umb.body or "")[:16000],
+                                                      encoding="utf-8")
+    return deps, umbrella, notes
+
+
+def _invoke_pipeline(src, config, binding, res, label: str) -> dict | None:
     """以子进程跑 issue-pipeline flow（bridge），返回 RESULT dict；异常返回 None。
 
     子进程 start_new_session + 超时 killpg：flow 内部还会再起 recursive/claude
@@ -813,6 +853,11 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         "review_mode": config.pipeline_review_mode,
         "push_mode": config.pipeline_push_mode,
     }
+    deps, umbrella, dep_notes = _dependency_payload(src, config, binding, res, artifact_dir)
+    payload["dependency_issues"] = deps
+    payload["umbrella_body_file"] = umbrella or ""
+    if dep_notes:
+        payload["notes"] = dep_notes
 
     log.info("[%s] 提交 issue-pipeline run (push_mode=%s, review_mode=%s)",
              label, payload["push_mode"], payload["review_mode"])
@@ -850,7 +895,7 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
             try:
                 pres = json.loads(line[len("RESULT "):])
                 status = pres.get("status")
-                posted = pres.get("comment_posted")
+                posted = pres.get("comment_posted", pres.get("posted"))
             except Exception:
                 pass
     if status is None:

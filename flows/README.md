@@ -77,13 +77,19 @@ ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害�
   "artifact_dir": "/Users/kong/.issue-keeper/pipeline/recursive-17",
   "test_command": "cargo test --workspace",        // per-repo；空=跳过质量门并注明
   "review_mode": "auto",                           // auto | human（human 且 high 才 HITL）
-  "push_mode": "branch"                            // branch(默认) | main
+  "push_mode": "branch",                           // branch(默认) | main
+  "dependency_issues": [                           // 依赖门：issue 顶部「**依赖 issue**：#22」解析产物
+    {"number": 22, "state": "open", "title": "...",
+     "body_file": "<artifact_dir>/dep-22.md"}],    // 拉取失败降级为 [] + notes 注明
+  "umbrella_body_file": "<artifact_dir>/umbrella.md" // 配 pipeline_umbrella_issues 才有，空串=无
 }
 ```
 
 返回（end output）：`{status: done|rejected|blocked|invalid|nochange|abort|partial|
-guarded|onhold, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
+guarded|onhold|basemismatch, tests_passed, pushed, merged, gitfacts, comment_posted, kanban_ok}`。
 keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警。
+所有早退出害口的回评发布结果统一用 `comment_posted` 键（bridge/keeper 双侧归一兜底 `posted`）；
+`basemismatch` = 本地默认分支与 origin 不一致，worktree 未创建，需人工对齐基线后重跑。
 
 ## 已知缺口（按优先级）
 

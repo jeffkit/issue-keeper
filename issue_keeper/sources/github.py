@@ -206,6 +206,18 @@ class GitHubSource(IssueSource):
         except RuntimeError:
             return ""
 
+    def get_issue(self, repo: str, kind: str, number: int) -> Resource | None:
+        """按编号查单个 issue/PR（任意状态）。"""
+        try:
+            raw = _run_gh([
+                "issue" if kind == "issue" else "pr", "view", str(number),
+                "-R", repo, "--json", "number,state,body,title,author,createdAt,labels,url",
+            ])
+            row = json.loads(raw)
+        except Exception:
+            return None
+        return _row_to_resource(row, kind, repo)
+
     def web_url(self, repo: str, resource: Resource) -> str:
         return _gh_url(repo, resource)
 
@@ -354,6 +366,15 @@ class GitHubTokenSource(IssueSource):
             except RuntimeError:
                 self._identity = ""
         return self._identity
+
+    def get_issue(self, repo: str, kind: str, number: int) -> Resource | None:
+        """按编号查单个 issue/PR（任意状态），REST API 版。"""
+        path = f"/repos/{repo}/issues/{number}"
+        try:
+            row = self._api(path) or {}
+        except RuntimeError:
+            return None
+        return _row_to_resource(row, "pr" if "pull_request" in row else kind, repo)
 
     def web_url(self, repo: str, resource: Resource) -> str:
         return _gh_url(repo, resource)

@@ -44,6 +44,8 @@ def main() -> None:
     try:
         result = flow.run(**payload)
         result = result if isinstance(result, dict) else {"status": str(result)}
+        if "comment_posted" not in result:
+            result["comment_posted"] = result.get("posted")  # 早退键归一（防旧 JSON 产物）
         ok = True
     except Exception as e:  # 引擎层异常（含超时）：结构化为失败结果，让 keeper 兜底回评
         result = {"status": "engine_error", "error": str(e)[:500]}
