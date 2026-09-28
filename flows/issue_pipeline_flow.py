@@ -303,7 +303,10 @@ def issue_pipeline(INPUT):
     implement = AGENTRUN(
         agent="glm-52",
         repo=INPUT.worktree_dir,
-        timeout_secs=1800,
+        # 2700（2026-09-28 由 1800 上调）：#40（parallel 死锁）在 1800s 被掐，
+        # worktree 里已有一份可观的部分实现——实现段对"要读并发代码+改多处"的
+        # issue 偏紧。与 keeper 的 pipeline_timeout_secs 联动（见 config.yaml）。
+        timeout_secs=2700,
         prompt=(
             "你是实现工程师，严格按 {% $INPUT.artifact_dir %}/02-plan.md 实施（背景 01-investigation.md）。"
             "约束：只改计划内文件（计划有误可在允许范围内调整并追加到 02-plan.md「## 实施记录」）；"
