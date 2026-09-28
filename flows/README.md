@@ -88,6 +88,20 @@ triage 区分 invalid/blocked-in-flight、
    「依赖未合入 main → blocked + 禁止就地实现依赖」写成硬判据（误引用可在 notes
    说明后忽略）。
 
+## issue #43 复盘处置（2026-09-28）
+
+`verdict` 节点的 review 判定解析用「第一个 `{` 到最后一个 `}`」切片。正文里一旦出现
+花括号（#43 的正文恰好是 `"preset resolves to: type={}, model={}"`），切片就把正文和
+JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 分钟白跑，回评只说
+「独立审查未给出可解析结论」，从外部完全看不出是解析器的锅（review 其实老老实实输出了
+`{"verdict":"fix",...}`，还在 notes 里指出了 `cargo fmt --check` 失败这个真问题）。
+
+修复：先逐行从后往前找严格 JSON（提示词本来就要求「输出一行严格 JSON」），再退化到
+「最后一个 `{` 到最后一个 `}`」；fail-safe 语义（解析不出 = abort）不变，且区分
+「解析不出」与「解析出但 verdict 非法」两种文案。回归：
+`tests/test_flow_verdict_parser.py`（含 #43 原文形态 + 反证旧写法失败）。
+已发布 console **v1.0.3**。
+
 ## 输入契约（keeper → run）
 
 ```json
@@ -132,7 +146,7 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
   `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
   改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
   semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
-  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.2**（1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式
+  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.3**（1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式
    `sandbox_backend="subprocess"`——编译器修好后节点级字段才真正进 IR）。
 - **观测上报**：`payload.observability_redis` 非空时，每次 run 写
   `plaita:execution:{id}`（console 执行列表/详情可见，30 天过期）+ 逐节点
