@@ -110,6 +110,17 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
 失败测试再跑 cargo，而 worktree 的 `target/` 是空的，冷构建常十几分钟；#42 同节点 381s）。
 两处一并发布 console **v1.0.4**。
 
+## v1.0.5（2026-09-28）：document 提示词 + 质量门转真
+
+- **`document` 段会张冠李戴**：#43 落地时发现它写的 CHANGELOG 条目描述的是 **#45** 的改动
+  （编号与内容都不对）。根因是提示词只说「按本仓惯例补一行」，没告诉它「这次改了什么」，
+  它就自己猜。现在注入本 issue 号/标题 + `$NODE.parsed.commit_message`，并要求先 `git diff`
+  + `git status -uall` 再动笔、条目必须如实描述本次 diff、拿不准就 SKIP。
+- **recursive 的质量门由空转真**：`pipeline_test_commands["jeffkit/recursive"]` 原本是空串，
+  gate 节点跑 `true` 恒过——回评里的「质量门已通过」其实只来自 agent 自述。现在设为
+  `cargo fmt --all --check && cargo test --workspace --no-fail-fast`（门预算 1200s；失败会走
+  `fix_test`/如实回评，不会静默放行）。若开始超时，收窄成按 crate 的 `-p` 列表。
+
 ## 输入契约（keeper → run）
 
 ```json

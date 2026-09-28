@@ -307,7 +307,7 @@
    "agent": "glm-turbo",
    "repo": "$INPUT.worktree_dir",
    "timeout_secs": 300,
-   "prompt": "按本仓惯例补文档：有 CHANGELOG.md 在 Unreleased 加一行；有 journal/milestone 机制按先例补最简记录；没有就什么都不改。不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP",
+   "prompt": "按本仓惯例补文档，**只针对本次改动**：先跑 `git diff` 与 `git status -uall` 看清这次改了什么，再动笔。\n本 issue：{% $INPUT.repo_full %} #{% $INPUT.issue_number %}《{% $INPUT.title %}》，建议提交信息：{% $NODE.parsed.commit_message %}。\nCHANGELOG.md（若有）Unreleased 段加 1-2 条**如实描述本次 diff** 的条目，编号必须写本 issue 号；严禁抄写/改编别处的历史条目来凑数（编号写错=事故，2026-09-28 有过一次把 A 的改动记成 B）。journal/milestone 按先例补最简记录；没有这些机制就什么都不改；拿不准就 SKIP。\n不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP",
    "next": "deliver",
    "source_line": 585
   },
@@ -324,7 +324,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "merge",
-   "source_line": 594
+   "source_line": 599
   },
   {
    "type": "code",
@@ -338,7 +338,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "reply",
-   "source_line": 616
+   "source_line": 621
   },
   {
    "type": "agentrun",
@@ -348,7 +348,7 @@
    "timeout_secs": 180,
    "prompt": "为 GitHub issue 写处理完成评论（直接给正文）。这是对外发布的最终评论，不是工作汇报。素材（自己读文件，不要臆造）：调查 {% $INPUT.artifact_dir %}/01-investigation.md、计划与实施记录 {% $INPUT.artifact_dir %}/02-plan.md。事实：本仓测试命令={% $INPUT.test_command %}（为空则如实注明「本仓未配置统一测试命令，质量门为独立 review」）；质量门 passed={% $NODE.gate.passed %}；分支 {% $INPUT.branch_name %}；推送 pushed={% $NODE.deliver.pushed %}；合并备注 {% $NODE.merge.note %}。issue 礼仪：结论先行（做了什么 + commit/分支/PR 等可核验引用）；只写根因/方案要点、改动文件清单、测试情况、在哪 review；不要叙述工作过程（不要「我先调查…然后实现…」这类经过），不要写内部状态（如「本地未推送」），不要出现任何本机路径或凭据信息。首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。",
    "next": "post",
-   "source_line": 637
+   "source_line": 642
   },
   {
    "type": "code",
@@ -366,7 +366,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "kanban",
-   "source_line": 655
+   "source_line": 660
   },
   {
    "type": "code",
@@ -379,7 +379,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "_n10",
-   "source_line": 679
+   "source_line": 684
   },
   {
    "type": "end",
@@ -393,7 +393,7 @@
     "kanban_ok": "$NODE.kanban.kanban_ok"
    },
    "resultType": "success",
-   "source_line": 693
+   "source_line": 698
   },
   {
    "type": "agentrun",

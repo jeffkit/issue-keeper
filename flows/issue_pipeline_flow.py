@@ -587,8 +587,13 @@ def issue_pipeline(INPUT):
         repo=INPUT.worktree_dir,
         timeout_secs=300,
         prompt=(
-            "按本仓惯例补文档：有 CHANGELOG.md 在 Unreleased 加一行；有 journal/milestone 机制按先例补最简记录；"
-            "没有就什么都不改。不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP"
+            "按本仓惯例补文档，**只针对本次改动**：先跑 `git diff` 与 `git status -uall` 看清这次改了什么，再动笔。\n"
+            "本 issue：{% $INPUT.repo_full %} #{% $INPUT.issue_number %}《{% $INPUT.title %}》，"
+            "建议提交信息：{% $NODE.parsed.commit_message %}。\n"
+            "CHANGELOG.md（若有）Unreleased 段加 1-2 条**如实描述本次 diff** 的条目，编号必须写本 issue 号；"
+            "严禁抄写/改编别处的历史条目来凑数（编号写错=事故，2026-09-28 有过一次把 A 的改动记成 B）。"
+            "journal/milestone 按先例补最简记录；没有这些机制就什么都不改；拿不准就 SKIP。\n"
+            "不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP"
         ),
     )
     deliver = CODE.python(
