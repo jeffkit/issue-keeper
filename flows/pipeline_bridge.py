@@ -56,6 +56,28 @@ def ensure_sandbox_timeout(default_secs: int = SANDBOX_TIMEOUT_DEFAULT_SECS) -> 
         os.environ["PLAITA_SANDBOX_TIMEOUT"] = str(default_secs)
 
 
+def ensure_shared_cargo_target(payload: dict) -> str:
+    """让管线复用主 clone 的 cargo `target/`，别在每个 worktree 里冷编译。
+
+    2026-09-28 实测：#19/#30/#40 三个 run 的 worktree 各自烘出 9.3G / 4.6G / 7.2G
+    的 `target/`，单跑 3000+ 秒里大半是编译（investigate 1444s、implement 1800s 被掐），
+    而主 clone 的 39G `target/` 本来就是热的。指向它之后 agent 段与质量门复用依赖，
+    只重编 workspace 内的 crate。
+
+    显式设了 `CARGO_TARGET_DIR` 就尊重显式值（人工调试用）。生效返回路径，未生效返回 ""。
+    """
+    if os.environ.get("CARGO_TARGET_DIR", "").strip():
+        return ""
+    main_clone = str(payload.get("main_clone") or "").strip()
+    if not main_clone:
+        return ""
+    if not (pathlib.Path(main_clone) / "Cargo.toml").is_file():
+        return ""
+    target = pathlib.Path(main_clone) / "target"
+    os.environ["CARGO_TARGET_DIR"] = str(target)
+    return str(target)
+
+
 ensure_sandbox_timeout()
 
 import plaita_nodes  # noqa: F401,E402
@@ -316,6 +338,11 @@ def main() -> None:
     t0 = time.time()
     payload = json.load(sys.stdin)
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    shared_target = ensure_shared_cargo_target(payload)
+    if shared_target:
+        print(f"[bridge] CARGO_TARGET_DIR={shared_target}"
+              "（复用主 clone 已烘热的依赖，避免每个 worktree 冷编译）", file=sys.stderr)
 
     console = payload.get("console") or {}
     definition, flow_source, flow_version = resolve_definition(console if console.get("url") else None)

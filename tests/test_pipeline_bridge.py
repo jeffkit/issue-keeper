@@ -75,3 +75,34 @@ def test_sandbox_timeout_explicit_env_wins(monkeypatch):
     monkeypatch.setenv("PLAITA_SANDBOX_TIMEOUT", "120")
     bridge.ensure_sandbox_timeout()
     assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "120"
+
+
+# ── 共享 cargo target（2026-09-28：#19/#30/#40 的 worktree 各自冷编译）──────────
+
+def test_shared_cargo_target_points_at_main_clone(monkeypatch, tmp_path):
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    (tmp_path / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+    got = bridge.ensure_shared_cargo_target({"main_clone": str(tmp_path)})
+    assert got == str(tmp_path / "target")
+    assert os.environ["CARGO_TARGET_DIR"] == str(tmp_path / "target")
+    # 助手直接写 os.environ，monkeypatch 撤不掉 → 显式收回，别漏给后面的测试
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+
+
+def test_shared_cargo_target_respects_explicit_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("CARGO_TARGET_DIR", "/tmp/explicit-target")
+    (tmp_path / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+    assert bridge.ensure_shared_cargo_target({"main_clone": str(tmp_path)}) == ""
+    assert os.environ["CARGO_TARGET_DIR"] == "/tmp/explicit-target"
+
+
+def test_shared_cargo_target_skips_non_rust_repos(monkeypatch, tmp_path):
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    assert bridge.ensure_shared_cargo_target({"main_clone": str(tmp_path)}) == ""
+    assert "CARGO_TARGET_DIR" not in os.environ
+
+
+def test_shared_cargo_target_skips_missing_main_clone(monkeypatch):
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    assert bridge.ensure_shared_cargo_target({}) == ""
+    assert bridge.ensure_shared_cargo_target({"main_clone": ""}) == ""
