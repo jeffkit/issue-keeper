@@ -35,6 +35,29 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita")
 sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita-nodes/src")
 
+# plaita 的 code 节点把整段 run() 包在 subprocess 沙箱里，wall-clock 上限取
+# import 时刻的 PLAITA_SANDBOX_TIMEOUT（默认 10s，见 plaita/node/code.py）。
+# 本 flow 的 deliver / merge 节点要跑 git ls-remote / commit / push（网络 IO），
+# 10s 常态不够——2026-09-28 实证：#41 死在 deliver、#45 的孤儿 run 死在 merge，
+# 都是「push 其实已经成功、包装层被墙钟杀掉」的假失败。
+# flow 源码本意是 sandbox_backend="unsafe"（本机可信部署），但 @flow 编译器没把
+# 这个 kwarg 带进 IR，运行期只能吃 register_code_node 的 subprocess 默认值。
+# 这里把预算放宽（env 可覆盖）；编译器/IR 的根因另记，不靠这一步掩盖。
+SANDBOX_TIMEOUT_DEFAULT_SECS = 900
+
+
+def ensure_sandbox_timeout(default_secs: int = SANDBOX_TIMEOUT_DEFAULT_SECS) -> None:
+    """没配（或配成空串）PLAITA_SANDBOX_TIMEOUT 时给个够用的默认值。
+
+    必须在本模块 import plaita 之前调用：plaita/node/code.py 在 import 期就把
+    该 env 读成模块常量，之后再改不生效；空串会让 int('') 直接抛 ValueError。
+    """
+    if not os.environ.get("PLAITA_SANDBOX_TIMEOUT", "").strip():
+        os.environ["PLAITA_SANDBOX_TIMEOUT"] = str(default_secs)
+
+
+ensure_sandbox_timeout()
+
 import plaita_nodes  # noqa: F401,E402
 from plaita.node import register_code_node  # E402
 

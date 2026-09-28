@@ -4,6 +4,7 @@
 后者 → 所有早退终态曾被误报「管线异常终止」。normalize_result 在 bridge 出口补齐别名。
 """
 import importlib.util
+import os
 import pathlib
 import sys
 
@@ -51,3 +52,26 @@ def test_success_path_comment_posted_untouched():
 def test_engine_error_without_posted_defaults_false():
     out = bridge.normalize_result({"status": "engine_error", "error": "boom"})
     assert out["comment_posted"] is False
+
+
+# ── code 节点沙箱预算（#41 deliver / #45 merge 假失败的回归）──────────
+# flow 的 deliver/merge 要跑 git ls-remote/commit/push，plaita 的 subprocess
+# 沙箱默认只给 10s，包装层被墙钟杀掉但 push 已经落地 → 假失败。
+
+def test_sandbox_timeout_default_is_not_the_10s_killer(monkeypatch):
+    monkeypatch.delenv("PLAITA_SANDBOX_TIMEOUT", raising=False)
+    bridge.ensure_sandbox_timeout()
+    assert int(os.environ["PLAITA_SANDBOX_TIMEOUT"]) >= 300
+
+
+def test_sandbox_timeout_empty_string_is_replaced(monkeypatch):
+    """空串会让 plaita import 期的 int('') 抛 ValueError，必须补上。"""
+    monkeypatch.setenv("PLAITA_SANDBOX_TIMEOUT", "")
+    bridge.ensure_sandbox_timeout()
+    assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "900"
+
+
+def test_sandbox_timeout_explicit_env_wins(monkeypatch):
+    monkeypatch.setenv("PLAITA_SANDBOX_TIMEOUT", "120")
+    bridge.ensure_sandbox_timeout()
+    assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "120"
