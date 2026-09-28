@@ -143,9 +143,12 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
 1. **引擎层异常（agentrun 超时/非零退出、code 节点抛错）默认 abort 终态且当前不可续跑**，
    不经过业务出害口——「必有回评」的最终兜底在 keeper（见上），长期应推动 plaita 支持
    error 态续跑或 per-node errorHandler。
-2. **agentproc 超时不 kill 进程组**（孤儿）——agentproc/agent_run 层修复，上线前必须。
-3. 段级 checkpoint = 节点级持久化；30min 的 implement 段内部无 checkpoint，重投整段重跑
+2. 段级 checkpoint = 节点级持久化；30min 的 implement 段内部无 checkpoint，重投整段重跑
    （幂等护栏已覆盖副作用）。
-4. 修复回环仅一轮（fix_test→retest）；更长回环用 loop 节点 + 迭代上限（v0.3）。
-5. 未做端到端真跑；首跑建议草稿 issue + 注册 dry-run 变体 flow 版本
-   （注意 dry_run 是 globalContext 而非输入参数，run 参数传不进去）。
+3. 修复回环仅一轮（fix_test→retest）；更长回环用 loop 节点 + 迭代上限（v0.3）。
+4. **批次编排已落地地板（2026-09-28），判断层待做**：keeper 侧已有 ①依赖拓扑排序
+   （`_dependency_first_order`——被依赖的 issue 先派，串行管线下依赖者开工时能看到
+   已合并成果）②依赖唤醒（blocked 记 `wakeup_deps` 监视，依赖闭合——关闭或修复
+   commit 进 origin/main——即清 processed 重跑，治「blocked 即永久沉默」）。**未做**：
+   批次指挥 LLM（隐式依赖/并行分组/umbrella 上下文注入 triage INPUT），应做成
+   plaita flow 走 console 发布流，与 supervisor 方向同构。

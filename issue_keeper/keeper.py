@@ -210,6 +210,101 @@ def _screen_or_block(
     return False
 
 
+def _extract_issue_refs(text: str) -> list[int]:
+    """正文里的 #N 引用（同仓裸数字）。去重保序，供依赖排序/唤醒监视用。"""
+    import re
+    seen: list[int] = []
+    for m in re.finditer(r"#(\d+)", text or ""):
+        n = int(m.group(1))
+        if n not in seen:
+            seen.append(n)
+    return seen
+
+
+def _dependency_first_order(resources: list, rs) -> list:
+    """未处理 issue 按依赖拓扑排序——被依赖者先行（2026-09-28 批次编排地板）。
+
+    图只建在本批未处理 issue 之间：正文 #N 引用命中批内其他未处理编号 → 被引用
+    者先跑，串行管线下依赖者的 triage/deps 预检就能看到已合并的依赖成果。
+    已处理的原序靠前（评论快扫不被长管线 run 压后）。环按原序放行，依赖正确性
+    交给 deps 预检的 blocked 兜底。
+    """
+    processed_first, pending = [], []
+    for r in resources:
+        (processed_first if rs.item(r.resource_key).processed else pending).append(r)
+    if len(pending) <= 1:
+        return processed_first + pending
+
+    index = {r.number: i for i, r in enumerate(pending)}
+    deps_of: dict[int, list[int]] = {}
+    for r in pending:
+        deps_of[r.number] = [d for d in _extract_issue_refs(r.body) if d in index and d != r.number]
+
+    ordered: list = []
+    done: set[int] = set()
+    remaining = [r.number for r in pending]
+    while remaining:
+        ready = [n for n in remaining if all(d in done for d in deps_of.get(n, []))]
+        if not ready:  # 环：按原序放行
+            ordered.extend(r for r in pending if r.number in set(remaining))
+            break
+        for n in ready:
+            ordered.append(pending[index[n]])
+            done.add(n)
+        remaining = [n for n in remaining if n not in done]
+    return processed_first + ordered
+
+
+def _wake_resolved_dependencies(src, binding, rs) -> None:
+    """依赖唤醒（2026-09-28）：blocked issue 的依赖全部闭合 → 清 processed 重跑。
+
+    闭合判定（每仓每轮一次）：依赖编号已不在 open 列表，或修复 commit 已进
+    origin/main（git log --grep #N——管线 deliver 直推 main 不会关 issue，
+    commit message 按 #17 惯例引用编号）。任何检查失败都不唤醒（保守）。
+    """
+    watched = [(int(k), it) for k, it in rs.items.items()
+               if it.wakeup_deps and it.processed and k.isdigit()]
+    if not watched:
+        return
+
+    open_numbers: set[int] | None = None
+    try:
+        kinds = ["issue"] + (["pr"] if binding.monitor_prs else [])
+        open_numbers = {r.number for r in src.list_open(binding.repo, kinds)}
+    except Exception as e:
+        log.warning("[wake] [%s] 列 open 资源失败，本轮只按 commit 判定: %s", binding.repo, e)
+
+    merged: set[int] = set()
+    import subprocess
+    from pathlib import Path
+    cwd = Path(binding.cwd).expanduser()
+    if cwd.is_dir() and (cwd / ".git").exists():
+        try:
+            all_deps = sorted({d for _, it in watched for d in it.wakeup_deps})
+            subprocess.run(["git", "-C", str(cwd), "fetch", "origin", "main", "--quiet"],
+                           timeout=120, check=False)
+            for n in all_deps:
+                r = subprocess.run(
+                    ["git", "-C", str(cwd), "log", "origin/main", "--grep", f"#{n}",
+                     "--oneline", "-1"],
+                    capture_output=True, text=True, timeout=30)
+                if r.returncode == 0 and r.stdout.strip():
+                    merged.add(n)
+        except Exception as e:
+            log.warning("[wake] [%s] git 检查失败: %s", binding.repo, e)
+
+    for num, it in watched:
+        resolved = all(
+            (d in merged) or (open_numbers is not None and d not in open_numbers)
+            for d in it.wakeup_deps
+        )
+        if resolved:
+            log.info("[wake] [%s issue#%d] 依赖 %s 已闭合，唤醒重跑", binding.repo, num, it.wakeup_deps)
+            it.wakeup_deps = []
+            it.processed = False
+            it.session_id = None
+
+
 def process_repo(
     binding: RepoBinding,
     config: Config,
@@ -247,12 +342,19 @@ def process_repo(
     if binding.monitor_prs:
         kinds.append(("pr", binding.pr_labels or binding.labels or None))
 
+    # 依赖唤醒：上轮 blocked 的 issue 若依赖已闭合，先清 processed——本轮下方
+    # 循环会把它当新 issue 重新处理（重新过 screener/管线，triage 再判一次）。
+    _wake_resolved_dependencies(src, binding, rs)
+
     for kind, labels in kinds:
         try:
             resources = src.list_open(binding.repo, [kind], labels)
         except Exception as e:
             log.error("[%s] 列出 %s 失败: %s", binding.repo, kind, e)
             continue
+
+        if kind == "issue":
+            resources = _dependency_first_order(resources, rs)
 
         for res in resources:
             handled += _process_resource(
@@ -347,6 +449,13 @@ def _process_resource(
                 it.processed = True
                 handled += 1
                 status = pres.get("status", "")
+                # 依赖唤醒监视：blocked = 依赖未就绪。记录正文引用的依赖编号，
+                # 每轮检查就绪后唤醒重跑（此前 blocked 即永久沉默——#17 教训）。
+                if status == "blocked" and res.kind == "issue":
+                    deps = [n for n in _extract_issue_refs(res.body) if n != res.number]
+                    if deps:
+                        rs.item(res.resource_key).wakeup_deps = deps
+                        log.info("[%s] blocked，监视依赖 %s 就绪后唤醒", label, deps)
                 if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
                     _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
                                actor_type="agent", comment=f"pipeline {status}，待人工")

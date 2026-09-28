@@ -19,6 +19,10 @@ class ItemState:
     session_id: str | None = None  # agent 返回的会话 uuid，用于续接
     processed_comment_ids: set[str] = field(default_factory=set)
     blocked: bool = False  # 安全过滤命中，后续不再自动处理
+    # 依赖唤醒监视（仅 issue）：pipeline 终态 blocked 时记录正文引用的依赖编号。
+    # 每轮检查——依赖全部闭合（关闭/修复已进 origin/main）→ 清 processed 唤醒重跑。
+    # 空列表 = 未在监视。
+    wakeup_deps: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -73,6 +77,7 @@ def load_state(path: Path) -> State:
             it.session_id = idata.get("session_id")
             it.processed_comment_ids = set(str(x) for x in (idata.get("processed_comment_ids") or []))
             it.blocked = bool(idata.get("blocked", False))
+            it.wakeup_deps = [int(x) for x in (idata.get("wakeup_deps") or [])]
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
     return state
@@ -89,6 +94,7 @@ def save_state(path: Path, state: State) -> None:
                     "session_id": it.session_id,
                     "processed_comment_ids": sorted(it.processed_comment_ids),
                     "blocked": it.blocked,
+                    "wakeup_deps": it.wakeup_deps,
                 }
                 for key, it in rs.items.items()
             }
