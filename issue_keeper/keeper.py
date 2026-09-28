@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime
+from pathlib import Path
 
 from .config import Config, RepoBinding, load_config
 from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
@@ -410,8 +412,11 @@ def _process_resource(
             log.info("[%s] %s 作者 %s 不在 allowlist，跳过首次回复", label, kind, res.author)
             it.processed = True
         elif _author_over_limit(config, res.author):
-            log.info("[%s] %s 作者 %s 今日触发次数已达上限，跳过", label, kind, res.author)
-            it.processed = True
+            # 故意不置 processed：日限会随日期重置、豁免名单也可能事后追加，
+            # 一旦置了 processed 就只剩「新评论」能唤醒——#19/#23/#41-#44 就是
+            # 这样被静默丢掉的（2026-09-28）。这里只推迟，不消费首次响应。
+            log.info("[%s] %s 作者 %s 今日触发次数已达上限，本轮跳过（未标记已处理，次日重试）",
+                     label, kind, res.author)
         else:
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
@@ -429,6 +434,13 @@ def _process_resource(
             # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
             if config.pipeline_mode:
                 pres = _invoke_pipeline(config, binding, res, label)
+                if pres is not None and pres.get("status") == ALREADY_RUNNING:
+                    # 同 issue 已有 run 在跑（典型：launchd KeepAlive 重启 keeper，
+                    # 旧 bridge 变成孤儿仍在改同一个 worktree）。不置 processed、
+                    # 不回评、不动看板——锁释放后下一轮自然重派，避免两个 run
+                    # 抢同一分支/同一次 main 推送。
+                    log.info("[%s] 同 issue 已有 pipeline run 在跑，本轮跳过派发", label)
+                    return 0
                 if pres is None:
                     _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
                                actor_type="agent", comment="管线异常，回退")
@@ -889,6 +901,54 @@ def _author_over_limit(config, author: str | None) -> bool:
     return n >= config.author_daily_limit
 
 
+# ── pipeline 派发互斥（2026-09-28）────────────────────────────────────
+# bridge 用 start_new_session 起独立会话：keeper 被 launchd KeepAlive 重启时，
+# 旧 bridge 不会跟着死，会继续改同一个 worktree/分支；新实例看不见它又派一份，
+# 于是同一个 issue 两个 run 并行（#45 实证：02-plan.md 里留下两份「实施记录」，
+# 且残留的 run 在 push_mode=main 下仍可能往 main 推）。
+# 锁文件里放 bridge 的 pid：pid 活着就跳过本轮派发；pid 死了视为陈旧锁清掉。
+PIPELINE_LOCK_NAME = "run.lock"
+ALREADY_RUNNING = "already_running"
+
+
+def _read_pipeline_lock(lock: Path) -> int | None:
+    try:
+        return int(lock.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """pid 是否仍存在；无权限发信号视为存在（不可误清别人的锁）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pipeline_in_flight(artifact_dir: Path) -> int | None:
+    """返回仍在跑的 bridge pid；顺带清理陈旧/损坏的锁文件。"""
+    lock = artifact_dir / PIPELINE_LOCK_NAME
+    if not lock.exists():
+        return None
+    holder = _read_pipeline_lock(lock)
+    if holder is not None and _pid_alive(holder):
+        return holder
+    lock.unlink(missing_ok=True)
+    return None
+
+
+def _release_pipeline_lock(lock: Path, pid: int) -> None:
+    """只删自己写的那把锁，避免误删后来者的。"""
+    if _read_pipeline_lock(lock) == pid:
+        lock.unlink(missing_ok=True)
+
+
 def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
     """以子进程跑 issue-pipeline flow（bridge），返回 RESULT dict；异常返回 None。
 
@@ -911,6 +971,13 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
     slug = binding.repo.split("/")[-1]
     artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{res.number}").expanduser()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    # 互斥检查必须在写 00-issue.md 之前——在跑的 run 正用着这份产物。
+    holder = _pipeline_in_flight(artifact_dir)
+    if holder is not None:
+        log.warning("[%s] 同 issue 已有 pipeline run 在跑 (pid=%s)，跳过本轮派发", label, holder)
+        return {"status": ALREADY_RUNNING, "comment_posted": True}
+
     body_file = artifact_dir / "00-issue.md"
     body_file.write_text((res.body or "")[:16000], encoding="utf-8")
 
@@ -948,6 +1015,13 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, start_new_session=True,
     )
+    # 锁里写 bridge 的 pid 而不是 keeper 自己的：keeper 被重启后 bridge 还活着，
+    # 新实例据此就能发现「这个 issue 已经有人在跑」。
+    lock = artifact_dir / PIPELINE_LOCK_NAME
+    try:
+        lock.write_text(str(proc.pid), encoding="utf-8")
+    except OSError as e:
+        log.warning("[%s] 写 pipeline 互斥锁失败（并发保护失效）: %s", label, e)
     try:
         out, err = proc.communicate(
             input=json.dumps(payload, ensure_ascii=False),
@@ -964,6 +1038,8 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
             pass
         log.error("[%s] pipeline 超时（%ss），进程组已清", label, config.pipeline_timeout_secs)
         return None
+    finally:
+        _release_pipeline_lock(lock, proc.pid)
 
     if proc.returncode != 0:
         log.error("[%s] pipeline bridge 退出码 %s: %s", label, proc.returncode,
