@@ -63,9 +63,13 @@ def append_ledger(record: dict) -> None:
 def normalize_result(result: dict) -> dict:
     """key 归一化：早退路径历史返回 posted，成功路径返回 comment_posted——
     在出口统一补齐别名，keeper 兜底判定只看 comment_posted，
-    flow 新增早退路径不必各写各的（issue #1「未发出回评」误报根因）。"""
-    if "comment_posted" not in result:
-        result["comment_posted"] = result.get("posted", False)
+    flow 新增早退路径不必各写各的（issue #1「未发出回评」误报根因）。
+    值收敛为严格布尔：显式 None（历史中间态/未接线的分支）也兜成 False，
+    keeper 侧 `not comment_posted` 判定不再被 None 迷惑（2026-09-28）。"""
+    posted = result.get("comment_posted")
+    if posted is None:
+        posted = result.get("posted")
+    result["comment_posted"] = bool(posted)
     return result
 
 
