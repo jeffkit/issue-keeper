@@ -727,7 +727,9 @@ def _compose_patrol_message(
     cmt_block = ""
     if comments:
         lines = []
-        for c in comments[-6:]:
+        # 12（2026-09-29 由 6 上调）：#40 的 must-fix 清单一度只比窗口早 1 条——keeper
+        # 自己的兜底回评会把关键评论挤出窗口，agent 就看不到上一轮审查结论了。
+        for c in comments[-12:]:
             lines.append(f"— {c.author}（{c.created_at}）：\n{c.body}")
         cmt_block = "\n\n最近评论：\n" + "\n\n".join(lines)
     return (
