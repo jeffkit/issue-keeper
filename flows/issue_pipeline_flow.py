@@ -28,23 +28,18 @@
 「终态 error 必有回评」由 keeper 侧兜底（轮询终态+无评论→补 fallback 评论）；
 agentproc 超时不 killpg 的孤儿问题需在 agentproc/agent_run 层修。
 codeflow 限制：@flow 函数内不能引用模块级常量，post 代码串按位内联。
+2026-09-29：codeflow DSL 放开表达式位置的比较/and/or/not/三元（plaita
+feat/expr-in-assignment）——reject 文案改 concat 表达式内联、risk_gate/prep
+两个胶水 code 节点删除（复合条件直写 if、`or 'true'` 直写赋值）。
 """
 
-from plaita.dsl.codeflow import CODE, ENV, flow
+from plaita.dsl.codeflow import CODE, ENV, F, flow
 
 
 @flow("issue-pipeline", desc="每 issue 一个 run：screener闸 → triage查重定级 → investigate → plan → [HITL] → implement → 独立review → 质量门(可配置命令+一轮修复) → diff护栏 → document → deliver → 消毒回评 → kanban")
 def issue_pipeline(INPUT):
     # ── 0. 入口安全闸：screener 未判 safe 一律不进 agent 段 ──
     if INPUT.screener_verdict != "safe":
-        reject = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    return {'text': '该 issue 未通过自动安全初筛（screener_verdict=' + str(input.get('v')) + '），已停止自动处理，请人工查看。'}\n"
-            ),
-            input={"v": INPUT.screener_verdict},
-        )
         post_reject = CODE.python(
             sandbox_backend="subprocess",
             code=(
@@ -55,7 +50,8 @@ def issue_pipeline(INPUT):
                 "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
                 "    return {'posted': r.returncode == 0}\n"
             ),
-            input={"text": reject.text, "artifact_dir": INPUT.artifact_dir,
+            input={"text": F.concat('该 issue 未通过自动安全初筛（screener_verdict=', INPUT.screener_verdict, '），已停止自动处理，请人工查看。'),
+                   "artifact_dir": INPUT.artifact_dir,
                    "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
         )
         return {"status": "rejected", "posted": post_reject.posted}
@@ -257,15 +253,9 @@ def issue_pipeline(INPUT):
             "只做计划不改代码。完成后只回复一行：DONE <计划要点>"
         ),
     )
-    risk_gate = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    return {'need_human': input.get('mode') == 'human' and input.get('risk') == 'high'}\n"
-        ),
-        input={"mode": INPUT.review_mode, "risk": parsed.risk},
-    )
-    if risk_gate.need_human == True:
+    # 复合条件直接写在 if 上（2026-09-29 起 codeflow DSL 支持表达式位置的比较/and/or，
+    # 不再需要 risk_gate code 节点中转算 need_human）
+    if INPUT.review_mode == "human" and parsed.risk == "high":
         approve = HITL(
             message="issue #{% $INPUT.issue_number %} 风险 high，计划在 {% $INPUT.artifact_dir %}/02-plan.md，请回复「批准」或修改意见。",
             timeout_secs=3600,
@@ -478,17 +468,9 @@ def issue_pipeline(INPUT):
         )
 
     # ── 6. 质量门：命令来自 INPUT.test_command（per-repo 绑定），留空跑 true 恒过并注明 ──
-    prep = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    cmd = (input.get('cmd') or '').strip()\n"
-            "    return {'cmd': cmd if cmd else 'true', 'has_tests': bool(cmd)}\n"
-        ),
-        input={"cmd": INPUT.test_command},
-    )
+    cmd = INPUT.test_command or 'true'
     gate = GATE(
-        command=prep.cmd,
+        command=cmd,
         gate_name="repo-tests",
         cwd=INPUT.worktree_dir,
         timeout_secs=2400,
@@ -506,7 +488,7 @@ def issue_pipeline(INPUT):
             ),
         )
         retest = GATE(
-            command=prep.cmd,
+            command=cmd,
             gate_name="repo-tests-retest",
             cwd=INPUT.worktree_dir,
             timeout_secs=2400,

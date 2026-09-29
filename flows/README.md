@@ -9,6 +9,24 @@
 >
 > 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓、全节点有出边 ✓。未做端到端真跑。
 
+## v1.0.12（2026-09-29，未发布）：expr 胶水节点清理
+
+plaita `feat/expr-in-assignment` 分支放开 codeflow DSL 表达式位置的比较/and/or/not/三元
+（编译为 `$F.eq/$F.and/…/$F.ifelse`，注册表补同名比较函数与 ifelse），据此消掉三个胶水
+code 节点，**62 → 60 节点（code 20 → 17）**：
+
+- `reject`：文案改 `F.concat(...)` 内联进 `post_reject` 的 input 表达式；
+- `risk_gate`：删除——`if INPUT.review_mode == "human" and parsed.risk == "high"`
+  直写复合条件，编译为结构化 and-ConditionGroup（console 可视化更友好）；
+- `prep`：改一行赋值 `cmd = INPUT.test_command or 'true'`，两个 GATE 引用 `$NODE.cmd`。
+
+同时 plaita 侧修正 assignment 节点两处坑：`output_type` 类型校验曾匹配原始表达式串
+（数值/布尔类型必然 miss 且静默返回 None）改为先求值再匹配、不匹配大声抛错；
+假值字面量（`0`/`False`/`""`）不再被真值判断吞掉。
+**发布前置条件：keeper daemon 重启**（daemon 常驻进程的 plaita 注册表是启动时 import 的，
+不重启执行 `$F.or/eq/ifelse` 会 NameError）。离线验证：假 `gh` shim 走 rejected
+路径全绿，`$F.concat` 在真实节点 input 求值正确。
+
 ## 管线形状（v0.2.1，编译后 61 节点）
 
 ```
