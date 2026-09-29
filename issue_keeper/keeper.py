@@ -20,7 +20,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .config import Config, RepoBinding, load_config
+from .config import Config, PipelineRepoConfig, RepoBinding, load_config
 from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
 from .reply import polish
 from .screener import ScreenerConfig, screen as screen_text
@@ -450,14 +450,19 @@ def _process_resource(
                        actor_type="agent", comment="开始处理")
 
             # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
-            if config.pipeline_mode:
+            # v0.3 per-repo 门控：无契约/无真门的仓不进管线（防空门假绿 +
+            # 硬编码基线在 develop/master 仓上出错），回退 legacy 单 agent 路径。
+            _pc, _pc_why = _pipeline_repo_cfg(config, binding) if config.pipeline_mode else (None, "")
+            if config.pipeline_mode and _pc is None:
+                log.info("[%s] 管线不适用（%s），走 legacy 单 agent 路径", label, _pc_why)
+            if config.pipeline_mode and _pc is not None:
                 in_flight = max(pipeline_in_flight, 0)
                 if in_flight >= max(1, config.pipeline_max_in_flight):
                     # 全局并发上限：不标记 processed，下轮腾出槽位再派。
                     log.info("[%s] 在途管线 run %d/%d，本轮不派发", label,
                              in_flight, config.pipeline_max_in_flight)
                     return 0
-                pres = _dispatch_pipeline(config, binding, res, it, label)
+                pres = _dispatch_pipeline(config, binding, res, it, label, pc=_pc)
                 if pres.get("status") == ALREADY_RUNNING:
                     # 同 issue 已有 run 在跑（run.lock 的 pid 活着）。不置 processed、
                     # 不回评——锁释放后下一轮自然重派。
@@ -1063,16 +1068,66 @@ def _latest_pipeline_record(repo_full: str, number: int, since_ts: float) -> dic
     return best
 
 
-def _dispatch_pipeline(config, binding, res, it, label: str) -> dict:
+# ── per-repo 管线契约解析（v0.3）────────────────────────────────────────────
+# 通用 flow 曾只参数化 test_command：基线硬编码 origin/main、push_mode 全局直推、
+# 17/18 仓空门假绿。契约化后：无真门的仓不进管线（回退 legacy 单 agent 路径），
+# readonly 仓只调查不开工，基线/安装/交付策略/仓规注入全部 per-repo。
+
+# flow 内置段预算（与 issue_pipeline_flow.py 的历史全局值一致；per-repo
+# timeout_overrides 在此之上覆盖——TS 仓可大幅调小，recursive 的长门可放大）
+_PIPELINE_SEGMENT_TIMEOUTS = {
+    "investigate": 2100, "plan": 1200, "implement": 4200,
+    "review": 2700, "fix_review": 2700, "fix_test": 900, "document": 300,
+}
+
+
+def _pipeline_repo_cfg(config: Config, binding: RepoBinding) -> tuple[PipelineRepoConfig | None, str]:
+    """解析该仓的管线契约。返回 (None, 原因) = 不进管线（回退 legacy 路径）。"""
+    pc = config.pipeline_repo_cfg(binding.repo)
+    if not pc.enabled:
+        return None, f"pipeline_repos[{binding.repo}].enabled=false"
+    if pc.mode == "readonly":
+        return pc, ""
+    if not pc.has_gate():
+        return None, (f"pipeline_repos 未登记 {binding.repo} 且无质量门——"
+                      "无真门不进管线（空门跑 true 恒过的假绿已废止），走 legacy")
+    return pc, ""
+
+
+def _gate_runner_invocation(config: Config, pc: PipelineRepoConfig, artifact_dir: Path) -> str:
+    """多门仓：写 spec 到产物目录，test_command = gate_runner 调用（argv 可执行）。"""
+    import json
+
+    runner = Path(config.pipeline_bridge).expanduser().parent / "gates" / "gate_runner.py"
+    spec = {
+        "base": pc.base_branch,
+        "gates": [{"name": g.name, "command": g.command,
+                   "timeout_secs": g.timeout_secs, "paths": g.paths}
+                  for g in pc.gates],
+    }
+    spec_file = artifact_dir / "gates.json"
+    spec_file.write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
+    return f"python3 {runner} --spec {spec_file} --cwd ."
+
+
+
+def _dispatch_pipeline(config, binding, res, it, label: str,
+                       pc: PipelineRepoConfig | None = None) -> dict:
     """后台派发一次管线 run（bridge），立即返回；完成由 _reap_pipelines 收尾。
 
     bridge 需要的 payload 走 dispatch.json 文件（后台进程不再有 stdin 可写），
     stdout/stderr 追加到 artifact_dir/bridge-<时刻>.log 供人工排查。
+    pc = per-repo 契约（v0.3）；缺省时现场解析。
     """
     import json
     import subprocess
     import sys
     import time
+
+    if pc is None:
+        # 生产路径总是先过 _pipeline_repo_cfg 门控再传入；直接调用（测试/工具）
+        # 时退到无门控解析——空门会在 flow 的 GATE 节点大声失败（不再假绿）。
+        pc = config.pipeline_repo_cfg(binding.repo)
 
     bridge = Path(config.pipeline_bridge).expanduser()
     if not bridge.exists():
@@ -1096,6 +1151,14 @@ def _dispatch_pipeline(config, binding, res, it, label: str) -> dict:
     body_file = artifact_dir / "00-issue.md"
     body_file.write_text((res.body or "")[:16000], encoding="utf-8")
 
+    # per-repo 契约（v0.3）：基线/安装/门/交付/注入全部来自 pipeline_repos 配置，
+    # 全局 pipeline_push_mode / pipeline_review_mode 仅作缺省。
+    test_command = pc.test_command.strip()
+    if pc.gates:
+        test_command = _gate_runner_invocation(config, pc, artifact_dir)
+    timeouts = dict(_PIPELINE_SEGMENT_TIMEOUTS)
+    timeouts.update({k: int(v) for k, v in pc.timeout_overrides.items()})
+
     payload = {
         "repo_full": binding.repo,
         "issue_number": res.number,
@@ -1107,9 +1170,24 @@ def _dispatch_pipeline(config, binding, res, it, label: str) -> dict:
         "worktree_dir": f"{binding.cwd}/.worktrees/issue-{res.number}",
         "branch_name": f"pipeline/issue-{res.number}",
         "artifact_dir": str(artifact_dir),
-        "test_command": config.pipeline_test_commands.get(binding.repo, ""),
-        "review_mode": config.pipeline_review_mode,
-        "push_mode": config.pipeline_push_mode,
+        "test_command": test_command,
+        "gate_timeout_secs": pc.effective_gate_timeout(),
+        "base_branch": pc.base_branch,
+        "setup_command": pc.setup_command,
+        "setup_timeout_secs": pc.setup_timeout_secs,
+        "readonly": pc.mode == "readonly",
+        "review_notes": pc.review_notes,
+        "triage_notes": pc.triage_notes,
+        "doc_notes": pc.doc_notes,
+        "review_mode": pc.resolved_review_mode(config.pipeline_review_mode),
+        "push_mode": pc.resolved_push_mode(config.pipeline_push_mode),
+        "investigate_timeout": timeouts["investigate"],
+        "plan_timeout": timeouts["plan"],
+        "implement_timeout": timeouts["implement"],
+        "review_timeout": timeouts["review"],
+        "fix_review_timeout": timeouts["fix_review"],
+        "fix_test_timeout": timeouts["fix_test"],
+        "document_timeout": timeouts["document"],
     }
     pc = config.pipeline.console
     if pc.url and pc.api_key:

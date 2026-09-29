@@ -453,3 +453,129 @@ def test_issue_cap_zero_disables(tmp_path, monkeypatch):
     _write_issue_ledger_n(tmp_path, "a/b", 5, n=9)
     assert _issue_over_pipeline_limit(
         Config(pipeline_issue_daily_limit=0), "a/b", 5) is False
+
+
+# ── v0.3 per-repo 契约：资格门控 + payload 构造 ──────────────────────
+
+from issue_keeper.config import GateSpec, PipelineRepoConfig  # noqa: E402
+from issue_keeper.keeper import _pipeline_repo_cfg  # noqa: E402
+
+
+def test_pipeline_repo_cfg_eligibility(tmp_path):
+    """无契约/无门 → 不进管线；readonly 无门也进；enabled=false 不进。"""
+    cfg = Config(pipeline_repos={
+        "a/gated": PipelineRepoConfig(test_command="pytest"),
+        "a/ro": PipelineRepoConfig(mode="readonly"),
+        "a/off": PipelineRepoConfig(enabled=False, test_command="x"),
+    })
+    pc, why = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/gated", profile="p"))
+    assert pc is not None and pc.test_command == "pytest"
+    pc, _ = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/ro", profile="p"))
+    assert pc is not None and pc.mode == "readonly"
+    pc, why = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/off", profile="p"))
+    assert pc is None and "enabled=false" in why
+    pc, why = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/other", profile="p"))
+    assert pc is None and "无质量门" in why
+    # 旧 pipeline_test_commands 兜底（兼容不迁移的仓）
+    cfg2 = Config(pipeline_test_commands={"a/legacy": "cargo test"})
+    pc, _ = _pipeline_repo_cfg(cfg2, RepoBinding(repo="a/legacy", profile="p"))
+    assert pc is not None and pc.test_command == "cargo test"
+
+
+def _await_seen(art, number: int) -> dict:
+    """等 bridge 落盘 dispatch.json.seen.json（后台进程有启动延迟）。"""
+    seen_path = art / "dispatch.json.seen.json"
+    deadline = time.time() + 5
+    while not seen_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    return json.loads(seen_path.read_text(encoding="utf-8"))
+
+
+def test_dispatch_payload_carries_per_repo_contract(tmp_path, monkeypatch):
+    """payload 注入 per-repo 契约：基线/安装/门预算/readonly/notes/push_mode。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, shutil, sys\n"
+        "shutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
+    art = _art(tmp_path)
+    pc = PipelineRepoConfig(
+        base_branch="develop",
+        setup_command="pnpm install --frozen-lockfile",
+        gates=[GateSpec(name="fmt", command="pnpm fmt", timeout_secs=300),
+               GateSpec(name="tui", command="x", timeout_secs=3600,
+                        paths=["crates/tui/**"])],
+        push_mode="pr",
+        review_notes="红线 X",
+        triage_notes="路由 Y",
+        doc_notes="惯例 Z",
+        timeout_overrides={"implement": 900},
+    )
+    out = _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_push_mode="main", pipeline_claim_comment=False),  # 全局 main，per-repo pr 覆盖
+        RepoBinding(repo="a/b", profile="p"), _res(number=7), ItemState(),
+        "a/b issue#7", pc=pc,
+    )
+    assert out["status"] == "dispatched"
+    seen = _await_seen(art, 7)
+    assert seen["base_branch"] == "develop"
+    assert seen["setup_command"] == "pnpm install --frozen-lockfile"
+    assert seen["push_mode"] == "pr"              # per-repo 覆盖全局 main
+    assert seen["review_mode"] == "auto"          # 未覆盖 → 继承全局
+    assert seen["readonly"] is False
+    assert seen["review_notes"] == "红线 X" and seen["triage_notes"] == "路由 Y"
+    assert seen["doc_notes"] == "惯例 Z"
+    assert seen["gate_timeout_secs"] == 300 + 3600 + 300
+    assert seen["implement_timeout"] == 900       # 覆盖生效
+    assert seen["investigate_timeout"] == 2100    # 未覆盖用内置默认
+    # 多门仓：test_command 指向 gate_runner，spec 落在产物目录
+    assert "gate_runner.py" in seen["test_command"]
+    spec = json.loads((art / "gates.json").read_text(encoding="utf-8"))
+    assert spec["base"] == "develop"
+    assert [g["name"] for g in spec["gates"]] == ["fmt", "tui"]
+    assert spec["gates"][1]["paths"] == ["crates/tui/**"]
+
+
+def test_dispatch_payload_readonly_repo(tmp_path, monkeypatch):
+    """readonly 仓：readonly=true、无门、不写 gates.json。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, shutil, sys\nshutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
+    art = _art(tmp_path)
+    pc_ro = PipelineRepoConfig(mode="readonly")
+    out = _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_claim_comment=False),
+        RepoBinding(repo="a/b", profile="p"),
+        _res(number=7), ItemState(), "a/b issue#7", pc=pc_ro,
+    )
+    assert out["status"] == "dispatched"
+    seen = _await_seen(art, 7)
+    assert seen["readonly"] is True and seen["test_command"] == ""
+    assert not (art / "gates.json").exists()
+
+
+def test_dispatch_payload_single_command_repo(tmp_path, monkeypatch):
+    """单命令仓：test_command 原样、默认预算 2400、不写 gates.json。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, shutil, sys\nshutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
+    art = _art(tmp_path, number=8)
+    pc_single = PipelineRepoConfig(test_command="pnpm test:run")
+    out = _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_claim_comment=False),
+        RepoBinding(repo="a/b", profile="p"),
+        _res(number=8), ItemState(), "a/b issue#8", pc=pc_single,
+    )
+    assert out["status"] == "dispatched"
+    seen = _await_seen(art, 8)
+    assert seen["test_command"] == "pnpm test:run"
+    assert seen["gate_timeout_secs"] == 2400   # 单命令默认预算
+    assert not (art / "gates.json").exists()

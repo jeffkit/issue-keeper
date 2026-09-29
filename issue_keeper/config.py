@@ -49,6 +49,72 @@ class PipelineConfig:
 
 
 @dataclass
+class GateSpec:
+    """单条质量门：命令 + 预算 + 可选 diff 路径条件（fnmatch，空 = 恒触发）。
+
+    gate_runner.py 按序执行；paths 命中本次改动文件（含未提交 + 分支上已提交
+    vs base）才跑。条件门的出处是 recursive 的 tui-mutants/cli-mutants——
+    触及特定 crate 才需要跑、且预算要 40-60min，单命令门模型装不下。
+    """
+    name: str
+    command: str
+    timeout_secs: int = 900
+    paths: list = field(default_factory=list)
+
+
+@dataclass
+class PipelineRepoConfig:
+    """per-repo 管线契约（v0.3）：把「基线/安装/验收/交付/仓规」从全局硬编码
+    降为每仓自带。
+
+    背景：通用 flow 曾只参数化了 test_command 一项——基线硬编码 origin/main
+    （argusai 家族是 develop）、push_mode 全局直推 main（绕过 PR 制仓的发布流）、
+    17/18 仓空门跑 `true` 恒过、review 红线内嵌 recursive 专属内容。
+    """
+    # false = 该仓不走管线（回退 legacy 单 agent 路径）
+    enabled: bool = True
+    # full = 九段管线；readonly = 只调查不开工不交付（数据/分发/镜像仓）
+    mode: str = "full"
+    # worktree 基线 & 集成分支（argusai 家族 = develop；deepseek-harness = master）
+    base_branch: str = "main"
+    # worktree 建立后跑一次（fresh worktree 无 node_modules/.venv，TS/Python 仓必须装）
+    setup_command: str = ""
+    setup_timeout_secs: int = 1800
+    # 单命令门（gates 优先；都没有 = 不进管线，防「空门恒过」回评撒谎）
+    test_command: str = ""
+    gates: list = field(default_factory=list)      # list[GateSpec]
+    gate_timeout_secs: int = 0                     # 0 = gates 预算和 + 300s 缓冲
+    # 空 = 继承全局 pipeline_push_mode / pipeline_review_mode
+    push_mode: str = ""                            # branch | pr | main | none
+    review_mode: str = ""                          # auto | human
+    # 注入各 agent 段提示词的仓内知识（红线/路由/文档惯例）——替代硬编码在
+    # 通用 flow 里的 recursive 专属内容
+    review_notes: str = ""
+    triage_notes: str = ""
+    doc_notes: str = ""
+    # 段级预算覆盖（键：investigate/plan/implement/review/fix_review/fix_test/
+    # document）；缺省用 flow 内置值（按 cargo 冷构建调优的那组）
+    timeout_overrides: dict = field(default_factory=dict)
+
+    def resolved_push_mode(self, global_default: str) -> str:
+        return self.push_mode or global_default
+
+    def resolved_review_mode(self, global_default: str) -> str:
+        return self.review_mode or global_default
+
+    def effective_gate_timeout(self) -> int:
+        """整门预算：显式 > gates 之和+缓冲 > 单命令默认 2400。"""
+        if self.gate_timeout_secs > 0:
+            return self.gate_timeout_secs
+        if self.gates:
+            return sum(int(g.timeout_secs) for g in self.gates) + 300
+        return 2400
+
+    def has_gate(self) -> bool:
+        return bool(self.test_command.strip() or self.gates)
+
+
+@dataclass
 class RepoBinding:
     repo: str
     profile: str
@@ -129,6 +195,9 @@ class Config:
     pipeline_review_mode: str = "auto"     # auto | human（human 且 risk=high 才 HITL）
     # repo_full → 质量门命令（如 "cargo test --workspace"）；缺省/空 = 跳过门禁并注明
     pipeline_test_commands: dict = field(default_factory=dict)
+    # repo_full → PipelineRepoConfig（v0.3 per-repo 契约）。未登记的仓：无真门
+    # 不进管线（回退 legacy），除非旧 pipeline_test_commands 给了命令（兼容）。
+    pipeline_repos: dict = field(default_factory=dict)
     # 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）
     author_allowlist: list = field(default_factory=list)
     # 豁免作者日限的作者名单（大小写不敏感）：名单内作者触发次数不限。
@@ -156,6 +225,73 @@ class Config:
     @property
     def state_path(self) -> Path:
         return self.state_file.expanduser()
+
+    def pipeline_repo_cfg(self, repo_full: str) -> PipelineRepoConfig:
+        """该仓的管线契约：pipeline_repos 登记 > 旧 pipeline_test_commands 兜底 >
+        全默认（无门 → 不进管线）。返回副本，调用方可安全改。"""
+        cfg = self.pipeline_repos.get(repo_full)
+        if cfg is None:
+            cfg = PipelineRepoConfig(test_command=self.pipeline_test_commands.get(repo_full, ""))
+        elif not cfg.test_command and not cfg.gates:
+            legacy = self.pipeline_test_commands.get(repo_full, "")
+            if legacy:
+                cfg.test_command = legacy
+        return cfg
+
+
+def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
+    """解析 pipeline_repos 映射（repo_full → 契约）。逐项校验，坏值大声报错。"""
+    if not isinstance(raw, dict):
+        raise ValueError("pipeline_repos 必须是映射（repo_full: 契约）")
+    out: dict[str, PipelineRepoConfig] = {}
+    for repo, item in raw.items():
+        repo = str(repo).strip()
+        if not isinstance(item, dict):
+            raise ValueError(f"pipeline_repos[{repo}] 必须是映射")
+        mode = str(item.get("mode") or "full").strip()
+        if mode not in ("full", "readonly"):
+            raise ValueError(f"pipeline_repos[{repo}].mode 只能是 full|readonly，得到 {mode!r}")
+        push_mode = str(item.get("push_mode") or "").strip()
+        if push_mode and push_mode not in ("branch", "pr", "main", "none"):
+            raise ValueError(
+                f"pipeline_repos[{repo}].push_mode 只能是 branch|pr|main|none，得到 {push_mode!r}")
+        review_mode = str(item.get("review_mode") or "").strip()
+        if review_mode and review_mode not in ("auto", "human"):
+            raise ValueError(f"pipeline_repos[{repo}].review_mode 只能是 auto|human")
+        base_branch = str(item.get("base_branch") or "main").strip() or "main"
+
+        gates: list[GateSpec] = []
+        for i, g in enumerate(item.get("gates") or []):
+            if not isinstance(g, dict) or not str(g.get("name") or "").strip() \
+                    or not str(g.get("command") or "").strip():
+                raise ValueError(
+                    f"pipeline_repos[{repo}].gates[{i}] 需要 name 与 command 字段")
+            gates.append(GateSpec(
+                name=str(g["name"]).strip(),
+                command=str(g["command"]),
+                timeout_secs=max(30, int(g.get("timeout_secs", 900))),
+                paths=[str(p) for p in (g.get("paths") or []) if str(p).strip()],
+            ))
+
+        timeout_overrides = {str(k): max(60, int(v))
+                             for k, v in (item.get("timeout_overrides") or {}).items()}
+        out[repo] = PipelineRepoConfig(
+            enabled=bool(item.get("enabled", True)),
+            mode=mode,
+            base_branch=base_branch,
+            setup_command=str(item.get("setup_command") or ""),
+            setup_timeout_secs=max(60, int(item.get("setup_timeout_secs", 1800))),
+            test_command=str(item.get("test_command") or ""),
+            gates=gates,
+            gate_timeout_secs=max(0, int(item.get("gate_timeout_secs", 0))),
+            push_mode=push_mode,
+            review_mode=review_mode,
+            review_notes=str(item.get("review_notes") or ""),
+            triage_notes=str(item.get("triage_notes") or ""),
+            doc_notes=str(item.get("doc_notes") or ""),
+            timeout_overrides=timeout_overrides,
+        )
+    return out
 
 
 def _expand_path(v: Any) -> Path:
@@ -381,6 +517,7 @@ def load_config(path: str | os.PathLike) -> Config:
     pipeline_test_raw = raw.get("pipeline_test_commands") or {}
     if not isinstance(pipeline_test_raw, dict):
         raise ValueError("pipeline_test_commands 必须是映射（repo_full: 测试命令）")
+    pipeline_repos = _load_pipeline_repos(raw.get("pipeline_repos") or {})
     allowlist_raw = raw.get("author_allowlist") or []
     if not isinstance(allowlist_raw, list):
         raise ValueError("author_allowlist 必须是列表")
@@ -405,6 +542,7 @@ def load_config(path: str | os.PathLike) -> Config:
         pipeline_push_mode=(raw.get("pipeline_push_mode") or "branch").strip(),
         pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
+        pipeline_repos=pipeline_repos,
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
         author_daily_limit_exempt=[str(a).strip() for a in (raw.get("author_daily_limit_exempt") or [])
                                    if str(a).strip()],

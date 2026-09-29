@@ -1,13 +1,60 @@
 # issue-pipeline —— issue-keeper 的 plaita 化管线（@flow 源码 + 生成 JSON）
 
-> v0.2.1，2026-09-27。经三方独立审查（plaita DSL 严谨性 / 编排设计缺陷 / 运维安全）
-> 后定稿。**审查主体是 `issue_pipeline_flow.py`（@flow 源码），JSON 是编译产物不要手改**：
+> v0.3，2026-09-30。per-repo 契约化（见下方专节）。**审查主体是
+> `issue_pipeline_flow.py`（@flow 源码），JSON 是编译产物不要手改**：
 >
 > ```bash
 > python3 flows/build_issue_pipeline.py     # 需 PYTHONPATH 含 plaita 与 plaita-nodes/src
 > ```
 >
-> 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓、全节点有出边 ✓。未做端到端真跑。
+> 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓（v0.3 重建后 69 节点）。
+> 未做端到端真跑。
+
+## v0.3（2026-09-30）：per-repo 契约化——通用 flow 剥离单仓形状
+
+动机：通用 flow 实际是围绕 recursive 打磨的（预算按 cargo 冷构建调优、review
+红线内嵌 recursive 专属内容、门脚本 cargo 专用、基线硬编码 origin/main），
+review 结论「不能 cover 所有子仓」。改造后 flow 不再内嵌任何单仓形状：
+
+- **配置面**：`config.yaml` 新增 `pipeline_repos`（repo_full → 契约）：
+  `enabled / mode(full|readonly) / base_branch / setup_command / test_command /
+  gates[] / gate_timeout_secs / push_mode(branch|pr|main|none) / review_mode /
+  review_notes / triage_notes / doc_notes / timeout_overrides`。
+  旧 `pipeline_test_commands` 兼容（未登记仓兜底，登记仓以新契约为准）。
+- **资格门控（keeper 侧）**：`_pipeline_repo_cfg`——未登记且无门的仓**不进
+  管线**，回退 legacy 单 agent 路径。根治「17/18 仓空门跑 `true` 恒过、回评
+  却报质量门通过」的假绿。readonly 仓无门也进（只调查不开工）。
+- **多门 gate_runner**：`flows/gates/gate_runner.py`——per-gate 预算 + diff
+  路径条件（触及 `crates/recursive-tui/**` 才跑 mutants 这类条件门进门），
+  先修再跑（首败即停）。门清单放 keeper 配置或仓内 `.issue-keeper/gates.json`
+  （惯例归仓）。GATE 节点只调 runner，整门预算 = Σgate+300s 传入
+  `INPUT.gate_timeout_secs`。
+- **flow 参数化**：`INPUT.base_branch`（wt_add/sync_main/git_publish 全链）、
+  `INPUT.setup_command`（fresh worktree 装 node_modules/.venv，失败如实回评）、
+  段预算全部 `INPUT.*_timeout`（默认=旧全局值，per-repo 覆盖）。
+- **readonly 早退**：investigate 后回评+路由建议（triage_notes 指路），
+  不进 plan/implement——数据/分发/镜像仓（recursive-providers、
+  argusai-marketplace）与「改行为请去别仓」的仓不再被九段管线误处理。
+- **惯例注入**：`INPUT.review_notes/triage_notes/doc_notes` 注入对应段提示词；
+  曾硬编码在 review 提示词的 recursive 红线（input_schema oneOf…）迁入
+  recursive 的 per-repo 配置；document 段不再假设「CHANGELOG.md Unreleased」
+  （Changesets 制仓的正确动作是加 .changeset 文件）。各实施段提示词显式要求
+  **先读目标仓 AGENTS.md / CLAUDE.md**。
+- **交付策略**：git_publish（plaita-nodes 0.6.x）`merge_mode` 新增
+  `pr`（推分支 + `gh pr create --base <base_branch>`，argusai 家族 PR 制）与
+  `none`（只本地 commit 不 push）；`base_branch` 参数化 main 模式推送目标。
+  gate/agent_run 节点的 `timeout_secs` 修为表达式求值（DSL 传参是表达式串——
+  与 git_publish.merge_mode 同一批坑，pydantic 构造期拒收 str 进 int 字段，
+  字段放宽为 Any + execute 内求值）。
+
+**部署链（v0.3 起）**：①重建 flow JSON → ②console 发布新 semver（旧 console
+定义不认识新 INPUT 字段，不发布则 bridge 用旧定义、新 payload 字段被忽略）；
+③`pip install -e . --break-system-packages` 刷新 plaita-nodes（gate/agent_run/
+git_publish 三节点行为变更）④keeper daemon 重启（加载新节点代码）；
+⑤config.yaml 迁移到 pipeline_repos（否则除 recursive 外全部仓回退 legacy——
+这是有意的安全缺省，不是故障）。
+
+## 输入契约（keeper → run，v0.3）
 
 ## v1.0.13（2026-09-29）：post_*/解析器/git 操作沉淀为 plaita-nodes 库节点
 
@@ -173,9 +220,19 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
   "worktree_dir": "<main_clone>/.worktrees/issue-17",
   "branch_name": "issue-17",
   "artifact_dir": "/Users/kong/.issue-keeper/pipeline/recursive-17",
-  "test_command": "cargo test --workspace",        // per-repo；空=跳过质量门并注明
+  "test_command": "python3 <flows>/gates/gate_runner.py --spec <artifact>/gates.json --cwd .",
+                                                   // per-repo：单命令原样；多门=gate_runner
+  "gate_timeout_secs": 9000,                       // 多门=Σgate+300；单命令默认 2400
+  "base_branch": "main",                           // v0.3：argusai 家族 develop 等
+  "setup_command": "pnpm install --frozen-lockfile", // v0.3：worktree 建立后跑一次
+  "setup_timeout_secs": 1800,
+  "readonly": false,                               // v0.3：true=investigate 后早退
+  "review_notes": "...", "triage_notes": "...", "doc_notes": "...",  // v0.3：仓规注入
+  "investigate_timeout": 2100, "plan_timeout": 1200, "implement_timeout": 4200,
+  "review_timeout": 2700, "fix_review_timeout": 2700, "fix_test_timeout": 900,
+  "document_timeout": 300,                         // v0.3：per-repo 可覆盖
   "review_mode": "auto",                           // auto | human（human 且 high 才 HITL）
-  "push_mode": "branch",                           // branch(默认) | main
+  "push_mode": "branch",                           // branch(默认) | pr | main | none
   "console": {                                     // 可选（混合形态）；缺省=纯本地定义
     "url": "http://127.0.0.1:8123", "api_key": "...",
     "flow_id": "issue-pipeline", "refresh_secs": 300,
@@ -186,8 +243,9 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
 ```
 
 返回（end output）：`{status: done|rejected|blocked|invalid|nochange|abort|partial|
-guarded|onhold, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
-keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警。
+guarded|onhold|readonly, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
+keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警
+（readonly=只调查不开工的终态，v0.3 新增）。
 
 **comment_posted 归一化**：成功路径直接返回 `comment_posted`；业务早退路径历史返回
 `posted`——`pipeline_bridge.py` 在出口统一补齐别名（缺 `comment_posted` 时用 `posted`

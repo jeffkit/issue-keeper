@@ -18,15 +18,19 @@ Dashboard 提供 REST + 前端看板。
 
 关键目录：
 - `issue_keeper/__main__.py` — CLI 入口（`python -m issue_keeper`）
-- `issue_keeper/keeper.py` — 主循环与 Agent 调用
+- `issue_keeper/keeper.py` — 主循环与 Agent 调用；pipeline 派发含 per-repo 契约
+  门控（`_pipeline_repo_cfg`：无真门的仓不进管线，回退 legacy）
 - `issue_keeper/screener.py` — 安全过滤层
 - `issue_keeper/reply.py` — 回评礼仪化（发布前消毒 + LLM 改写，防过程叙述/隐私外泄）
-- `issue_keeper/config.py` / `team.py` — 配置与项目绑定
+- `issue_keeper/config.py` / `team.py` — 配置与项目绑定；`pipeline_repos` =
+  per-repo 管线契约（基线/安装/门/交付/仓规注入/预算，v0.3）
 - `issue_keeper/sources/` — `github.py` / `internal.py`
 - `issue_keeper/dashboard/` — FastAPI 看板 API
 - `frontend/src/` — 看板前端
 - `flows/` — issue-pipeline flow（pipeline_mode 时新 issue 首响应的 plaita 管线）
-- `config.example.yaml` — 全局配置模板（screener / patrol / reply_polish 等）
+  + `flows/gates/gate_runner.py`（多门调度器：per-gate 预算 + diff 路径条件）
+- `config.example.yaml` — 全局配置模板（screener / patrol / reply_polish /
+  pipeline_repos 等）
 - `tests/` — pytest
 
 ## 开发约定

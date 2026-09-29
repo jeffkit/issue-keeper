@@ -92,6 +92,59 @@ pipeline:
   # 可见节点级 trace；Langfuse 另需进程 env LANGFUSE_PUBLIC_KEY（trace id = 执行 id）。
   # observability_redis: redis://localhost:6379/0
 
+# ─── per-repo 管线契约（pipeline_repos，v0.3 2026-09-30）──────────────
+# 每个仓自带：基线分支 / 依赖安装 / 质量门（单命令或多门清单）/ 交付策略 /
+# 审核模式 / 仓规注入（红线·路由·文档惯例）/ 段预算覆盖。
+# 资格规则：未登记且无门的仓**不进管线**（回退 legacy 单 agent 路径）——
+# 空门跑 `true` 恒过的假绿已废止；readonly 仓不需要门。
+# 全局 pipeline_push_mode / pipeline_review_mode 只作缺省，per-repo 可覆盖。
+pipeline_repos:
+  # Rust 仓 + 多门（含条件门：触及 recursive-tui 才跑 mutants，预算对齐其
+  # AGENTS.md 失败模式 #8 的 40-60min 实测）。门清单也可放仓内
+  # .issue-keeper/gates.json（惯例归仓，gate_runner 会自动发现）。
+  jeffkit/recursive:
+    base_branch: main
+    push_mode: main                # jeffkit 拍板：recursive 可直推
+    review_notes: "Anthropic input_schema 顶层不得出现 oneOf/allOf/anyOf；OpenAI tool_calls assistant 消息 content 须发 null 而非空串；非测试代码禁止 unwrap()/expect()；新能力放 tools/ 或 providers/，严禁在 run_inner 加分支。"
+    triage_notes: "查重时另查 .dev/runs/ 目录——本仓有自迭代工作流（self-improve flow）在途任务，正在跑的 goal 算 in-flight，不要重复开工。"
+    doc_notes: "在 .dev/journal/manual-<YYYYMMDD>-<短标签>.md 补记录（Date/Goal/Files touched/Tests added/Notes），与自迭代 run 的观察史保持同构。"
+    gates:
+      - name: fmt
+        command: cargo fmt --all --check
+        timeout_secs: 300
+      - name: clippy
+        command: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        timeout_secs: 1800
+      - name: test
+        command: cargo test --workspace --no-fail-fast
+        timeout_secs: 2400
+      - name: tui-test-presence
+        command: bash .dev/scripts/tui-test-presence.sh
+        timeout_secs: 600
+        paths: ["crates/recursive-tui/**"]
+      - name: tui-mutants
+        command: bash .dev/scripts/tui-mutants.sh
+        timeout_secs: 3600           # AGENTS.md 失败模式 #8：main.rs 类改动要 40-60min，
+        paths: ["crates/recursive-tui/**"]  # 20min 预算会产出截断的 survivor list 造成误判
+  # TS pnpm 仓 + develop 基线 + PR 制（argusai 家族形态）
+  jeffkit/argusai:
+    base_branch: develop
+    setup_command: pnpm install --frozen-lockfile
+    test_command: pnpm type-check && pnpm test:run
+    push_mode: pr                  # 该仓约定 PR 合并，不直推
+    timeout_overrides:
+      investigate: 900
+      implement: 1800              # TS 仓不用 cargo 冷构建的 4200s
+    review_notes: "禁止手改 schemas/*.json 而不同步 packages/core 的 schema 生成流程；改动 packages/core 编排/断言逻辑必须跑过相关包测试。"
+    doc_notes: "版本发布走 Changesets：正确动作是 pnpm changeset 加 .changeset/*.md，不要直接改 CHANGELOG.md。"
+  # 数据/分发/镜像仓：readonly（只调查不开工，investigate 后回评+路由建议）
+  jeffkit/recursive-providers:
+    mode: readonly
+    triage_notes: "本仓是数据目录仓（providers.json 单一事实源）。数据修正请人工或走仓内脚本；功能问题应路由到 jeffkit/recursive。"
+  jeffkit/argusai-marketplace:
+    mode: readonly
+    triage_notes: "本仓是插件分发仓。改行为请去 jeffkit/argusai 仓；本仓只接受插件定义/文档更新，需人工核对面板工具名与参数一致性。"
+
 # ─── 安全过滤层（screener）────────────────────────────────────────────
 # 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。
 # 这一层在 keeper 进程内完成，不起子进程、无本地权限。

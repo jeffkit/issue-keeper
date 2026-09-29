@@ -172,3 +172,117 @@ class TestConfigLoading:
         )
         with pytest.raises(ValueError, match="poll_interval_secs"):
             load_config(cfg)
+
+
+class TestPipelineRepos:
+    """v0.3 per-repo 管线契约解析。"""
+
+    def _cfg(self, tmp_path, extra: str):
+        cfg = _write(tmp_path, _base(tmp_path, _valid_screener() + extra))
+        return load_config(cfg)
+
+    def test_full_contract_parsed(self, tmp_path):
+        c = self._cfg(tmp_path, (
+            "pipeline_repos:\n"
+            "  jeffkit/argusai:\n"
+            "    base_branch: develop\n"
+            "    setup_command: pnpm install --frozen-lockfile\n"
+            "    test_command: pnpm test:run\n"
+            "    push_mode: pr\n"
+            "    review_mode: human\n"
+            "    review_notes: 'schema 生成流程不可绕过'\n"
+            "    timeout_overrides:\n"
+            "      implement: 1200\n"
+        ))
+        pc = c.pipeline_repo_cfg("jeffkit/argusai")
+        assert pc.enabled and pc.mode == "full"
+        assert pc.base_branch == "develop"
+        assert pc.setup_command == "pnpm install --frozen-lockfile"
+        assert pc.test_command == "pnpm test:run"
+        assert pc.resolved_push_mode("branch") == "pr"
+        assert pc.resolved_review_mode("auto") == "human"
+        assert pc.review_notes.startswith("schema")
+        assert pc.timeout_overrides["implement"] == 1200
+        assert pc.has_gate() is True
+        # 空覆盖继承全局（resolved_* 的兜底语义）
+        assert pc.resolved_push_mode("main") == "pr"
+
+    def test_gates_parsed_with_paths_and_timeout(self, tmp_path):
+        c = self._cfg(tmp_path, (
+            "pipeline_repos:\n"
+            "  jeffkit/recursive:\n"
+            "    gates:\n"
+            "      - name: fmt\n"
+            "        command: cargo fmt --all --check\n"
+            "        timeout_secs: 300\n"
+            "      - name: tui-mutants\n"
+            "        command: bash .dev/scripts/tui-mutants.sh\n"
+            "        timeout_secs: 3600\n"
+            "        paths:\n"
+            "          - 'crates/recursive-tui/**'\n"
+        ))
+        pc = c.pipeline_repo_cfg("jeffkit/recursive")
+        assert [g.name for g in pc.gates] == ["fmt", "tui-mutants"]
+        assert pc.gates[1].paths == ["crates/recursive-tui/**"]
+        # 整门预算 = gates 之和 + 300 缓冲
+        assert pc.effective_gate_timeout() == 300 + 3600 + 300
+        assert pc.has_gate() is True
+
+    def test_legacy_test_commands_merged(self, tmp_path):
+        c = self._cfg(tmp_path, (
+            "pipeline_test_commands:\n"
+            "  jeffkit/recursive: cargo test --workspace\n"
+            "pipeline_repos:\n"
+            "  jeffkit/argusai:\n"
+            "    test_command: pnpm test:run\n"
+        ))
+        # 旧配置单独生效（未登记仓兜底）
+        assert c.pipeline_repo_cfg("jeffkit/recursive").test_command == "cargo test --workspace"
+        # 新契约优先于旧命令
+        assert c.pipeline_repo_cfg("jeffkit/argusai").test_command == "pnpm test:run"
+        # 登记了 gates 的仓不吃旧命令
+        c2 = self._cfg(tmp_path, (
+            "pipeline_test_commands:\n"
+            "  jeffkit/recursive: cargo test --workspace\n"
+            "pipeline_repos:\n"
+            "  jeffkit/recursive:\n"
+            "    gates:\n"
+            "      - name: g\n"
+            "        command: x\n"
+        ))
+        assert c2.pipeline_repo_cfg("jeffkit/recursive").test_command == ""
+        assert c2.pipeline_repo_cfg("jeffkit/recursive").has_gate() is True
+
+    def test_unregistered_repo_has_no_gate(self, tmp_path):
+        c = self._cfg(tmp_path, "pipeline_repos:\n  jeffkit/x:\n    test_command: t\n")
+        assert c.pipeline_repo_cfg("jeffkit/other").has_gate() is False
+
+    def test_readonly_mode(self, tmp_path):
+        c = self._cfg(tmp_path, (
+            "pipeline_repos:\n"
+            "  jeffkit/recursive-providers:\n"
+            "    mode: readonly\n"
+        ))
+        pc = c.pipeline_repo_cfg("jeffkit/recursive-providers")
+        assert pc.mode == "readonly" and pc.has_gate() is False  # readonly 不需要门
+
+    def test_invalid_mode_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="mode"):
+            self._cfg(tmp_path, "pipeline_repos:\n  a/b:\n    mode: aggressive\n")
+
+    def test_invalid_push_mode_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="push_mode"):
+            self._cfg(tmp_path, "pipeline_repos:\n  a/b:\n    push_mode: force\n")
+
+    def test_gate_missing_name_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="gates"):
+            self._cfg(tmp_path, "pipeline_repos:\n  a/b:\n    gates:\n      - command: x\n")
+
+    def test_disabled_repo(self, tmp_path):
+        c = self._cfg(tmp_path, (
+            "pipeline_repos:\n"
+            "  a/b:\n"
+            "    enabled: false\n"
+            "    test_command: t\n"
+        ))
+        assert c.pipeline_repo_cfg("a/b").enabled is False
