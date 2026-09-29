@@ -365,7 +365,8 @@ def process_repo(
 
         for res in resources:
             handled += _process_resource(
-                src, binding, config, screener, entry, rs, res, me, timeout, visible_prefix
+                src, binding, config, screener, entry, rs, res, me, timeout, visible_prefix,
+                pipeline_in_flight=_count_in_flight(state),
             )
 
     return handled
@@ -382,6 +383,7 @@ def _process_resource(
     me: str,
     timeout: int,
     visible_prefix: str,
+    pipeline_in_flight: int = 0,
 ) -> int:
     """处理单个 issue/PR，返回本轮处理条目数。"""
     handled = 0
