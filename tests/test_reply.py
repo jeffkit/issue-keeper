@@ -172,3 +172,15 @@ class TestConfigWiring:
         )
         with pytest.raises(ValueError, match="reply_polish.provider"):
             load_config(p)
+
+
+def test_sanitize_rewrites_unexpanded_command_substitution():
+    """#19 实证：LLM 把想执行的命令原样写进回评（`$(git rev-parse …)` 上屏），
+    GitHub 不做命令替换，读者只看到假哈希。消毒改写为如实说明。"""
+    t = "已合入 main（`$(git rev-parse --short origin/main)`，rebase 后 ff 推入）。"
+    out = sanitize(t)
+    assert "$(" not in out
+    assert "git rev-parse --short origin/main" in out
+    assert "未在发布时执行" in out
+    # 其余内容不受影响
+    assert "rebase 后 ff 推入" in out
