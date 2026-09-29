@@ -168,7 +168,7 @@ def issue_pipeline(INPUT):
                 "def run(input):\n"
                 "    import re, subprocess\n"
                 "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                 "        t = re.sub(pat, rep, t)\n"
                 "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                 "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -188,8 +188,9 @@ def issue_pipeline(INPUT):
             timeout_secs=600,
             prompt=(
                 "为 GitHub issue 写简短中文评论（直接给正文）：无需新代码改动。"
-                "原因：{% $NODE.parsed.notes %}。若已有修复给出 commit/PR 链接。纯文本 2-5 句，"
-                "不要出现任何本机路径或凭据信息。"
+                "原因：{% $NODE.parsed.notes %}。若已有修复给出 commit/PR 链接（哈希必须是真实值，"
+                "拿不到就写「见 main 最新提交」，禁止输出 `$(…)` 等未执行的命令替换占位）。"
+                "纯文本 2-5 句，不要出现任何本机路径或凭据信息。"
             ),
         )
         post_invalid = CODE.python(
@@ -198,7 +199,7 @@ def issue_pipeline(INPUT):
                 "def run(input):\n"
                 "    import re, subprocess\n"
                 "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                 "        t = re.sub(pat, rep, t)\n"
                 "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                 "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -286,7 +287,7 @@ def issue_pipeline(INPUT):
                     "def run(input):\n"
                     "    import re, subprocess\n"
                     "    t = input.get('text') or ''\n"
-                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                     "        t = re.sub(pat, rep, t)\n"
                     "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                     "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -303,15 +304,22 @@ def issue_pipeline(INPUT):
     implement = AGENTRUN(
         agent="glm-52",
         repo=INPUT.worktree_dir,
-        # 2700（2026-09-28 由 1800 上调）：#40（parallel 死锁）在 1800s 被掐，
-        # worktree 里已有一份可观的部分实现——实现段对"要读并发代码+改多处"的
-        # issue 偏紧。与 keeper 的 pipeline_timeout_secs 联动（见 config.yaml）。
-        timeout_secs=3000,
+        # 预算沿革：1800（#40 首次被掐）→ 2700 → 3000 → 4200（v1.0.11）。
+        # 2026-09-29 四轮实测：implement 是唯一的墙——#40/#31 都在 3000s 被掐，
+        # 而 worktree 里其实已有实质进展（#40 甚至已提交）。所以除了加时间，
+        # 提示词也改成「先看已有改动、就地修正、不要从零重写」。
+        # 与 keeper 的 pipeline_timeout_secs 联动（见 config.yaml）。
+        timeout_secs=4200,
         prompt=(
             "你是实现工程师，严格按 {% $INPUT.artifact_dir %}/02-plan.md 实施（背景 01-investigation.md）。"
-            "约束：只改计划内文件（计划有误可在允许范围内调整并追加到 02-plan.md「## 实施记录」）；"
-            "禁止改动 .github/**；用定向测试自验并修编译/测试错误，但不要跑全量 {% $INPUT.test_command %}"
-            "（管线有独立质量门）；不要 git commit / git push。"
+            "**先侦察已有进展**：`git status`、`git diff`、`git log --oneline origin/main..HEAD`——"
+            "本工作树可能保留着上一轮（超时中断）的实现或提交。已有部分**就地修正**，"
+            "不要从零重写、更不要 revert 掉可用改动；只在确有必要时才重做某处，并在"
+            "02-plan.md「## 实施记录」里写一句为什么。"
+            "约束：只改计划内文件（计划有误可在允许范围内调整并追加到实施记录）；"
+            "禁止改动 .github/**；自验用**定向**测试（`cargo test -p <crate> --test <target>` / "
+            "`cargo check -p <crate>`），**不要跑全量 {% $INPUT.test_command %}**（管线有独立质量门会跑）；"
+            "不要 git commit / git push。"
             "发现计划不可行则回复 BLOCKED <原因> 且不改代码。完成后只回复一行：DONE <改动文件数> <一句话>"
         ),
     )
@@ -348,7 +356,7 @@ def issue_pipeline(INPUT):
                 "def run(input):\n"
                 "    import re, subprocess\n"
                 "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                 "        t = re.sub(pat, rep, t)\n"
                 "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                 "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -442,7 +450,7 @@ def issue_pipeline(INPUT):
                 "def run(input):\n"
                 "    import re, subprocess\n"
                 "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                 "        t = re.sub(pat, rep, t)\n"
                 "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                 "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -523,7 +531,7 @@ def issue_pipeline(INPUT):
                     "def run(input):\n"
                     "    import re, subprocess\n"
                     "    t = input.get('text') or ''\n"
-                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                     "        t = re.sub(pat, rep, t)\n"
                     "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                     "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -577,7 +585,7 @@ def issue_pipeline(INPUT):
                 "def run(input):\n"
                 "    import re, subprocess\n"
                 "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
                 "        t = re.sub(pat, rep, t)\n"
                 "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
                 "    p = input['artifact_dir'] + '/reply.md'\n"
@@ -663,6 +671,8 @@ def issue_pipeline(INPUT):
             "只写根因/方案要点、改动文件清单、测试情况、在哪 review；"
             "不要叙述工作过程（不要「我先调查…然后实现…」这类经过），"
             "不要写内部状态（如「本地未推送」），不要出现任何本机路径或凭据信息。"
+            "commit 哈希必须是上文事实里的真实值；拿不到真实哈希就写「见 main 最新提交」，"
+            "禁止输出 `$(…)` 等未执行的命令替换占位。"
             "首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。"
         ),
     )
@@ -672,7 +682,7 @@ def issue_pipeline(INPUT):
             "def run(input):\n"
             "    import re, subprocess\n"
             "    t = input.get('text') or ''\n"
-            "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]')]:\n"
+            "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
             "        t = re.sub(pat, rep, t)\n"
             "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
             "    # 落地事实由管线追加（模板统一给出，agent 自由文本只讲技术内容）：\n"

@@ -42,6 +42,10 @@ _REDACTIONS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"/Users/\S+"), "[REDACTED-PATH]"),
     (re.compile(r"/home/\S+"), "[REDACTED-PATH]"),
     (re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[=:]\s*\S+"), "[REDACTED-SECRET]"),
+    # LLM 偶尔把「想执行的命令」原样写进回评（#19 实证：`$(git rev-parse …)` 字面上屏，
+    # GitHub 不做命令替换，读者只看到一句假哈希）。反引号包裹的 $() 是回评里的
+    # 伪执行签名——行内代码不会是给人跑的脚本，改写成如实说明。
+    (re.compile(r"`\$\(([^`]+)\)`"), r"（命令 `\1` 未在发布时执行，以仓库实际状态为准）"),
 ]
 
 
