@@ -9,7 +9,29 @@
 >
 > 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓、全节点有出边 ✓。未做端到端真跑。
 
-## v1.0.12（2026-09-29，未发布）：expr 胶水节点清理
+## v1.0.13（2026-09-29）：post_*/解析器/git 操作沉淀为 plaita-nodes 库节点
+
+plaita-nodes **0.6.0** 新增三节点（`dff35ab`+`ca1654d`，已推 origin），flow 源码 724 → 531 行、
+**60 → 59 节点（code 17 → 4：deps/check/guard/kanban）**：
+
+- **`github_comment`×9**：替代 post_* 九连拷——消毒（路径/密钥/`$()` 打码）、
+  `dedup_marker` 去重、`footer` 尾注（成功路径核验行由 `F.concat` 拼 `pub.pushed`/`pub.note`）、
+  artifact 留档；dry-run 写草稿不连网；
+- **`parse_json`×2**：替代 parsed/verdict——#43 健壮解析策略沉淀入库（逐行倒序严格
+  JSON → rfind 切片），`choices` verdict 白名单 + `default` fail-safe（明细追加进
+  `notes`/`parse_error`）；triage 的 acceptance 经 `join_fields` 自动拼 `acceptance_str`；
+- **`git_publish`×1**：替代 deliver+merge，并**修掉缺口 #6**——旧 deliver 见远端已有
+  分支就跳过 commit（重投丢改动），新语义=有改动一律先 commit、远端头==本地头才
+  跳过 push；main 模式 ff 合并 `origin/<branch>` 不变。
+
+**部署链注意**：①注册走 pip dist-info entry-points——本机 editable 元数据曾停在
+0.5.0 拒收新节点，须 `pip install -e . --break-system-packages` 刷新；build/bridge/run_e2e
+已加 `plaita_nodes.register_all()` 显式兜底，不再依赖元数据新鲜度。②console 与 keeper
+daemon 均须重启加载 0.6.0 才能解析/执行新节点类型。③`git_publish.merge_mode` 经 DSL
+传入是表达式串，节点内已先求值（`ca1654d`）。回归：`tests/test_flow_verdict_parser.py`
+改为对生产定义中 verdict 节点（parse_json）的动态构造测试，#43 用例全保留。
+
+## v1.0.12（2026-09-29）：expr 胶水节点清理
 
 plaita `feat/expr-in-assignment` 分支放开 codeflow DSL 表达式位置的比较/and/or/not/三元
 （编译为 `$F.eq/$F.and/…/$F.ifelse`，注册表补同名比较函数与 ifelse），据此消掉三个胶水

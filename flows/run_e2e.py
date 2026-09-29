@@ -10,6 +10,7 @@ sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita")
 sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita-nodes/src")
 
 import plaita_nodes  # noqa: F401,E402
+plaita_nodes.register_all()  # 不依赖 dist-info entry-points 新鲜度
 from plaita.node import register_code_node  # E402
 
 register_code_node(default_backend="subprocess")

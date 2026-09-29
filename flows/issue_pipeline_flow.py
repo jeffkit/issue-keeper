@@ -40,19 +40,11 @@ from plaita.dsl.codeflow import CODE, ENV, F, flow
 def issue_pipeline(INPUT):
     # ── 0. 入口安全闸：screener 未判 safe 一律不进 agent 段 ──
     if INPUT.screener_verdict != "safe":
-        post_reject = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import subprocess\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(input.get('text') or '')\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0}\n"
-            ),
-            input={"text": F.concat('该 issue 未通过自动安全初筛（screener_verdict=', INPUT.screener_verdict, '），已停止自动处理，请人工查看。'),
-                   "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_reject = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=F.concat('该 issue 未通过自动安全初筛（screener_verdict=', INPUT.screener_verdict, '），已停止自动处理，请人工查看。'),
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "rejected", "posted": post_reject.posted}
 
@@ -124,25 +116,16 @@ def issue_pipeline(INPUT):
             '"acceptance":["..."],"commit_message":"...","notes":"..."}'
         ),
     )
-    parsed = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    import json\n"
-            "    raw = (input.get('text') or '').strip()\n"
-            "    s = raw[raw.find('{'):raw.rfind('}')+1]\n"
-            "    try:\n"
-            "        d = json.loads(s)\n"
-            "        if d.get('verdict') not in ('actionable', 'blocked', 'invalid'):\n"
-            "            d = {'verdict': 'blocked', 'blockers': '分诊输出非法，需人工复核', 'risk': 'low',"
-            " 'kind': 'unknown', 'acceptance': [], 'commit_message': '', 'notes': 'triage verdict 非法'}\n"
-            "    except Exception:\n"
-            "        d = {'verdict': 'blocked', 'blockers': '分诊输出解析失败，需人工复核原始输出', 'risk': 'low',"
-            " 'kind': 'unknown', 'acceptance': [], 'commit_message': '', 'notes': 'triage 解析失败'}\n"
-            "    d['acceptance_str'] = '; '.join(d.get('acceptance') or [])\n"
-            "    return d\n"
-        ),
-        input={"text": triage.text},
+    # 解析 fail-safe 已沉淀为 plaita-nodes 的 parse_json 节点（健壮解析策略
+    # 含 #43 回归：逐行倒序找严格 JSON → rfind 切片，正文带花括号不误杀）；
+    # 失败时返回 default 并把明细追加进 notes，blockers 统一走人工复核
+    parsed = PARSE_JSON(
+        text=triage.text,
+        choices=["actionable", "blocked", "invalid"],
+        join_fields=["acceptance"],
+        default={"verdict": "blocked", "blockers": "分诊输出解析失败，需人工复核原始输出",
+                 "risk": "low", "kind": "unknown", "acceptance": [], "commit_message": "",
+                 "notes": "triage 解析失败"},
     )
 
     # ── 出害口 A/B：blocked / invalid ──
@@ -158,22 +141,11 @@ def issue_pipeline(INPUT):
                 "纯文本 3-6 句，不要出现任何本机路径或凭据信息。"
             ),
         )
-        post_blocked = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import re, subprocess\n"
-                "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                "        t = re.sub(pat, rep, t)\n"
-                "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(t)\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-            ),
-            input={"text": reply_blocked.text, "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_blocked = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=reply_blocked.text,
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "blocked", "posted": post_blocked.posted}
 
@@ -189,22 +161,11 @@ def issue_pipeline(INPUT):
                 "纯文本 2-5 句，不要出现任何本机路径或凭据信息。"
             ),
         )
-        post_invalid = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import re, subprocess\n"
-                "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                "        t = re.sub(pat, rep, t)\n"
-                "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(t)\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-            ),
-            input={"text": reply_invalid.text, "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_invalid = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=reply_invalid.text,
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "invalid", "posted": post_invalid.posted}
 
@@ -271,22 +232,11 @@ def issue_pipeline(INPUT):
                     "纯文本 3-6 句，不要出现任何本机路径或凭据信息。"
                 ),
             )
-            post_hold = CODE.python(
-                sandbox_backend="subprocess",
-                code=(
-                    "def run(input):\n"
-                    "    import re, subprocess\n"
-                    "    t = input.get('text') or ''\n"
-                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                    "        t = re.sub(pat, rep, t)\n"
-                    "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                    "    p = input['artifact_dir'] + '/reply.md'\n"
-                    "    open(p, 'w', encoding='utf-8').write(t)\n"
-                    "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                    "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-                ),
-                input={"text": reply_hold.text, "artifact_dir": INPUT.artifact_dir,
-                       "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+            post_hold = GITHUB_COMMENT(
+                repo=INPUT.repo_full,
+                issue_number=INPUT.issue_number,
+                text=reply_hold.text,
+                artifact_dir=INPUT.artifact_dir,
             )
             return {"status": "onhold", "posted": post_hold.posted}
 
@@ -340,22 +290,11 @@ def issue_pipeline(INPUT):
                 "给出后续建议。纯文本 2-5 句，不要出现任何本机路径或凭据信息。"
             ),
         )
-        post_nochange = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import re, subprocess\n"
-                "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                "        t = re.sub(pat, rep, t)\n"
-                "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(t)\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-            ),
-            input={"text": reply_nochange.text, "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_nochange = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=reply_nochange.text,
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "nochange", "posted": post_nochange.posted}
 
@@ -382,44 +321,11 @@ def issue_pipeline(INPUT):
             "你只审不改码。输出一行严格 JSON：{\"verdict\":\"approve|fix|abort\",\"notes\":\"...\"}"
         ),
     )
-    verdict = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    import json\n"
-            "    raw = (input.get('text') or '').strip()\n"
-            "\n"
-            "    def _ok(v):\n"
-            "        return isinstance(v, dict) and v.get('verdict') in ('approve', 'fix', 'abort')\n"
-            "\n"
-            "    # 提示词要求「输出一行严格 JSON」：先逐行从后往前找；再退化到「最后一个 {\n"
-            "    # 到最后一个 }」的切片。不能用第一个 '{' —— 正文里可能带花括号（#43 实证：\n"
-            "    # 正文含 \"type={}, model={}\"，旧写法把正文与 JSON 粘成一段，必然解析失败\n"
-            "    # → fail-safe abort，把本该 approve/fix 的 review 误判成叫停）。\n"
-            "    cands = []\n"
-            "    for line in reversed(raw.splitlines()):\n"
-            "        t = line.strip().strip('`').strip()\n"
-            "        if t.startswith('{') and t.endswith('}'):\n"
-            "            cands.append(t)\n"
-            "    lo, lc = raw.rfind('{'), raw.rfind('}')\n"
-            "    if lo != -1 and lc > lo:\n"
-            "        cands.append(raw[lo:lc + 1])\n"
-            "\n"
-            "    parsed_any = False\n"
-            "    for c in cands:\n"
-            "        try:\n"
-            "            v = json.loads(c)\n"
-            "        except Exception:\n"
-            "            continue\n"
-            "        if isinstance(v, dict):\n"
-            "            parsed_any = True\n"
-            "            if _ok(v):\n"
-            "                return v\n"
-            "    if parsed_any:\n"
-            "        return {'verdict': 'abort', 'notes': 'review 输出非法 verdict，fail-safe 叫停'}\n"
-            "    return {'verdict': 'abort', 'notes': 'review 输出无法解析，fail-safe 叫停: ' + raw[:150]}\n"
-        ),
-        input={"text": review.text},
+    # 同上：#43 事故策略已沉淀 parse_json 节点；fail-safe abort 语义不变
+    verdict = PARSE_JSON(
+        text=review.text,
+        choices=["approve", "fix", "abort"],
+        default={"verdict": "abort", "notes": "review 输出无法解析，fail-safe 叫停"},
     )
 
     # ── 出害口 D：review 叫停（fail-safe：解析失败也走这里）──
@@ -434,22 +340,11 @@ def issue_pipeline(INPUT):
                 "请人工定方向。纯文本 3-6 句，不要出现任何本机路径或凭据信息。"
             ),
         )
-        post_abort = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import re, subprocess\n"
-                "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                "        t = re.sub(pat, rep, t)\n"
-                "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(t)\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-            ),
-            input={"text": reply_abort.text, "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_abort = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=reply_abort.text,
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "abort", "posted": post_abort.posted}
 
@@ -507,22 +402,11 @@ def issue_pipeline(INPUT):
                     "纯文本 5-8 句，不要出现任何本机路径或凭据信息。"
                 ),
             )
-            post_partial = CODE.python(
-                sandbox_backend="subprocess",
-                code=(
-                    "def run(input):\n"
-                    "    import re, subprocess\n"
-                    "    t = input.get('text') or ''\n"
-                    "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                    "        t = re.sub(pat, rep, t)\n"
-                    "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                    "    p = input['artifact_dir'] + '/reply.md'\n"
-                    "    open(p, 'w', encoding='utf-8').write(t)\n"
-                    "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                    "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-                ),
-                input={"text": reply_partial.text, "artifact_dir": INPUT.artifact_dir,
-                       "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+            post_partial = GITHUB_COMMENT(
+                repo=INPUT.repo_full,
+                issue_number=INPUT.issue_number,
+                text=reply_partial.text,
+                artifact_dir=INPUT.artifact_dir,
             )
             return {"status": "partial", "posted": post_partial.posted}
 
@@ -561,22 +445,11 @@ def issue_pipeline(INPUT):
                 "不要出现任何本机路径或凭据信息。"
             ),
         )
-        post_guard = CODE.python(
-            sandbox_backend="subprocess",
-            code=(
-                "def run(input):\n"
-                "    import re, subprocess\n"
-                "    t = input.get('text') or ''\n"
-                "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-                "        t = re.sub(pat, rep, t)\n"
-                "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-                "    p = input['artifact_dir'] + '/reply.md'\n"
-                "    open(p, 'w', encoding='utf-8').write(t)\n"
-                "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-                "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-            ),
-            input={"text": reply_guard.text, "artifact_dir": INPUT.artifact_dir,
-                   "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full},
+        post_guard = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=reply_guard.text,
+            artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "guarded", "posted": post_guard.posted}
 
@@ -595,48 +468,16 @@ def issue_pipeline(INPUT):
             "不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP"
         ),
     )
-    deliver = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    import subprocess, re\n"
-            "    wt = input['worktree_dir']\n"
-            "    def sh(args, cwd=None, t=300):\n"
-            "        return subprocess.run(args, cwd=cwd or wt, capture_output=True, text=True, timeout=t)\n"
-            "    lr = sh(['git', 'ls-remote', '--heads', 'origin', input['branch_name']], t=60)\n"
-            "    if lr.stdout.strip():\n"
-            "        return {'pushed': True, 'note': '分支已在远端（续跑/重复投递），跳过重复 push'}\n"
-            "    plan = open(input['artifact_dir'] + '/02-plan.md', encoding='utf-8').read()\n"
-            "    m = re.search(r'^COMMIT_MESSAGE: (.+)$', plan, re.M)\n"
-            "    msg = (m.group(1).strip() if m else ('fix: issue #' + str(input['issue_number'])))\n"
-            "    sh(['git', 'add', '-A'])\n"
-            "    rc = sh(['git', 'commit', '-m', msg])\n"
-            "    rp = sh(['git', 'push', '-u', 'origin', input['branch_name']])\n"
-            "    return {'pushed': rp.returncode == 0, 'note': '' if rp.returncode == 0 else (rp.stderr or '')[-300:]}\n"
-        ),
-        input={"worktree_dir": INPUT.worktree_dir, "artifact_dir": INPUT.artifact_dir,
-               "branch_name": INPUT.branch_name, "issue_number": INPUT.issue_number},
-    )
-    merge = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    if input.get('push_mode') != 'main':\n"
-            "        return {'merged': None, 'note': 'branch 模式：仅推分支，不合并 main'}\n"
-            "    import subprocess\n"
-            "    mc = input['main_clone']; br = input['branch_name']\n"
-            "    def sh(args, cwd=None):\n"
-            "        return subprocess.run(args, cwd=cwd or mc, capture_output=True, text=True, timeout=300)\n"
-            "    sh(['git', 'fetch', 'origin'])\n"
-            "    r1 = sh(['git', 'merge', '--ff-only', 'origin/' + br])\n"
-            "    if r1.returncode != 0:\n"
-            "        sh(['git', 'merge', '--abort'])\n"
-            "        return {'merged': False, 'note': 'ff 合并失败（main 已前进或分支未推送），分支在远端，请人工合并'}\n"
-            "    r2 = sh(['git', 'push', 'origin', 'HEAD:main'])\n"
-            "    return {'merged': r2.returncode == 0,"
-            " 'note': '已 ff 合并推送 main' if r2.returncode == 0 else '合并成功但推送失败'}\n"
-        ),
-        input={"push_mode": INPUT.push_mode, "main_clone": INPUT.main_clone, "branch_name": INPUT.branch_name},
+    # deliver+merge 已沉淀为 plaita-nodes 的 git_publish 节点，并修掉缺口 #6：
+    # 旧 deliver 见远端已有分支就直接跳过 add/commit/push——重投时工作区新改动
+    # 被静默丢弃；新语义=有改动一律先 commit，远端头==本地头才跳过 push
+    pub = GIT_PUBLISH(
+        worktree_dir=INPUT.worktree_dir,
+        branch_name=INPUT.branch_name,
+        plan_file=F.concat(INPUT.artifact_dir, '/02-plan.md'),
+        issue_number=INPUT.issue_number,
+        merge_mode=INPUT.push_mode,
+        main_clone=INPUT.main_clone,
     )
     reply = AGENTRUN(
         agent="glm-turbo",
@@ -648,7 +489,7 @@ def issue_pipeline(INPUT):
             "调查 {% $INPUT.artifact_dir %}/01-investigation.md、计划与实施记录 {% $INPUT.artifact_dir %}/02-plan.md。"
             "事实：本仓测试命令={% $INPUT.test_command %}（为空则如实注明「本仓未配置统一测试命令，"
             "质量门为独立 review」）；质量门 passed={% $NODE.gate.passed %}；分支 {% $INPUT.branch_name %}；"
-            "推送 pushed={% $NODE.deliver.pushed %}；合并备注 {% $NODE.merge.note %}。"
+            "推送 pushed={% $NODE.pub.pushed %}；合并备注 {% $NODE.pub.note %}。"
             "issue 礼仪：结论先行（做了什么 + commit/分支/PR 等可核验引用）；"
             "只写根因/方案要点、改动文件清单、测试情况、在哪 review；"
             "不要叙述工作过程（不要「我先调查…然后实现…」这类经过），"
@@ -658,29 +499,13 @@ def issue_pipeline(INPUT):
             "首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。"
         ),
     )
-    post = CODE.python(
-        sandbox_backend="subprocess",
-        code=(
-            "def run(input):\n"
-            "    import re, subprocess\n"
-            "    t = input.get('text') or ''\n"
-            "    for pat, rep in [(r'/Users/\\S+', '[REDACTED-PATH]'), (r'/home/\\S+', '[REDACTED-PATH]'), (r'(?i)(api[_-]?key|token|secret|password)\\s*[=:]\\s*\\S+', '[REDACTED-SECRET]'), (r'`\\$\\(([^`]+)\\)`', '（命令 `\\\\1` 未在发布时执行，以仓库实际状态为准）')]:\n"
-            "        t = re.sub(pat, rep, t)\n"
-            "    t = t.replace(input.get('artifact_dir') or '', '[ARTIFACT-DIR]')\n"
-            "    # 落地事实由管线追加（模板统一给出，agent 自由文本只讲技术内容）：\n"
-            "    t = t + '\\n\\n---\\n*管线核验：分支 ' + str(input.get('branch_name')) + ' · 推送=' + str(input.get('pushed')) + ' · ' + str(input.get('merged_note')) + '*'\n"
-            "    p = input['artifact_dir'] + '/reply.md'\n"
-            "    open(p, 'w', encoding='utf-8').write(t)\n"
-            "    chk = subprocess.run(['gh', 'issue', 'view', str(input['issue_number']), '-R', input['repo_full'], '--json', 'comments', '--jq', '.comments | map(select(.body | contains(\"<!-- issue-pipeline -->\"))) | length'], capture_output=True, text=True, timeout=60)\n"
-            "    if chk.stdout.strip() not in ('', '0'):\n"
-            "        return {'posted': False, 'note': '已有 pipeline 评论（断点续跑），跳过'}\n"
-            "    r = subprocess.run(['gh', 'issue', 'comment', str(input['issue_number']), '-R', input['repo_full'], '--body-file', p], capture_output=True, text=True, timeout=60)\n"
-            "    return {'posted': r.returncode == 0, 'note': (r.stderr or '')[-200:]}\n"
-        ),
-        input={"text": reply.text, "artifact_dir": INPUT.artifact_dir,
-               "issue_number": INPUT.issue_number, "repo_full": INPUT.repo_full,
-               "branch_name": INPUT.branch_name, "pushed": deliver.pushed,
-               "merged_note": merge.note},
+    post = GITHUB_COMMENT(
+        repo=INPUT.repo_full,
+        issue_number=INPUT.issue_number,
+        text=reply.text,
+        artifact_dir=INPUT.artifact_dir,
+        dedup_marker="<!-- issue-pipeline -->",
+        footer=F.concat('管线核验：分支 ', INPUT.branch_name, ' · 推送=', pub.pushed, ' · ', pub.note),
     )
     kanban = CODE.python(
         sandbox_backend="subprocess",
@@ -699,8 +524,8 @@ def issue_pipeline(INPUT):
     return {
         "status": "done",
         "tests_passed": gate.passed,
-        "pushed": deliver.pushed,
-        "merged": merge.merged,
+        "pushed": pub.pushed,
+        "merged": pub.merged,
         "comment_posted": post.posted,
         "kanban_ok": kanban.kanban_ok,
     }

@@ -16,7 +16,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita")
 sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita-nodes/src")
 
-import plaita_nodes  # noqa: F401,E402  注册 agentrun/gate/capture/writefile/hitl
+import plaita_nodes  # noqa: F401,E402
+plaita_nodes.register_all()  # 显式注册全部节点——不依赖 pip dist-info entry-points 新鲜度
 from plaita.node import register_code_node  # E402
 
 register_code_node(default_backend="subprocess")

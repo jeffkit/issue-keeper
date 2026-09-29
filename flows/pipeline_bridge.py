@@ -87,6 +87,7 @@ def ensure_tool_path() -> str:
 ensure_sandbox_timeout()
 
 import plaita_nodes  # noqa: F401,E402
+plaita_nodes.register_all()  # 显式注册——dist-info entry-points 可能滞后于本地 src
 from plaita.node import register_code_node  # E402
 
 register_code_node(default_backend="subprocess")
