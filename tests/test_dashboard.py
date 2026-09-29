@@ -1,5 +1,8 @@
 """dashboard REST API 测试（FastAPI TestClient + 临时 db，不打网络）。"""
 
+import time
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from issue_keeper.dashboard import create_app
@@ -137,3 +140,71 @@ class TestDashboardApi:
         c.post("/api/projects", json={"name": "p", "agent_label": "a", "cwd": "/x"})
         ps = {p["project"]: p for p in c.get("/api/projects").json()}
         assert ps["p"]["role"] == "agent"
+
+
+# ── Pipeline 观测面端点（L2）─────────────────────────────────────────
+
+def _seed_metrics(tmp_path: Path) -> Path:
+    """在临时 metrics 目录造两个 run：一成一败（含门失败）。"""
+    import json
+    root = tmp_path / "metrics"
+    d = root / time.strftime("%Y-%m")
+    d.mkdir(parents=True)
+    (d / "run-a.json").write_text(json.dumps({
+        "schema": 1, "execution_id": "run-a", "repo": "jeffkit/a", "issue": 1,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "done", "ok": True,
+        "duration_secs": 120.0, "flow_version": "2.0.0",
+        "nodes": [
+            {"id": "investigate", "type": "agentrun", "status": "success", "duration_ms": 5000,
+             "model": "glm-52", "tokens": {"input": 100, "output": 30}},
+            {"id": "gate", "type": "gate", "status": "success", "duration_ms": 800,
+             "gate": "repo-tests", "passed": True, "exit_code": 0},
+        ],
+    }), encoding="utf-8")
+    (d / "run-b.json").write_text(json.dumps({
+        "schema": 1, "execution_id": "run-b", "repo": "jeffkit/a", "issue": 2,
+        "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": "partial", "ok": False,
+        "duration_secs": 240.0, "flow_version": "2.0.0",
+        "nodes": [
+            {"id": "gate", "type": "gate", "status": "error", "duration_ms": 900,
+             "gate": "test", "passed": False, "exit_code": 1, "fail_tail": "boom"},
+        ],
+    }), encoding="utf-8")
+    return root
+
+
+def test_pipeline_summary_endpoint(client, tmp_path, monkeypatch):
+    from issue_keeper import metrics as m
+    monkeypatch.setattr(m, "METRICS_DIR", _seed_metrics(tmp_path))
+    r = client.get("/api/pipeline/summary?days=30")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_runs"] == 2
+    assert body["success_rate"] == 0.5
+    assert body["by_repo"]["jeffkit/a"]["gate_failures"] == {"test": 1}
+    assert body["gate_failures"] == {"test": 1}
+
+
+def test_pipeline_runs_and_detail(client, tmp_path, monkeypatch):
+    from issue_keeper import metrics as m
+    monkeypatch.setattr(m, "METRICS_DIR", _seed_metrics(tmp_path))
+    r = client.get("/api/pipeline/runs?days=30&repo=jeffkit/a")
+    assert r.status_code == 200
+    runs = r.json()
+    assert len(runs) == 2
+    failed = next(x for x in runs if x["status"] == "partial")
+    assert failed["gate_failed"] == "test"
+    assert failed["segments"] == {"gate": 900}
+
+    d = client.get("/api/pipeline/runs/run-b")
+    assert d.status_code == 200
+    assert d.json()["nodes"][0]["fail_tail"] == "boom"
+    assert client.get("/api/pipeline/runs/missing").status_code == 404
+
+
+from pytest import fixture  # noqa: E402
+
+
+@fixture
+def client(tmp_path):
+    return _client(tmp_path)

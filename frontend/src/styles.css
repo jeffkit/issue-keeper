@@ -382,3 +382,37 @@ section h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight:
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #3a414f; }
+
+/* ── Pipeline 观测面（L2）────────────────────────────────────────── */
+.pipeline { padding: 16px 20px; }
+.pl-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.repo-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.repo-card { border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 10px 12px; cursor: pointer; background: #fff; }
+.repo-card.active { border-color: #4a7dbe; box-shadow: 0 0 0 2px rgba(74,125,190,.2); }
+.rc-name { font-weight: 600; margin-bottom: 4px; }
+.rc-stats { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+.rc-stats .bad { color: #c0392b; font-weight: 600; }
+.rc-gates { font-size: 12px; margin-top: 4px; }
+.rc-gates.bad { color: #c0392b; }
+.rc-statuses { font-size: 11px; margin-top: 4px; }
+.muted { color: #888; }
+.bad { color: #c0392b; }
+table.runs { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
+table.runs th, table.runs td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; white-space: nowrap; }
+.run-row { cursor: pointer; }
+.run-row:hover { background: #f5f8fc; }
+.chip { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #eef; }
+.st-done { background: #d9f2e3; color: #1e7c43; }
+.st-bad { background: #fde3e1; color: #b03028; }
+.st-early { background: #eef1f5; color: #5a6b7d; }
+.st-mid { background: #fdf3d7; color: #8a6d1a; }
+.segbar { display: flex; height: 10px; width: 160px; border-radius: 5px; overflow: hidden; background: #eee; }
+.seg { height: 100%; }
+.drawer { position: fixed; right: 0; top: 52px; bottom: 0; width: 52%; min-width: 560px; background: #fff; border-left: 1px solid #ddd; box-shadow: -6px 0 18px rgba(0,0,0,.08); padding: 14px 18px; overflow: auto; z-index: 30; }
+.drawer-head { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+table.nodes { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+table.nodes th, table.nodes td { border-bottom: 1px solid #eee; padding: 5px 7px; text-align: left; }
+table.nodes tr.row-bad { background: #fdf0ef; }
+
+.datasets { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
+.dataset-chip { border: 1px solid #ddd; border-radius: 12px; padding: 2px 10px; background: #fafbfc; }

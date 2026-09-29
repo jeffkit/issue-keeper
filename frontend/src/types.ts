@@ -85,3 +85,58 @@ export const STATUS_LABEL: Record<Status, string> = {
   done: "已完成",
   closed: "已关闭",
 };
+
+// ── Pipeline 观测面（L2）─────────────────────────────────────────────
+
+export interface PipelineRepoSummary {
+  runs: number;
+  done: number;
+  success_rate: number | null;
+  by_status: Record<string, number>;
+  duration_secs: { p50: number | null; max: number | null };
+  tokens: number | null;
+  gate_failures: Record<string, number>;
+}
+
+export interface PipelineSummary {
+  window_days: number;
+  total_runs: number;
+  success_rate: number | null;
+  duration_secs: { p50: number | null; p90: number | null };
+  tokens_total: number | null;
+  by_repo: Record<string, PipelineRepoSummary>;
+  gate_failures: Record<string, number>;
+  failure_nodes: Record<string, number>;
+  flow_versions: Record<string, number>;
+}
+
+export interface PipelineRunRow {
+  execution_id: string;
+  repo: string;
+  issue: number;
+  started: string;
+  status: string;
+  ok: boolean;
+  error?: string | null;
+  duration_secs: number | null;
+  flow_version?: string | null;
+  pushed?: boolean | null;
+  merged?: boolean | null;
+  comment_posted?: boolean | null;
+  base_branch?: string | null;
+  push_mode?: string | null;
+  gate_failed?: string | null;
+  tokens_total?: number | null;
+  segments: Record<string, number>;
+}
+
+export interface PipelineRunDetail {
+  execution_id: string;
+  repo: string;
+  issue: number;
+  status: string;
+  nodes: Array<Record<string, any>>;
+  [k: string]: any;
+}
+
+export interface BenchmarkInfo { name: string; latest_version: number | null; versions: Record<string, any>; }

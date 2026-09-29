@@ -310,3 +310,22 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
 8. **keeper 串行阻塞（2026-09-28）**：`_invoke_pipeline` 同步等 bridge，单 run 最长
    `pipeline_timeout_secs`（5400s），期间整个 17 仓轮询停摆（#45 实测卡 28 分钟）。
    与第 4 条的 per-repo 队列化一并做。
+
+## 可观测与改进闭环（L1-L4，2026-09-30）
+
+- **L1 数据地基**：bridge 的 `MetricsRecorder`（始终启用、fail-open）把每 run 的
+  节点级事实（时长/agent 模型与 token 用量/门级 PASS-FAIL/契约快照）落盘
+  `~/.issue-keeper/pipeline/metrics/<YYYY-MM>/<execution_id>.json`——本地永久，
+  是看板/巡检/数据集的单一事实源（Redis trace 只当 30 天实时窗口）。台账新增
+  `gate_failed/tokens_total/slowest_node`。
+- **L2 看板**：dashboard 新增 `/api/pipeline/{summary,runs,runs/{id}}` 与前端
+  「管线观测」页（按仓成功率/时长/段耗时堆叠条/失败门排名/token/console 深链）。
+- **L3 经验闭环**：`supervisor_patrol` 升级——按仓观测摘要 + 确定性规则产出
+  契约变更提案（`~/.issue-keeper/pipeline/proposals/`）：门超时→提预算
+  （exit 124）、agent 段超时≥2 次→提段预算、门连续失败→manual 人工。
+  审批：`python -m issue_keeper proposals list|show|apply <id>|reject <id>`
+  （数值类自动应用：备份→改数字→load_config 校验→失败回滚）。
+- **L4 benchmark**：`python -m issue_keeper benchmarks build/list/label/eval`——
+  从观测+产物构建 triage 评测集（auto-label 来自 run 结果，正文过消毒，
+  provenance 齐全），人工纠正即金标，回放评测打分入 manifest。
+  flow 新版本发布前跑 eval 不达标不发布（与 screener 的评测集+人签发布同模式）。

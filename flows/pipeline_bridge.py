@@ -346,6 +346,116 @@ class ArtifactPersistCallback(FlowCallback):
             print(f"[bridge] 产物持久化失败: {exc}", file=sys.stderr)
 
 
+class MetricsRecorder(FlowCallback):
+    """per-run 全量观测落盘（本地永久，fail-open，始终启用）。
+
+    Redis trace 30 天过期、artifact 目录分散——本回调把一次 run 的节点级
+    事实（时长/agent 模型与 token 用量/门级结果）聚合成单一 JSON，落
+    metrics/<YYYY-MM>/<execution_id>.json，作为看板聚合（L2）、经验巡检
+    （L3）、benchmark 构建（L4）的共同数据源。任何失败静默跳过不影响主管线。
+    """
+
+    def __init__(self, metrics_root: pathlib.Path | None):
+        self._root = metrics_root
+        self._nodes: list[dict] = []
+        self._t0: float | None = None
+        self._flow_t0: float | None = None
+
+    def on_flow_start(self, flow, **kwargs) -> None:
+        self._flow_t0 = time.monotonic()
+
+    def on_node_start(self, flow, node, **kwargs) -> None:
+        self._t0 = time.monotonic()
+
+    def on_node_end(self, flow, node, result=None, error=None, exception=None, **kwargs) -> None:
+        try:
+            if self._t0 is None:
+                return
+            duration_ms = int((time.monotonic() - self._t0) * 1000)
+            self._t0 = None
+            err = str(error or exception or "")
+            node_id = str(getattr(node, "id", "") or "node")
+            node_type = str(getattr(node, "node_type", type(node).__name__) or "")
+            entry: dict = {
+                "id": node_id,
+                "type": node_type,
+                "status": "error" if err else "success",
+                "duration_ms": duration_ms,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            if err:
+                entry["error"] = err[:300]
+                entry["timed_out"] = "timed out" in err.lower() or "timeout" in err.lower()
+            res = result if isinstance(result, dict) else {}
+            if node_type == "agentrun":
+                usage = res.get("usage") if isinstance(res.get("usage"), dict) else None
+                entry["agent"] = res.get("cli")
+                entry["model"] = res.get("model")
+                entry["session_id"] = res.get("session_id") or ""
+                entry["text_len"] = len(res.get("text") or "")
+                entry["usage"] = usage
+                entry["tokens"] = _usage_tokens(usage)
+            elif node_type == "gate":
+                entry["gate"] = res.get("gate")
+                entry["passed"] = res.get("passed")
+                entry["exit_code"] = res.get("exit_code")
+                entry["retries"] = res.get("retries")
+                if res.get("passed") is not True:
+                    entry["fail_tail"] = str(res.get("stdout") or "")[-300:]
+            elif node_type == "git_publish":
+                entry["pushed"] = res.get("pushed")
+                entry["merged"] = res.get("merged")
+                entry["note"] = str(res.get("note") or "")[:200]
+            elif node_type == "parse_json":
+                entry["parse_ok"] = res.get("parse_ok")
+                entry["verdict"] = res.get("verdict")
+            elif node_type == "github_comment":
+                entry["posted"] = res.get("posted")
+            elif node_type == "hitl":
+                entry["hitl_status"] = res.get("status")
+            self._nodes.append(entry)
+        except Exception as exc:  # noqa: BLE001 —— 观测不阻塞主管线
+            print(f"[bridge] metrics 采集失败（node_end）: {exc}", file=sys.stderr)
+
+    def finalize(self, meta: dict) -> dict:
+        """聚合本次 run 记录并落盘；返回记录（供台账补字段）。失败返回空 dict。"""
+        try:
+            record = {
+                "schema": 1,
+                **meta,
+                "duration_secs": round(time.monotonic() - self._flow_t0, 1)
+                if self._flow_t0 is not None else None,
+                "nodes": self._nodes,
+            }
+            if self._root is not None:
+                month = (meta.get("started") or time.strftime("%Y-%m"))[:7]
+                out = self._root / month / f"{meta.get('execution_id') or 'unknown'}.json"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(record, ensure_ascii=False, default=str),
+                               encoding="utf-8")
+            return record
+        except Exception as exc:  # noqa: BLE001
+            print(f"[bridge] metrics 落盘失败: {exc}", file=sys.stderr)
+            return {}
+
+
+def _usage_tokens(usage: dict | None) -> dict | None:
+    """从 provider 各异的使用结构里防御性提取 token 数（claude 风格字段优先）。"""
+    if not isinstance(usage, dict):
+        return None
+    def _num(*keys):
+        total = 0
+        for k in keys:
+            v = usage.get(k)
+            if isinstance(v, (int, float)):
+                total += v
+        return total
+    return {
+        "input": _num("input_tokens", "prompt_tokens", "promptTokens"),
+        "output": _num("output_tokens", "completion_tokens", "completionTokens"),
+    }
+
+
 class BridgeTraceCallback(FlowCallback):
     """节点级 trace 回调：形状对齐 console local_executor 的 _LocalTraceCallback，
     落点从 sqlite 换成 ConsoleReporter（Redis）。"""
@@ -448,7 +558,10 @@ def main() -> None:
     trace_cb = BridgeTraceCallback(reporter) if reporter is not None else None
     langfuse_cb = _build_langfuse_callback()
     artifact_cb = ArtifactPersistCallback(artifact_dir_flag)
-    handlers = [cb for cb in (langfuse_cb, trace_cb, artifact_cb) if cb is not None]
+    metrics_root = pathlib.Path("~/.issue-keeper/pipeline/metrics").expanduser()
+    metrics_cb = MetricsRecorder(metrics_root)
+    handlers = [cb for cb in (langfuse_cb, trace_cb, artifact_cb, metrics_cb)
+                if cb is not None]
 
     try:
         flow = build_flow(definition)
@@ -467,20 +580,45 @@ def main() -> None:
 
     result = normalize_result(result)
 
-    if reporter is not None:
-        try:
-            reporter.finish(
-                "completed" if ok else "failed",
-                output=result if ok else None,
-                error=None if ok else {"message": result.get("error", ""), "type": "engine_error"},
-            )
-        except Exception as exc:
-            print(f"[bridge] 观测上报失败（finish）: {exc}", file=sys.stderr)
-    if langfuse_cb is not None:
-        try:
-            langfuse_cb.finalize()
-        except Exception:
-            pass
+    # per-run 全量观测落盘（L1 数据地基；fail-open，不影响主管线）
+    metrics_record = metrics_cb.finalize({
+        "execution_id": execution_id,
+        "repo": payload.get("repo_full"),
+        "issue": payload.get("issue_number"),
+        "started": started,
+        "ended": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "status": result.get("status"),
+        "ok": ok,
+        "error": result.get("error"),
+        "comment_posted": result.get("comment_posted"),
+        "pushed": result.get("pushed"),
+        "merged": result.get("merged"),
+        "flow_source": flow_source,
+        "flow_version": flow_version,
+        # 契约快照：把结果与 per-repo 配置关联（调参前后对比的数据基础）
+        "base_branch": payload.get("base_branch"),
+        "push_mode": payload.get("push_mode"),
+        "review_mode": payload.get("review_mode"),
+        "readonly": payload.get("readonly"),
+        "test_command": payload.get("test_command"),
+    })
+
+    def _ledger_extras() -> dict:
+        """从 metrics 记录提炼台账增强字段（门失败名/token 合计/最慢节点）。"""
+        if not metrics_record:
+            return {}
+        nodes = metrics_record.get("nodes") or []
+        gate_failed = next((n.get("gate") for n in nodes
+                            if n.get("type") == "gate" and n.get("passed") is not True), None)
+        tokens = sum((n.get("tokens") or {}).get("input", 0) + (n.get("tokens") or {}).get("output", 0)
+                     for n in nodes if n.get("type") == "agentrun")
+        slow = max((n for n in nodes if n.get("type") in ("agentrun", "gate")),
+                   key=lambda n: n.get("duration_ms") or 0, default=None)
+        return {
+            "gate_failed": gate_failed,
+            "tokens_total": tokens or None,
+            "slowest_node": f"{slow['id']}:{slow['duration_ms']}ms" if slow else None,
+        }
 
     append_ledger({
         "ts": started,
@@ -496,7 +634,24 @@ def main() -> None:
         "flow_source": flow_source,
         "flow_version": flow_version,
         "execution_id": execution_id,
+        **_ledger_extras(),
     })
+
+    if reporter is not None:
+        try:
+            reporter.finish(
+                "completed" if ok else "failed",
+                output=result if ok else None,
+                error=None if ok else {"message": result.get("error", ""), "type": "engine_error"},
+            )
+        except Exception as exc:
+            print(f"[bridge] 观测上报失败（finish）: {exc}", file=sys.stderr)
+    if langfuse_cb is not None:
+        try:
+            langfuse_cb.finalize()
+        except Exception:
+            pass
+
     print("RESULT " + json.dumps(result, ensure_ascii=False, default=str))
 
 

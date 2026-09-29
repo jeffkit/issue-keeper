@@ -1,5 +1,9 @@
 import type {
   Issue,
+  BenchmarkInfo,
+  PipelineRunDetail,
+  PipelineRunRow,
+  PipelineSummary,
   IssueDetail,
   Project,
   Status,
@@ -139,4 +143,24 @@ export function closeIssue(
       body: JSON.stringify(data),
     }),
   );
+}
+
+// ── Pipeline 观测面（L2）─────────────────────────────────────────────
+
+export function pipelineSummary(days: number): Promise<PipelineSummary> {
+  return j(fetch(`${BASE}/pipeline/summary?days=${days}`));
+}
+
+export function pipelineRuns(days: number, repo: string): Promise<PipelineRunRow[]> {
+  const q = new URLSearchParams({ days: String(days) });
+  if (repo) q.set("repo", repo);
+  return j(fetch(`${BASE}/pipeline/runs?${q}`));
+}
+
+export function pipelineRunDetail(executionId: string): Promise<PipelineRunDetail> {
+  return j(fetch(`${BASE}/pipeline/runs/${encodeURIComponent(executionId)}`));
+}
+
+export function benchmarksList(): Promise<BenchmarkInfo[]> {
+  return j(fetch(`${BASE}/benchmarks`));
 }

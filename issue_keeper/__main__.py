@@ -424,6 +424,70 @@ def _run_onboard(args) -> int:
     return 0
 
 
+def _run_proposals(args) -> int:
+    """L3 经验闭环：契约变更提案的生成/列表/应用/驳回。"""
+    import json
+
+    from . import proposals
+
+    if args.action == "generate":
+        created = proposals.generate(days=args.days)
+        print(f"新提案 {len(created)} 条：")
+        for p in created:
+            mark = "（manual）" if p["status"] == "manual" else ""
+            print(f"  [{p['id']}] {p['repo']} {p['kind']} → {p['target']} {mark}｜{p['reason']}")
+        return 0
+    if args.action == "list":
+        for p in proposals.list_proposals(status=args.status or None):
+            print(f"[{p['id']}] {p['status']:8s} {p['repo']} {p['kind']} → {p['target']}｜{p['reason']}")
+        return 0
+    if args.action == "show":
+        props = [p for p in proposals.list_proposals() if p["id"] == args.id]
+        if not props:
+            print(f"找不到提案 {args.id}")
+            return 1
+        print(json.dumps(props[0], ensure_ascii=False, indent=1))
+        return 0
+    if args.action == "apply":
+        config_path = args.config or str(
+            Path("~/.issue-keeper/config.yaml").expanduser())
+        out = proposals.apply_proposal(args.id, config_path, factor=args.factor)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0 if out.get("applied") else 1
+    if args.action == "reject":
+        print(json.dumps(proposals.reject_proposal(args.id), ensure_ascii=False))
+        return 0
+    return 2
+
+
+def _run_benchmarks(args) -> int:
+    """L4：benchmark 数据集构建/标注/评测。"""
+    import json
+
+    from . import benchmarks as B
+
+    if args.action == "build":
+        out = B.build_triage(days=args.days)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    if args.action == "list":
+        for d in B.list_datasets():
+            latest = d.get("latest_version")
+            info = (d.get("versions") or {}).get(str(latest), {})
+            print(f"{d['name']} v{latest}: {info.get('count')} cases · "
+                  f"{info.get('by_expected')} · 构建于 {info.get('created')}")
+        return 0
+    if args.action == "label":
+        out = B.label_case(args.name, args.case_id, args.expected)
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+    if args.action == "eval":
+        out = B.eval_triage(args.name, agent=args.agent, limit=args.limit)
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+        return 0
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="issue-keeper",
@@ -506,6 +570,40 @@ def main(argv: list[str] | None = None) -> int:
                             help="角色：agent（默认）/ keeper（管理向，帮人类管 issue）")
     onb_parser.add_argument("--reload", action="store_true", help="立即重载 keeper daemon（macOS launchd）；不加重载则等下一轮 live-reload")
 
+    # proposals：L3 经验闭环（观测 → 契约变更提案 → 审批应用）
+    prop_parser = subparsers.add_parser(
+        "proposals", help="契约变更提案：generate/list/show/apply/reject（观测数据驱动的调参闭环）")
+    prop_sub = prop_parser.add_subparsers(dest="action", required=True)
+    p_gen = prop_sub.add_parser("generate", help="扫观测窗生成新提案（可重复跑，自动去重）")
+    p_gen.add_argument("--days", type=int, default=7, help="观测窗口（天，默认 7）")
+    p_list = prop_sub.add_parser("list", help="列提案（--status 过滤）")
+    p_list.add_argument("--status", choices=["pending", "applied", "rejected", "manual"])
+    p_show = prop_sub.add_parser("show", help="看单条提案详情")
+    p_show.add_argument("id")
+    p_apply = prop_sub.add_parser("apply", help="应用数值类提案（自动备份+校验+失败回滚）")
+    p_apply.add_argument("id")
+    p_apply.add_argument("--config", help="config.yaml 路径（默认 ~/.issue-keeper/config.yaml）")
+    p_apply.add_argument("--factor", type=float, default=1.5, help="数值放大系数（默认 1.5）")
+    p_reject = prop_sub.add_parser("reject", help="驳回提案")
+    p_reject.add_argument("id")
+
+    # benchmarks：L4 数据集（观测沉淀 → 评测集 → flow 版本发布门）
+    bm_parser = subparsers.add_parser(
+        "benchmarks", help="benchmark 数据集：build/list/label/eval（triage 评测集）")
+    bm_sub = bm_parser.add_subparsers(dest="action", required=True)
+    p_bm_build = bm_sub.add_parser("build", help="从观测窗构建 triage 数据集新版本")
+    p_bm_build.add_argument("--days", type=int, default=60, help="观测窗口（天，默认 60）")
+    bm_sub.add_parser("list", help="列数据集")
+    p_bm_label = bm_sub.add_parser("label", help="人工纠正 case 金标")
+    p_bm_label.add_argument("name")
+    p_bm_label.add_argument("case_id")
+    p_bm_label.add_argument("--expected", required=True,
+                            choices=["actionable", "blocked", "invalid"])
+    p_bm_eval = bm_sub.add_parser("eval", help="回放评测（冻结提示词，真实 LLM 单段调用）")
+    p_bm_eval.add_argument("name")
+    p_bm_eval.add_argument("--agent", default="glm-turbo")
+    p_bm_eval.add_argument("--limit", type=int, default=30)
+
     # internal source 管理
     internal_parser = subparsers.add_parser("internal", help="管理 internal source 的 issue")
     internal_sub = internal_parser.add_subparsers(dest="internal_cmd", required=True)
@@ -567,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_team(args)
     if args.cmd == "onboard":
         return _run_onboard(args)
+    if args.cmd == "proposals":
+        return _run_proposals(args)
+    if args.cmd == "benchmarks":
+        return _run_benchmarks(args)
 
     return 2
 

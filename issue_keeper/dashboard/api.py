@@ -348,3 +348,106 @@ def close_issue(
     )
     fresh = src.get_issue(project, kind, number)
     return _resource_to_dict(fresh) if fresh else _resource_to_dict(res)
+
+
+# ── Pipeline 观测面（L2）：消费 bridge MetricsRecorder 的 metrics 落盘 ──
+
+
+@router.get("/pipeline/summary")
+def pipeline_summary(days: int = 30, repo: str = "") -> dict[str, Any]:
+    """按仓聚合：成功率/时长分布/状态分布/失败门 top/token/flow 版本分布。"""
+    from .. import metrics as m
+    days = max(1, min(days, 365))
+    return m.summarize(days=days, repo=repo or None)
+
+
+@router.get("/pipeline/runs")
+def pipeline_runs(
+    days: int = 30,
+    repo: str = "",
+    status: str = "",
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """run 列表（新→旧），附段耗时摘要与门结果。"""
+    from .. import metrics as m
+    days = max(1, min(days, 365))
+    limit = max(1, min(limit, 500))
+    out = []
+    for rec in m.iter_runs(days=days, repo=repo or None):
+        if status and rec.get("status") != status:
+            continue
+        nodes = rec.get("nodes") or []
+        out.append({
+            "execution_id": rec.get("execution_id"),
+            "repo": rec.get("repo"),
+            "issue": rec.get("issue"),
+            "started": rec.get("started"),
+            "status": rec.get("status"),
+            "ok": rec.get("ok"),
+            "error": rec.get("error"),
+            "duration_secs": rec.get("duration_secs"),
+            "flow_version": rec.get("flow_version"),
+            "pushed": rec.get("pushed"),
+            "merged": rec.get("merged"),
+            "comment_posted": rec.get("comment_posted"),
+            "base_branch": rec.get("base_branch"),
+            "push_mode": rec.get("push_mode"),
+            "gate_failed": next((n.get("gate") for n in nodes
+                                 if n.get("type") == "gate" and n.get("passed") is not True), None),
+            "tokens_total": sum(
+                ((n.get("tokens") or {}).get("input") or 0)
+                + ((n.get("tokens") or {}).get("output") or 0)
+                for n in nodes if n.get("type") == "agentrun") or None,
+            "segments": m.segments_of(rec),
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+@router.get("/pipeline/runs/{execution_id}")
+def pipeline_run_detail(execution_id: str) -> dict[str, Any]:
+    """单次 run 的节点级详情（含每段 agent/model/usage/门级结果）。"""
+    from .. import metrics as m
+    rec = m.run_detail(execution_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"找不到 run {execution_id}")
+    rec.pop("_path", None)
+    return rec
+
+
+# ── Benchmarks（L4）：数据集列表 / case 浏览 / 人工标注 ────────────────
+
+
+@router.get("/benchmarks")
+def benchmarks_list() -> list[dict[str, Any]]:
+    from .. import benchmarks as b
+    return b.list_datasets()
+
+
+@router.get("/benchmarks/{name}")
+def benchmarks_cases(name: str, version: int = 0) -> dict[str, Any]:
+    from .. import benchmarks as b
+    v = version or b.latest_version(name)
+    if v is None:
+        raise HTTPException(status_code=404, detail=f"数据集 {name} 不存在")
+    cases = b.load_cases(name, v)
+    return {
+        "name": name, "version": v, "count": len(cases),
+        "unlabeled": sum(1 for c in cases if not c.get("expected")),
+        "cases": cases,
+    }
+
+
+class LabelReq(BaseModel):
+    case_id: str
+    expected: str = Field(pattern="^(actionable|blocked|invalid)$")
+
+
+@router.post("/benchmarks/{name}/label")
+def benchmarks_label(name: str, req: LabelReq) -> dict[str, Any]:
+    from .. import benchmarks as b
+    try:
+        return b.label_case(name, req.case_id, req.expected)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))

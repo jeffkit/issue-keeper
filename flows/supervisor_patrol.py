@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""issue-pipeline supervisor 巡检：读台账 + keeper 日志 → 生成运行报告与改进建议。
+"""issue-pipeline supervisor 巡检：读台账+metrics+keeper 日志 → 运行报告 + 契约变更提案。
 
 用法：python3 flows/supervisor_patrol.py [--ledger PATH] [--log PATH]
 输出：~/.issue-keeper/pipeline/report-latest.md（同时打印摘要到 stdout）
+      提案落 ~/.issue-keeper/pipeline/proposals/*.json（L3 闭环；pending 提案用
+      `python -m issue_keeper proposals apply <id>` 审批应用）
 定时：LaunchAgent cc.agentstudio.issue-pipeline-patrol（每 4 小时）
 """
 import json
 import pathlib
+import sys
 import time
 from collections import Counter
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))  # 仓根：让巡检能 import issue_keeper
+
+from issue_keeper import metrics as m  # noqa: E402
+from issue_keeper import proposals as P  # noqa: E402
 
 LEDGER = pathlib.Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
 KLOG = pathlib.Path("~/.issue-keeper/keeper.log").expanduser()
@@ -75,6 +84,20 @@ status_counts = Counter(r.get("status") for r in RUNS)
 alerts = keeper_alerts()
 sugg = suggestions(status_counts, alerts)
 
+# L3：从 metrics 提炼契约变更提案（确定性规则，去重后落盘待审批）
+try:
+    new_props = P.generate(days=7)
+except Exception as exc:  # noqa: BLE001 —— 巡检不受提案故障影响
+    new_props = []
+    print(f"[patrol] 提案生成失败: {exc}", file=sys.stderr)
+pending = P.list_proposals(status="pending")
+
+# 按仓观测摘要（metrics 为主口径；无 metrics 的旧 run 仍在台账统计里）
+try:
+    summary = m.summarize(days=7)
+except Exception:
+    summary = {}
+
 lines = [
     f"# issue-pipeline 巡检报告 {time.strftime('%Y-%m-%d %H:%M')}",
     "",
@@ -86,11 +109,39 @@ lines = [
     "## 近 24h keeper 错误",
     *(["```", *alerts[-10:], "```"] if alerts else ["（无）"]),
     "",
+    "## 按仓观测（近 7 天，metrics 口径）",
+]
+for repo, s in (summary.get("by_repo") or {}).items():
+    dur = s.get("duration_secs") or {}
+    lines.append(
+        f"- {repo}: {s['runs']} runs · 成功率 {s['success_rate'] if s['success_rate'] is not None else '—'}"
+        f" · p50 {dur.get('p50') or '—'}s · tokens {s.get('tokens') or 0}"
+        + (f" · 门失败 {s['gate_failures']}" if s.get("gate_failures") else ""))
+if not (summary.get("by_repo") or {}):
+    lines.append("（metrics 无数据——v0.3 部署后开始积累）")
+
+lines += [
+    "",
     "## 建议",
     *(f"- {s}" for s in sugg),
     "",
+    "## 契约变更提案（L3）",
 ]
+if new_props:
+    lines.append(f"本次新增 {len(new_props)} 条：")
+    for p in new_props:
+        lines.append(f"- [{p['id']}] {p['repo']} {p['kind']} → {p['target']}｜{p['reason']}"
+                     + ("（需人工）" if p["status"] == "manual" else
+                        f"（python -m issue_keeper proposals apply {p['id']}）"))
+else:
+    lines.append("本次无新提案。")
+if pending:
+    lines.append(f"待审批 {len(pending)} 条：")
+    for p in pending:
+        lines.append(f"- [{p['id']}] {p['repo']} {p['kind']} → {p['target']}｜{p['reason']}")
+lines.append("")
+
 OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text("\n".join(lines), encoding="utf-8")
 print(f"报告已写 {OUT}")
-print("\n".join(lines[-len(sugg) - 1:]))
+print("\n".join(lines[-len(sugg) - len(new_props) - len(pending) - 4:]))
