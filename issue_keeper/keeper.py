@@ -449,9 +449,9 @@ def _process_resource(
 
             # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
             if config.pipeline_mode:
-                in_flight = _count_in_flight(state)
+                in_flight = max(pipeline_in_flight, 0)
                 if in_flight >= max(1, config.pipeline_max_in_flight):
-                    # 全局并发上限（默认 2）：不标记 processed，下轮腾出槽位再派。
+                    # 全局并发上限：不标记 processed，下轮腾出槽位再派。
                     log.info("[%s] 在途管线 run %d/%d，本轮不派发", label,
                              in_flight, config.pipeline_max_in_flight)
                     return 0
