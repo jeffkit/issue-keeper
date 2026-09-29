@@ -340,6 +340,9 @@ def _slim_input(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if k not in ("console", "observability_redis")}
 
 
+# 注：2026-09-29 曾在此安装 pre-push 守卫拦「工作树直推 main」，当天已移除——
+# 那次误判了另一会话的正常落地，钩子也会静默挡住合法流程；main 是否绿改由 CI 说了算。
+#
 # ⚠️ 不要再让管线共用主 clone 的 CARGO_TARGET_DIR（v1.0.8 试过，已回滚）
 # 2026-09-28 曾把 CARGO_TARGET_DIR 指到 <main_clone>/target 想让 worktree 复用热依赖，
 # 2026-09-29 实测发现它会**链接到另一个 checkout 的库**：同一工作区在两个目录下共用
@@ -352,61 +355,10 @@ def _slim_input(payload: dict) -> dict:
 # 并用提示词限制 agent 的自检范围，而不是共用 target。
 
 
-PUSH_GUARD_HOOK = """#!/bin/sh
-# issue-keeper 推送守卫（由 flows/pipeline_bridge.py 安装，请勿手改）。
-#
-# 2026-09-29：一个 implement agent 自己 commit → `git rebase main` → 把 main 推了上去，
-# 绕过了 gate 与 guard（推上去的代码在 recursive-tui 的 clippy 上直接挂掉，main 变红）。
-# 提示词里"不要 push"拦不住 agent，所以在 git 层拦。
-#
-# 只对 **linked worktree** 生效（GIT_DIR 形如 <common>/worktrees/<name>）：
-#   - 人工在主 checkout 里的推送不受影响；
-#   - flow 的 deliver（在工作树里推分支）不受影响（只拦 refs/heads/main）；
-#   - flow 的 merge（在 main clone 里推 main）不受影响。
-case "${GIT_DIR:-}" in
-  */worktrees/*) ;;
-  *) exit 0 ;;
-esac
-while read -r _local_ref _local_sha remote_ref _remote_sha; do
-  if [ "$remote_ref" = "refs/heads/main" ]; then
-    echo "issue-keeper: 拒绝从管线工作树直接推送 main —— 请让 flow 的 deliver/merge 节点处理。" >&2
-    exit 1
-  fi
-done
-exit 0
-"""
-
-
-def ensure_push_guard(main_clone: str) -> str:
-    """在主 clone 的 hooks 目录安装 pre-push 守卫（幂等）。
-
-    已存在同名 hook 且不是我们装的 → 不动它（避免覆盖用户自己的 hook），返回 ""。
-    """
-    if not main_clone:
-        return ""
-    hook = pathlib.Path(main_clone) / ".git" / "hooks" / "pre-push"
-    if not hook.parent.is_dir():
-        return ""
-    try:
-        if hook.exists():
-            if hook.read_text(encoding="utf-8", errors="replace") != PUSH_GUARD_HOOK:
-                return ""
-        else:
-            hook.write_text(PUSH_GUARD_HOOK, encoding="utf-8")
-        hook.chmod(0o755)
-    except OSError:
-        return ""
-    return str(hook)
-
-
 def main() -> None:
     t0 = time.time()
     payload = json.load(sys.stdin)
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-    guard_hook = ensure_push_guard(str(payload.get("main_clone") or ""))
-    if guard_hook:
-        print(f"[bridge] pre-push 守卫: {guard_hook}（拦工作树直推 main）", file=sys.stderr)
 
     added_path = ensure_tool_path()
     if added_path:
