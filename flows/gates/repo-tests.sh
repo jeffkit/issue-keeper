@@ -10,5 +10,9 @@ export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:
 
 echo "== cargo fmt --all --check =="
 cargo fmt --all --check || exit 1
+# clippy 必须进：2026-09-29 一个 agent 绕过门直接推了 main，挂的正是
+# recursive-tui 的 clippy（MutexGuard held across await）——门当时只跑 fmt+test。
+echo "== cargo clippy --workspace --all-targets --all-features -- -D warnings =="
+cargo clippy --workspace --all-targets --all-features -- -D warnings || exit 1
 echo "== cargo test --workspace --no-fail-fast =="
 cargo test --workspace --no-fail-fast

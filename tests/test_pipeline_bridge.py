@@ -76,3 +76,27 @@ def test_sandbox_timeout_explicit_env_wins(monkeypatch):
     bridge.ensure_sandbox_timeout()
     assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "120"
 
+
+
+# ── pre-push 守卫（2026-09-29：agent 自己把 main 推了）────────────────────────
+
+def test_push_guard_installed_and_idempotent(tmp_path):
+    (tmp_path / ".git" / "hooks").mkdir(parents=True)
+    first = bridge.ensure_push_guard(str(tmp_path))
+    assert first.endswith(".git/hooks/pre-push")
+    assert os.access(first, os.X_OK)
+    assert bridge.ensure_push_guard(str(tmp_path)) == first  # 幂等
+    assert "refs/heads/main" in open(first, encoding="utf-8").read()
+
+
+def test_push_guard_does_not_clobber_foreign_hook(tmp_path):
+    hooks = tmp_path / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "pre-push").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    assert bridge.ensure_push_guard(str(tmp_path)) == ""
+    assert "issue-keeper" not in (hooks / "pre-push").read_text(encoding="utf-8")
+
+
+def test_push_guard_skips_non_git(tmp_path):
+    assert bridge.ensure_push_guard(str(tmp_path)) == ""
+    assert bridge.ensure_push_guard("") == ""
