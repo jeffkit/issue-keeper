@@ -253,14 +253,26 @@
    },
    "source_line": 351,
    "next": "fix_review",
-   "else_next": "cmd"
+   "else_next": "sync_main"
+  },
+  {
+   "type": "code",
+   "id": "sync_main",
+   "language": "python",
+   "code": "def run(input):\n    import subprocess\n    wt = input['worktree_dir']\n    def sh(args, t=120):\n        return subprocess.run(args, cwd=wt, capture_output=True, text=True, timeout=t)\n    sh(['git', 'fetch', 'origin'])\n    behind = sh(['git', 'rev-list', '--count', 'HEAD..origin/main'])\n    n = (behind.stdout or '0').strip()\n    if behind.returncode != 0 or n == '0':\n        return {'synced': False, 'note': 'main 无新提交'}\n    dirty = (sh(['git', 'status', '--porcelain']).stdout or '').strip()\n    if dirty:\n        sh(['git', 'stash', 'push', '-u', '-m', 'issue-pipeline-sync'])\n    r = sh(['git', 'merge', '--ff-only', 'origin/main'])\n    if r.returncode != 0:\n        if dirty:\n            sh(['git', 'stash', 'pop'])\n        return {'synced': False, 'note': 'ff 同步失败', 'error': (r.stderr or '')[-300:]}\n    popped = ''\n    if dirty:\n        p = sh(['git', 'stash', 'pop'], 300)\n        if p.returncode != 0:\n            return {'synced': False, 'note': 'stash pop 有冲突，需人工处理', 'error': (p.stderr or '')[-300:]}\n        popped = '；工作区改动已从 stash 恢复'\n    return {'synced': True, 'note': 'main 前进 %s 个提交，已同步%s' % (n, popped)}\n",
+   "input": {
+    "worktree_dir": "$INPUT.worktree_dir"
+   },
+   "sandbox_backend": "subprocess",
+   "next": "cmd",
+   "source_line": 368
   },
   {
    "type": "assignment",
    "id": "cmd",
    "output": "$F.or($INPUT.test_command, \"true\")",
    "next": "gate",
-   "source_line": 366
+   "source_line": 402
   },
   {
    "type": "gate",
@@ -271,7 +283,7 @@
    "timeout_secs": 2400,
    "max_retries": 0,
    "next": "_n8",
-   "source_line": 367
+   "source_line": 403
   },
   {
    "type": "if",
@@ -281,7 +293,7 @@
     "operator": "ne",
     "value": true
    },
-   "source_line": 374,
+   "source_line": 410,
    "next": "fix_test",
    "else_next": "guard"
   },
@@ -295,7 +307,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "_n9",
-   "source_line": 414
+   "source_line": 450
   },
   {
    "type": "if",
@@ -305,7 +317,7 @@
     "operator": "ne",
     "value": true
    },
-   "source_line": 436,
+   "source_line": 472,
    "next": "reply_guard",
    "else_next": "document"
   },
@@ -317,7 +329,7 @@
    "timeout_secs": 300,
    "prompt": "按本仓惯例补文档，**只针对本次改动**：先跑 `git diff` 与 `git status -uall` 看清这次改了什么，再动笔。\n本 issue：{% $INPUT.repo_full %} #{% $INPUT.issue_number %}《{% $INPUT.title %}》，建议提交信息：{% $NODE.parsed.commit_message %}。\nCHANGELOG.md（若有）Unreleased 段加 1-2 条**如实描述本次 diff** 的条目，编号必须写本 issue 号；严禁抄写/改编别处的历史条目来凑数（编号写错=事故，2026-09-28 有过一次把 A 的改动记成 B）。journal/milestone 按先例补最简记录；没有这些机制就什么都不改；拿不准就 SKIP。\n不动源码，不 commit、不 push。完成后只回复一行：DONE 或 SKIP",
    "next": "pub",
-   "source_line": 457
+   "source_line": 493
   },
   {
    "type": "git_publish",
@@ -329,7 +341,7 @@
    "merge_mode": "$INPUT.push_mode",
    "main_clone": "$INPUT.main_clone",
    "next": "reply",
-   "source_line": 474
+   "source_line": 510
   },
   {
    "type": "agentrun",
@@ -339,7 +351,7 @@
    "timeout_secs": 600,
    "prompt": "为 GitHub issue 写处理完成评论（直接给正文）。这是对外发布的最终评论，不是工作汇报。素材（自己读文件，不要臆造）：调查 {% $INPUT.artifact_dir %}/01-investigation.md、计划与实施记录 {% $INPUT.artifact_dir %}/02-plan.md。事实：本仓测试命令={% $INPUT.test_command %}（为空则如实注明「本仓未配置统一测试命令，质量门为独立 review」）；质量门 passed={% $NODE.gate.passed %}；分支 {% $INPUT.branch_name %}；推送 pushed={% $NODE.pub.pushed %}；合并备注 {% $NODE.pub.note %}。issue 礼仪：结论先行（做了什么 + commit/分支/PR 等可核验引用）；只写根因/方案要点、改动文件清单、测试情况、在哪 review；不要叙述工作过程（不要「我先调查…然后实现…」这类经过），不要写内部状态（如「本地未推送」），不要出现任何本机路径或凭据信息。commit 哈希必须是上文事实里的真实值；拿不到真实哈希就写「见 main 最新提交」，禁止输出 `$(…)` 等未执行的命令替换占位。首行加 <!-- issue-pipeline -->。纯文本 markdown 10 句内。",
    "next": "post",
-   "source_line": 482
+   "source_line": 518
   },
   {
    "type": "github_comment",
@@ -351,7 +363,7 @@
    "dedup_marker": "<!-- issue-pipeline -->",
    "footer": "$F.concat(\"管线核验：分支 \", $INPUT.branch_name, \" · 推送=\", $NODE.pub.pushed, \" · \", $NODE.pub.note)",
    "next": "kanban",
-   "source_line": 502
+   "source_line": 538
   },
   {
    "type": "code",
@@ -364,7 +376,7 @@
    },
    "sandbox_backend": "subprocess",
    "next": "_n10",
-   "source_line": 510
+   "source_line": 546
   },
   {
    "type": "end",
@@ -378,7 +390,7 @@
     "kanban_ok": "$NODE.kanban.kanban_ok"
    },
    "resultType": "success",
-   "source_line": 524
+   "source_line": 560
   },
   {
    "type": "agentrun",
@@ -388,7 +400,7 @@
    "timeout_secs": 600,
    "prompt": "为 GitHub issue 写评论（直接给正文）：实现已完成但改动越出计划边界，自动管线已停止推送，请人工检查。越界文件：{% $NODE.guard.violations %}，oversized={% $NODE.guard.oversized %}。分支 {% $INPUT.branch_name %} 保留在本地未推送。纯文本 4-8 句，不要出现任何本机路径或凭据信息。",
    "next": "post_guard",
-   "source_line": 437
+   "source_line": 473
   },
   {
    "type": "github_comment",
@@ -398,7 +410,7 @@
    "text": "$NODE.reply_guard.text",
    "artifact_dir": "$INPUT.artifact_dir",
    "next": "_n11",
-   "source_line": 448
+   "source_line": 484
   },
   {
    "type": "end",
@@ -408,7 +420,7 @@
     "posted": "$NODE.post_guard.posted"
    },
    "resultType": "success",
-   "source_line": 454
+   "source_line": 490
   },
   {
    "type": "agentrun",
@@ -418,7 +430,7 @@
    "timeout_secs": 900,
    "prompt": "测试门未过，请修复。失败输出（截断）：{% $NODE.gate.stdout %}\n约束：只修让测试变绿的代码，不做计划外重构，不 commit、不 push。完成后只回复一行：DONE <修了什么>",
    "next": "retest",
-   "source_line": 375
+   "source_line": 411
   },
   {
    "type": "gate",
@@ -429,7 +441,7 @@
    "timeout_secs": 2400,
    "max_retries": 0,
    "next": "_n12",
-   "source_line": 385
+   "source_line": 421
   },
   {
    "type": "if",
@@ -439,7 +451,7 @@
     "operator": "ne",
     "value": true
    },
-   "source_line": 392,
+   "source_line": 428,
    "next": "reply_partial",
    "else_next": "guard"
   },
@@ -451,7 +463,7 @@
    "timeout_secs": 600,
    "prompt": "为 GitHub issue 写诚实的中期评论（直接给正文）：实现已完成但全量测试两轮未过，自动处理停止。改动保留在本地 worktree（分支 {% $INPUT.branch_name %}，尚未推送）。只归纳失败模块与错误类型，不要贴原始测试输出。说明需人工接手的事项。纯文本 5-8 句，不要出现任何本机路径或凭据信息。",
    "next": "post_partial",
-   "source_line": 394
+   "source_line": 430
   },
   {
    "type": "github_comment",
@@ -461,7 +473,7 @@
    "text": "$NODE.reply_partial.text",
    "artifact_dir": "$INPUT.artifact_dir",
    "next": "_n13",
-   "source_line": 405
+   "source_line": 441
   },
   {
    "type": "end",
@@ -471,7 +483,7 @@
     "posted": "$NODE.post_partial.posted"
    },
    "resultType": "success",
-   "source_line": 411
+   "source_line": 447
   },
   {
    "type": "agentrun",
@@ -480,7 +492,7 @@
    "repo": "$INPUT.worktree_dir",
    "timeout_secs": 2700,
    "prompt": "按独立审查员的指令修正工作目录未提交改动：{% $NODE.verdict.notes %}。只做指令范围修改，不 commit、不 push；自检用相关用例，**不要跑全量测试**（门会跑）。完成后只回复一行：DONE <一句话>",
-   "next": "cmd",
+   "next": "sync_main",
    "source_line": 352
   },
   {

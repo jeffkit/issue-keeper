@@ -141,6 +141,12 @@ class Config:
     # 5 轮全部超时/拦截。0 = 不限；到顶后本轮跳过、不消费首次响应（次日自动重试，
     # 人工处置后也可 reopen 立即重派）。
     pipeline_issue_daily_limit: int = 2
+    # 同时刻在跑的管线 run 上限（跨仓；worktree 天然隔离不同 issue）。
+    # 2026-09-29 派发解耦后 keeper 不再被长 run 阻塞，这个池子才有意义。
+    pipeline_max_in_flight: int = 2
+    # 派发时在 issue 上发一条「已认领」评论：多会话/多人并行的机器可读信号
+    # （2026-09-29 与另一会话在同一 issue 撞车的教训）。
+    pipeline_claim_comment: bool = True
     # 混合形态（定义归 console + 观测进 console，执行留本地 bridge）
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     # 回评礼仪化：agent 原始输出发布前消毒 + LLM 改写为 issue 礼仪评论。

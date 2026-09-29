@@ -8,6 +8,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,9 @@ class ItemState:
     # 每轮检查——依赖全部闭合（关闭/修复已进 origin/main）→ 清 processed 唤醒重跑。
     # 空列表 = 未在监视。
     wakeup_deps: list[int] = field(default_factory=list)
+    # 管线 run 在途标记（2026-09-29 派发解耦）：dispatch 时写 epoch 秒，reaper
+    # 收尾清回 None。非 None 期间该资源整体跳过（reaper 拥有它），避免重复派发。
+    in_flight_since: float | None = None
 
 
 @dataclass
@@ -78,13 +84,50 @@ def load_state(path: Path) -> State:
             it.processed_comment_ids = set(str(x) for x in (idata.get("processed_comment_ids") or []))
             it.blocked = bool(idata.get("blocked", False))
             it.wakeup_deps = [int(x) for x in (idata.get("wakeup_deps") or [])]
+            it.in_flight_since = (
+                float(idata["in_flight_since"]) if idata.get("in_flight_since") else None)
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
     return state
 
 
+@contextmanager
+def _state_lock(path: Path):
+    """state 写锁：与写回竞态（2026-09-29 实证）——长周期结束时把内存旧状态整份写回，
+    会覆盖轮中途的 `reopen`。所有写路径都先拿这把锁。"""
+    lock = path.with_suffix(path.suffix + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    import fcntl
+    with open(lock, "w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
 def save_state(path: Path, state: State) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    with _state_lock(path):
+        _save_state_unlocked(path, state)
+
+
+def _save_state_unlocked(path: Path, state: State) -> None:
+    raw = _dump_state_dict(state)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".state.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(raw, indent=2, ensure_ascii=False))
+        os.replace(tmp, path)  # 原子替换：进程死在写中间也不会留半个 state.json
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _dump_state_dict(state: State) -> dict[str, Any]:
     raw: dict[str, Any] = {"repos": {}}
     for repo_slug, rs in state.repos.items():
         raw["repos"][repo_slug] = {
@@ -95,10 +138,29 @@ def save_state(path: Path, state: State) -> None:
                     "processed_comment_ids": sorted(it.processed_comment_ids),
                     "blocked": it.blocked,
                     "wakeup_deps": it.wakeup_deps,
+                    "in_flight_since": it.in_flight_since,
                 }
                 for key, it in rs.items.items()
             }
         }
-    raw["patrol"] = state.patrol
+    raw["patrol"] = dict(state.patrol)
     raw["patrol_cycle"] = state.patrol_cycle
-    path.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+    return raw
+
+
+def save_state_item(path: Path, repo_slug: str, key: str, item: ItemState) -> None:
+    """单条合并写：重读盘上最新状态 → 只替换这一条 → 原子写回。
+
+    解 2026-09-29 的竞态：daemon 一个长周期结束时把**整份**内存状态写回，
+    会覆盖周期中途 `reopen` 的改动。逐条合并后，CLI 与 daemon 谁后写谁覆盖的
+    粒度从「整份文件」缩到「单条 item」，且互不踩别的字段。
+    """
+    with _state_lock(path):
+        state = load_state_unlocked(path)
+        rs = state.repo(repo_slug)
+        rs.items[str(key)] = item
+        _save_state_unlocked(path, state)
+
+
+def load_state_unlocked(path: Path) -> State:
+    return load_state(path)

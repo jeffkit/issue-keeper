@@ -24,6 +24,7 @@ killpg 的孤儿清理语义在 keeper._invoke_pipeline（2026-09-27 孤儿事�
 含 error 字段——2026-09-28 补 #33 暴露的错误可见性债）。
 """
 import json
+import shutil
 import os
 import pathlib
 import sys
@@ -43,7 +44,7 @@ sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita-nodes/src")
 # flow 源码本意是 sandbox_backend="unsafe"（本机可信部署），但 @flow 编译器没把
 # 这个 kwarg 带进 IR，运行期只能吃 register_code_node 的 subprocess 默认值。
 # 这里把预算放宽（env 可覆盖）；编译器/IR 的根因另记，不靠这一步掩盖。
-SANDBOX_TIMEOUT_DEFAULT_SECS = 900
+SANDBOX_TIMEOUT_DEFAULT_SECS = 2400
 
 
 def ensure_sandbox_timeout(default_secs: int = SANDBOX_TIMEOUT_DEFAULT_SECS) -> None:
@@ -51,6 +52,8 @@ def ensure_sandbox_timeout(default_secs: int = SANDBOX_TIMEOUT_DEFAULT_SECS) -> 
 
     必须在本模块 import plaita 之前调用：plaita/node/code.py 在 import 期就把
     该 env 读成模块常量，之后再改不生效；空串会让 int('') 直接抛 ValueError。
+    2400（2026-09-29 由 900 上调）：merge 节点在 main 前进时会 rebase 分支并重跑
+    质量门（fmt+clippy+全量测试），900s 不够。
     """
     if not os.environ.get("PLAITA_SANDBOX_TIMEOUT", "").strip():
         os.environ["PLAITA_SANDBOX_TIMEOUT"] = str(default_secs)
@@ -293,6 +296,56 @@ class ConsoleReporter:
         self._flush(status, output=output, error=error, end=True)
 
 
+class ArtifactPersistCallback(FlowCallback):
+    """把每个节点的终态写进 artifact_dir/nodes/<id>.json。
+
+    2026-09-29 教训：run 中途失败时，上一轮的审查/计划结论只存在于 Redis trace，
+    重跑等于失忆——implement 看不到上一轮 review 指出的问题，只能从头再错一遍。
+    落盘之后，提示词就可以引用上一轮结论（续跑而非重来）。review/verdict 另存
+    人类可读的 03-review.md / 04-verdict.json。
+    """
+
+    def __init__(self, artifact_dir: pathlib.Path):
+        self._artifact_dir = artifact_dir
+        self._dir = artifact_dir / "nodes"
+
+    def bind_execution(self, execution: FlowExecution) -> None:
+        return None
+
+    def on_flow_start(self, flow, **kwargs) -> None:
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(f"[bridge] 产物目录创建失败: {exc}", file=sys.stderr)
+
+    def on_node_start(self, flow, node, **kwargs) -> None:
+        return None
+
+    def on_node_end(self, flow, node, result=None, error=None, exception=None, **kwargs) -> None:
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            node_id = str(getattr(node, "id", "") or "node")
+            err = str(error or exception or "")
+            payload = {
+                "id": node_id,
+                "status": "error" if err else "success",
+                "output": result if isinstance(result, (dict, str, int, float, bool, type(None))) else str(result),
+                "error": err or None,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            }
+            (self._dir / f"{node_id}.json").write_text(
+                json.dumps(payload, ensure_ascii=False, default=str), encoding="utf-8")
+            # 人类可读别名
+            if node_id == "review" and isinstance(result, dict):
+                text = result.get("text") or json.dumps(result, ensure_ascii=False)
+                (self._artifact_dir / "03-review.md").write_text(text, encoding="utf-8")
+            if node_id == "verdict" and isinstance(result, dict):
+                (self._artifact_dir / "04-verdict.json").write_text(
+                    json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            print(f"[bridge] 产物持久化失败: {exc}", file=sys.stderr)
+
+
 class BridgeTraceCallback(FlowCallback):
     """节点级 trace 回调：形状对齐 console local_executor 的 _LocalTraceCallback，
     落点从 sqlite 换成 ConsoleReporter（Redis）。"""
@@ -358,13 +411,22 @@ def _slim_input(payload: dict) -> dict:
 
 def main() -> None:
     t0 = time.time()
-    payload = json.load(sys.stdin)
+    # 后台派发（keeper 2026-09-29 解耦）把 payload 写进 dispatch.json 从 argv 传入；
+    # 兼容旧的 stdin 方式（手工调试用）。
+    payload = (json.load(open(sys.argv[1], encoding="utf-8")) if len(sys.argv) > 1
+               else json.load(sys.stdin))
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+    if shutil.which("sccache"):
+        os.environ.setdefault("RUSTC_WRAPPER", "sccache")
+        print("[bridge] RUSTC_WRAPPER=sccache（跨 worktree 共享编译缓存）", file=sys.stderr)
 
     added_path = ensure_tool_path()
     if added_path:
         print(f"[bridge] PATH 补齐: {added_path}（launchd 的 keeper 没有 ~/.cargo/bin）",
               file=sys.stderr)
+    artifact_dir_flag = pathlib.Path(payload["artifact_dir"]) if payload.get("artifact_dir") else None
+
     console = payload.get("console") or {}
     definition, flow_source, flow_version = resolve_definition(console if console.get("url") else None)
     if flow_source != "local":
@@ -385,7 +447,8 @@ def main() -> None:
 
     trace_cb = BridgeTraceCallback(reporter) if reporter is not None else None
     langfuse_cb = _build_langfuse_callback()
-    handlers = [cb for cb in (langfuse_cb, trace_cb) if cb is not None]
+    artifact_cb = ArtifactPersistCallback(artifact_dir_flag)
+    handlers = [cb for cb in (langfuse_cb, trace_cb, artifact_cb) if cb is not None]
 
     try:
         flow = build_flow(definition)

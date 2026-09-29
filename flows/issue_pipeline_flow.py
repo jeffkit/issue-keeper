@@ -362,6 +362,42 @@ def issue_pipeline(INPUT):
             ),
         )
 
+    # ── 5.5 同步 main：门之前把分支带到最新 origin/main ─────────────────
+    # 门跑在旧基线上、落地时才发现 main 已前进（#19/#31 都撞过）。工作区有未提交
+    # 改动就 stash → ff → pop（pop 冲突如实报错），让门校验最终要落地的树。
+    sync_main = CODE.python(
+        sandbox_backend="subprocess",
+        code=(
+            "def run(input):\n"
+            "    import subprocess\n"
+            "    wt = input['worktree_dir']\n"
+            "    def sh(args, t=120):\n"
+            "        return subprocess.run(args, cwd=wt, capture_output=True, text=True, timeout=t)\n"
+            "    sh(['git', 'fetch', 'origin'])\n"
+            "    behind = sh(['git', 'rev-list', '--count', 'HEAD..origin/main'])\n"
+            "    n = (behind.stdout or '0').strip()\n"
+            "    if behind.returncode != 0 or n == '0':\n"
+            "        return {'synced': False, 'note': 'main 无新提交'}\n"
+            "    dirty = (sh(['git', 'status', '--porcelain']).stdout or '').strip()\n"
+            "    if dirty:\n"
+            "        sh(['git', 'stash', 'push', '-u', '-m', 'issue-pipeline-sync'])\n"
+            "    r = sh(['git', 'merge', '--ff-only', 'origin/main'])\n"
+            "    if r.returncode != 0:\n"
+            "        if dirty:\n"
+            "            sh(['git', 'stash', 'pop'])\n"
+            "        return {'synced': False, 'note': 'ff 同步失败', 'error': (r.stderr or '')[-300:]}\n"
+            "    popped = ''\n"
+            "    if dirty:\n"
+            "        p = sh(['git', 'stash', 'pop'], 300)\n"
+            "        if p.returncode != 0:\n"
+            "            return {'synced': False, 'note': 'stash pop 有冲突，需人工处理',"
+            " 'error': (p.stderr or '')[-300:]}\n"
+            "        popped = '；工作区改动已从 stash 恢复'\n"
+            "    return {'synced': True, 'note': 'main 前进 %s 个提交，已同步%s' % (n, popped)}\n"
+        ),
+        input={"worktree_dir": INPUT.worktree_dir},
+    )
+
     # ── 6. 质量门：命令来自 INPUT.test_command（per-repo 绑定），留空跑 true 恒过并注明 ──
     cmd = INPUT.test_command or 'true'
     gate = GATE(

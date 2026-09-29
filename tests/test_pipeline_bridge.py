@@ -68,7 +68,8 @@ def test_sandbox_timeout_empty_string_is_replaced(monkeypatch):
     """空串会让 plaita import 期的 int('') 抛 ValueError，必须补上。"""
     monkeypatch.setenv("PLAITA_SANDBOX_TIMEOUT", "")
     bridge.ensure_sandbox_timeout()
-    assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "900"
+    # 2400（2026-09-29 由 900 上调）：merge 节点 rebase 后要重跑质量门
+    assert os.environ["PLAITA_SANDBOX_TIMEOUT"] == "2400"
 
 
 def test_sandbox_timeout_explicit_env_wins(monkeypatch):

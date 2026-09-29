@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .keeper import reopen_issues, run_daemon, run_once
+from .keeper import _count_in_flight, reopen_issues, run_daemon, run_once
 
 
 def _run_reopen(args) -> int:
@@ -64,7 +64,16 @@ def _run_keeper(args) -> int:
         return 2
 
     if args.once:
+        import time
         handled = run_once(config)
+        if getattr(args, "wait", False):
+            from .state import load_state
+            from .keeper import _reap_pipelines  # noqa: PLC0415
+            state = load_state(config.state_path)
+            while _count_in_flight_module(state):
+                time.sleep(30)
+                state = load_state(config.state_path)
+                _reap_pipelines(config, state)
         print(f"完成，本轮处理 {handled} 条。")
         return 0
 
@@ -426,6 +435,8 @@ def main(argv: list[str] | None = None) -> int:
     keeper_parser = subparsers.add_parser("keep", help="运行 keeper")
     keeper_parser.add_argument("--config", "-c", required=True)
     keeper_parser.add_argument("--once", action="store_true")
+    keeper_parser.add_argument("--wait", action="store_true",
+                               help="--once 派发后等所有在途管线 run 收尾再退出")
     keeper_parser.add_argument("--log-level", default="INFO",
                                choices=["DEBUG", "INFO", "WARNING", "ERROR"])
 

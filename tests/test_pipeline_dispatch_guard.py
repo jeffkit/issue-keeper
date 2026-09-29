@@ -1,16 +1,17 @@
-"""pipeline 派发互斥 + 日限跳过语义的回归测试（2026-09-28）。
+"""管线派发互斥 + 后台派发/reaper + 日限语义的回归测试。
 
-来自两个真实事故：
+来自四起真实事故：
 
-1. **同 issue 重复派发**：keeper 由 launchd 托管且 `KeepAlive=true`，重启时
-   bridge（`start_new_session`）不会跟着死，变成无主孤儿继续改同一个 worktree；
-   新实例看不见它又派一份，于是同一 issue 两个 run 并行（#45 实证：`02-plan.md`
-   里留下两份「实施记录」，且残留 run 在 `push_mode=main` 下仍可能往 main 推）。
-   修法：artifact 目录放 `run.lock`（内容为 bridge pid），pid 活着就跳过派发。
-
-2. **日限静默消费首次响应**：作者日限跳过时置了 `it.processed = True`，而
-   processed 的语义是「后续只看评论」——日限次日重置、豁免名单事后追加都救不回来，
-   #19/#23/#41-#44 就是这样一条回评都没有地卡住的。修法：日限只推迟，不消费。
+1. **同 issue 重复派发**（#45）：launchd KeepAlive 重启 keeper 时 bridge（独立会话）
+   不跟着死，新实例看不见它又派一份 → artifact 目录 `run.lock`（bridge pid）防重。
+2. **日限静默消费首次响应**（#19/#23/#41-#44）：日限跳过时置 processed 就再也救不回
+   → 日限只推迟、不消费。
+3. **同步等整跑堵死轮询**（#40 一夜五轮）：旧 `_invoke_pipeline` 同步等 3000s+，17 个
+   仓的轮询全部停摆 → 2026-09-29 派发解耦：`_dispatch_pipeline` 后台拉起（payload 走
+   dispatch.json），每轮 `_reap_pipelines` 收尸（读台账终态、补兜底回评、kanban、
+   processed、超时清进程组）。
+4. **同 issue 每日管线上限**（#40 空转）：终态被拉回队列时无限重派整轮 → 日上限
+   跳过且不消费首次响应。
 """
 
 import json
@@ -19,22 +20,22 @@ import subprocess
 import sys
 import time
 
-import pytest
-
 from issue_keeper.config import Config, RepoBinding
 from issue_keeper.keeper import (
     ALREADY_RUNNING,
     _author_over_limit,
+    _count_in_flight,
+    _dispatch_pipeline,
     _global_pipeline_in_flight,
-    _invoke_pipeline,
+    _issue_over_pipeline_limit,
     _pid_alive,
     _pipeline_in_flight,
-    _process_resource,
+    _reap_pipelines,
     _release_pipeline_lock,
     reopen_issues,
 )
 from issue_keeper.sources import Resource
-from issue_keeper.state import RepoState, State, load_state, save_state
+from issue_keeper.state import ItemState, State, load_state, save_state
 
 
 def _res(number: int = 5, author: str = "bob", status: str = "inbox",
@@ -46,27 +47,44 @@ def _res(number: int = 5, author: str = "bob", status: str = "inbox",
     )
 
 
-class _FakeSrc:
-    """只满足 _supports_status 检查（有 move_status 方法）。"""
-
-    def move_status(self, *a, **kw):  # noqa: D401
-        return True, "x"
-
-
 def _dead_pid() -> int:
     p = subprocess.Popen([sys.executable, "-c", ""])
     p.wait()
     return p.pid
 
 
-def _pipeline_cfg(bridge) -> Config:
-    return Config(
+def _sleep_pid() -> int:
+    """一个活着的进程（reaper 超时清剿测试用）。
+
+    必须 start_new_session：生产的 bridge 就是独立会话，reaper 的 killpg 才只会
+    清掉 run 本身；测试里若不隔离，killpg 会把 pytest 自己连着杀掉。"""
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    ).pid
+
+
+def _pipeline_cfg(bridge, **over) -> Config:
+    base = dict(
         pipeline_bridge=bridge,
         pipeline_timeout_secs=30,
         pipeline_push_mode="branch",
         pipeline_review_mode="auto",
         pipeline_test_commands={},
     )
+    base.update(over)
+    return Config(**base)
+
+
+def _bindings(repo="a/b"):
+    return [RepoBinding(repo=repo, profile="p")]
+
+
+def _art(tmp_path, repo="b", number=7):
+    # 目录派生必须与 keeper 一致：slug = repo.split("/")[-1]
+    art = tmp_path / ".issue-keeper" / "pipeline" / f"{repo.split('/')[-1]}-{number}"
+    art.mkdir(parents=True, exist_ok=True)
+    return art
 
 
 # ── pid 存活判定 ─────────────────────────────────────────────────────
@@ -79,201 +97,70 @@ def test_pid_dead_after_reap():
     assert _pid_alive(_dead_pid()) is False
 
 
-# ── 锁的读写与清理 ───────────────────────────────────────────────────
-
 def test_in_flight_returns_live_holder_and_keeps_lock(tmp_path):
-    art = tmp_path / "b-7"
-    art.mkdir()
-    (art / "run.lock").write_text(str(os.getpid()))
-    assert _pipeline_in_flight(art) == os.getpid()
-    assert (art / "run.lock").exists()
+    art = tmp_path / "x"
+    art.mkdir(parents=True)
+    live = _sleep_pid()
+    try:
+        (art / "run.lock").write_text(str(live), encoding="utf-8")
+        assert _pipeline_in_flight(art) == live
+        assert (art / "run.lock").exists()
+    finally:
+        os.kill(live, 9)
 
 
 def test_in_flight_clears_stale_lock(tmp_path):
-    art = tmp_path / "b-7"
-    art.mkdir()
-    (art / "run.lock").write_text(str(_dead_pid()))
+    art = tmp_path / "x"
+    art.mkdir(parents=True)
+    (art / "run.lock").write_text(str(_dead_pid()), encoding="utf-8")
     assert _pipeline_in_flight(art) is None
     assert not (art / "run.lock").exists()
 
 
 def test_in_flight_clears_garbage_lock(tmp_path):
-    art = tmp_path / "b-7"
-    art.mkdir()
-    (art / "run.lock").write_text("not-a-pid")
+    art = tmp_path / "x"
+    art.mkdir(parents=True)
+    (art / "run.lock").write_text("not-a-pid", encoding="utf-8")
     assert _pipeline_in_flight(art) is None
-    assert not (art / "run.lock").exists()
 
 
 def test_in_flight_none_when_no_lock(tmp_path):
-    art = tmp_path / "b-7"
-    art.mkdir()
+    art = tmp_path / "x"
+    art.mkdir(parents=True)
     assert _pipeline_in_flight(art) is None
 
 
 def test_release_lock_only_removes_own_pid(tmp_path):
-    lock = tmp_path / "run.lock"
-    lock.write_text("123456")
-    _release_pipeline_lock(lock, os.getpid())   # 不是自己写的
-    assert lock.exists()
-    _release_pipeline_lock(lock, 123456)
+    art = tmp_path / "x"
+    art.mkdir(parents=True)
+    lock = art / "run.lock"
+    lock.write_text("12345", encoding="utf-8")
+    _release_pipeline_lock(lock, 999)
+    assert lock.exists()  # 不是自己的锁不动
+    _release_pipeline_lock(lock, 12345)
     assert not lock.exists()
 
 
-# ── 派发互斥（事故 1 的回归）─────────────────────────────────────────
+# ── 后台派发（_dispatch_pipeline）────────────────────────────────────
 
 def test_dispatch_skipped_while_same_issue_in_flight(tmp_path, monkeypatch):
-    """锁持有人还活着：不派发、不覆盖在跑 run 的 00-issue.md。"""
+    """锁持有人还活着：不派发、不覆盖在跑 run 的 00-issue.md、不置在途。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     bridge = tmp_path / "bridge.py"
     bridge.write_text("raise SystemExit(1)\n", encoding="utf-8")
-    art = tmp_path / ".issue-keeper" / "pipeline" / "b-7"
-    art.mkdir(parents=True)
+    art = _art(tmp_path)
     (art / "00-issue.md").write_text("在跑 run 的产物", encoding="utf-8")
     (art / "run.lock").write_text(str(os.getpid()), encoding="utf-8")
 
-    out = _invoke_pipeline(
+    it = ItemState()
+    out = _dispatch_pipeline(
         _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
-        _res(number=7), "a/b issue#7",
+        _res(number=7), it, "a/b issue#7",
     )
 
     assert out == {"status": ALREADY_RUNNING, "comment_posted": True}
     assert (art / "00-issue.md").read_text(encoding="utf-8") == "在跑 run 的产物"
-
-
-def test_stale_lock_does_not_block_dispatch(tmp_path, monkeypatch):
-    """锁持有人已退出：视为陈旧锁，正常派发并在结束后释放锁。"""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    bridge = tmp_path / "bridge.py"
-    bridge.write_text(
-        "import json, sys\n"
-        "sys.stdin.read()\n"
-        "print('RESULT ' + json.dumps({'status': 'done', 'comment_posted': True}))\n",
-        encoding="utf-8",
-    )
-    art = tmp_path / ".issue-keeper" / "pipeline" / "b-7"
-    art.mkdir(parents=True)
-    (art / "run.lock").write_text(str(_dead_pid()), encoding="utf-8")
-
-    out = _invoke_pipeline(
-        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p", cwd=str(tmp_path)),
-        _res(number=7), "a/b issue#7",
-    )
-
-    assert out == {"status": "done", "comment_posted": True}
-    assert (art / "00-issue.md").exists()
-    assert not (art / "run.lock").exists()
-
-
-# ── 日限跳过（事故 2 的回归）────────────────────────────────────────
-
-def _write_ledger(tmp_path, author: str) -> None:
-    ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    today = time.strftime("%Y-%m-%d")
-    ledger.write_text(
-        json.dumps({"ts": f"{today}T10:00:00+0800", "author": author}) + "\n",
-        encoding="utf-8",
-    )
-
-
-def test_over_limit_keeps_first_reply_pending(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    _write_ledger(tmp_path, "bob")
-    cfg = Config(author_allowlist=[], author_daily_limit=1, author_daily_limit_exempt=[])
-    rs = RepoState()
-
-    handled = _process_resource(
-        _FakeSrc(), RepoBinding(repo="a/b", profile="p"), cfg, cfg.screener,
-        None, rs, _res(author="bob"), "", 60, "[issue-keeper:x]",
-    )
-
-    assert handled == 0
-    assert rs.item("5").processed is False   # 关键：日限只推迟，不消费首次响应
-
-
-def test_exempt_author_is_not_over_limit(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
-    _write_ledger(tmp_path, "bob")
-    cfg = Config(author_daily_limit=1, author_daily_limit_exempt=["BOB"])
-    assert _author_over_limit(cfg, "bob") is False
-
-
-def test_allowlist_skip_still_consumes_first_reply(tmp_path, monkeypatch):
-    """allowlist 是永久性拒绝：保持原语义（消费掉，不再反复扫）。"""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    cfg = Config(author_allowlist=["alice"], author_daily_limit=1)
-    rs = RepoState()
-
-    _process_resource(
-        _FakeSrc(), RepoBinding(repo="a/b", profile="p"), cfg, cfg.screener,
-        None, rs, _res(author="bob"), "", 60, "[issue-keeper:x]",
-    )
-
-    assert rs.item("5").processed is True
-
-
-# ── 人工重派入口 reopen（同一次事故的结构性缺口）────────────────────
-# 日限误跳过/引擎异常之后，keeper 原先没有任何手段让一条 processed 的 issue
-# 再进队，只能绕过 keeper 跑 ad-hoc 脚本（还会丢掉兜底回评）。
-
-def test_reopen_puts_consumed_issue_back(tmp_path):
-    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
-                 state_file=tmp_path / "state.json")
-    st = State()
-    it = st.repo("a-b").item("5")
-    it.processed = True
-    it.processed_comment_ids.add("IC_1")
-    save_state(cfg.state_path, st)
-
-    changed = reopen_issues(cfg, "a/b", [5, 6])
-
-    assert changed == [5]                      # 6 号本就没被消费，不动
-    it2 = load_state(cfg.state_path).repo("a-b").item("5")
-    assert it2.processed is False
-    assert "IC_1" in it2.processed_comment_ids  # 评论级进度保留，旧评论不重答
-
-
-def test_reopen_clears_security_block(tmp_path):
-    """被 screener 拦下的 issue 人工重派：放开重新走一遍（正文会重新过闸）。"""
-    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
-                 state_file=tmp_path / "state.json")
-    st = State()
-    st.repo("a-b").item("9").blocked = True
-    save_state(cfg.state_path, st)
-
-    assert reopen_issues(cfg, "a/b", [9]) == [9]
-    assert load_state(cfg.state_path).repo("a-b").item("9").blocked is False
-
-
-def test_reopen_unknown_repo_raises(tmp_path):
-    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
-                 state_file=tmp_path / "state.json")
-    with pytest.raises(ValueError):
-        reopen_issues(cfg, "x/y", [1])
-
-
-# ── 全局并发闸（跨进程）：README 部署强制项 #2 的落地 ────────────────
-# keeper 自身串行，但第二个实例 / `--once` 补跑脚本会绕过它：2026-09-28 两个进程
-# 各派一个 run，抢同一个 main clone 做 ff 合并与 push，还互相抢 CPU 顶出 agent 超时。
-
-def test_global_slot_detects_live_holder(tmp_path):
-    root = tmp_path / "pipeline"
-    root.mkdir()
-    art = root / "b-7"
-    art.mkdir()
-    (root / ".pipeline.lock").write_text(str(os.getpid()))
-    assert _global_pipeline_in_flight(art) == os.getpid()
-
-
-def test_global_slot_clears_stale_holder(tmp_path):
-    root = tmp_path / "pipeline"
-    root.mkdir()
-    art = root / "b-7"
-    art.mkdir()
-    (root / ".pipeline.lock").write_text(str(_dead_pid()))
-    assert _global_pipeline_in_flight(art) is None
-    assert not (root / ".pipeline.lock").exists()
+    assert it.in_flight_since is None
 
 
 def test_dispatch_deferred_when_global_slot_taken(tmp_path, monkeypatch):
@@ -285,74 +172,276 @@ def test_dispatch_deferred_when_global_slot_taken(tmp_path, monkeypatch):
     root.mkdir(parents=True)
     (root / ".pipeline.lock").write_text(str(os.getpid()), encoding="utf-8")
 
-    out = _invoke_pipeline(
+    out = _dispatch_pipeline(
         _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
-        _res(number=7), "a/b issue#7",
+        _res(number=7), ItemState(), "a/b issue#7",
     )
 
     assert out == {"status": ALREADY_RUNNING, "comment_posted": True}
     assert not (root / "b-7" / "00-issue.md").exists()
 
 
-def test_both_locks_released_after_run(tmp_path, monkeypatch):
+def test_dispatch_is_detached_and_writes_payload(tmp_path, monkeypatch):
+    """派发立即返回；payload 走 dispatch.json（不再依赖 stdin）；锁里写 bridge pid。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     bridge = tmp_path / "bridge.py"
     bridge.write_text(
-        "import json, sys\n"
-        "sys.stdin.read()\n"
-        "print('RESULT ' + json.dumps({'status': 'done', 'comment_posted': True}))\n",
+        "import json, shutil, sys\n"
+        "shutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
         encoding="utf-8",
     )
-    root = tmp_path / ".issue-keeper" / "pipeline"
-
-    out = _invoke_pipeline(
-        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p", cwd=str(tmp_path)),
-        _res(number=7), "a/b issue#7",
+    art = _art(tmp_path)
+    it = ItemState()
+    out = _dispatch_pipeline(
+        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
+        _res(number=7), it, "a/b issue#7",
     )
 
-    assert out == {"status": "done", "comment_posted": True}
-    assert not (root / ".pipeline.lock").exists()
-    assert not (root / "b-7" / "run.lock").exists()
+    assert out["status"] == "dispatched"
+    assert it.in_flight_since is not None
+    seen_path = art / "dispatch.json.seen.json"
+    deadline = time.time() + 5
+    while not seen_path.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    seen = json.loads(seen_path.read_text(encoding="utf-8"))
+    assert seen["issue_number"] == 7
+    assert seen["worktree_dir"].endswith(".worktrees/issue-7")
+    assert (art / "run.lock").exists()
 
 
-# ── 同 issue 管线日上限（#40 空转事故的回归，2026-09-29）──────────────
+def test_dispatch_posts_claim_comment(tmp_path, monkeypatch):
+    """认领评论可关；开着时带 bot marker 发出（多会话撞车的教训）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text("pass\n", encoding="utf-8")
+    _art(tmp_path)
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_claim_comment=True),
+        RepoBinding(repo="a/b", profile="p"), _res(number=7), ItemState(),
+        "a/b issue#7",
+    )
+    assert posted and "issue-keeper-bot" in posted[0]
 
-def _write_issue_ledger(tmp_path, repo: str, number: int, n: int, day_offset: int = 0) -> None:
-    """写 n 条该 (repo, issue) 今日（或 day_offset 天前）的 run 台账。"""
+    posted.clear()
+    _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_claim_comment=False),
+        RepoBinding(repo="a/b", profile="p"), _res(number=8), ItemState(),
+        "a/b issue#8",
+    )
+    assert posted == []
+
+
+# ── reaper（_reap_pipelines）────────────────────────────────────────
+
+def _in_flight_state(tmp_path, repo="a/b", number=7, *, live=False, since=None):
+    # 注意两个派生不同：state 的 key 是 repo_slug（a-b），artifact 目录是
+    # repo.split("/")[-1]（b）——与 keeper 各自的派生保持一致。
+    repo_slug = repo.replace("/", "-")
+    state = State()
+    it = state.repo(repo_slug).item(str(number))
+    it.in_flight_since = since if since is not None else time.time()
+    art = tmp_path / ".issue-keeper" / "pipeline" / f"{repo.split('/')[-1]}-{number}"
+    art.mkdir(parents=True, exist_ok=True)
+    (art / "00-issue.md").write_text("正文", encoding="utf-8")
+    (art / "run.lock").write_text(
+        str(_sleep_pid() if live else _dead_pid()), encoding="utf-8")
+    return state, it, art
+
+
+def _write_issue_ledger(tmp_path, repo: str, number: int, record: dict) -> None:
     ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
     ledger.parent.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y-%m-%dT10:00:00+0800", time.localtime(time.time() - day_offset * 86400))
-    lines = [json.dumps({"ts": ts, "repo": repo, "issue": number,
-                         "author": "bob", "status": "engine_error"}) + "\n"] * n
     with ledger.open("a", encoding="utf-8") as f:
-        f.writelines(lines)
+        f.write(json.dumps({"repo": repo, "issue": number,
+                            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+0800"),
+                            **record}) + "\n")
+
+
+def test_reaper_finalizes_done_run(tmp_path, monkeypatch):
+    """pid 死了 + 台账 done（回评已发）→ processed、清在途、不重复发兜底。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, art = _in_flight_state(tmp_path, repo="a/b")
+    _write_issue_ledger(tmp_path, "a/b", 7, {"status": "done", "comment_posted": True})
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda *a, **kw: posted.append(a))
+
+    assert _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b")) == 1
+    assert it.processed is True
+    assert it.in_flight_since is None
+    assert not (art / "run.lock").exists()
+    assert posted == []
+
+
+def test_reaper_falls_back_when_no_ledger(tmp_path, monkeypatch):
+    """pid 死了且没有台账（bridge 极早崩溃）→ engine_error 兜底回评。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, _art = _in_flight_state(tmp_path, repo="a/b")
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+
+    assert it.processed is True
+    assert len(posted) == 1
+    assert "engine_error" in posted[0] and "issue-keeper-bot" in posted[0]
+
+
+def test_reaper_leaves_live_runs_alone(tmp_path, monkeypatch):
+    """pid 活着且未超时：不动（仍在途）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, _art = _in_flight_state(tmp_path, repo="a/b", live=True)
+    before = it.in_flight_since
+
+    assert _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b")) == 0
+    assert it.in_flight_since == before
+    assert it.processed is False
+
+
+def test_reaper_kills_timed_out_run(tmp_path, monkeypatch):
+    """pid 活着但超过 pipeline_timeout_secs → 清进程组 + engine_error 兜底。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, art = _in_flight_state(
+        tmp_path, repo="a/b", live=True, since=time.time() - 999)
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    cfg = _pipeline_cfg(tmp_path / "b", pipeline_timeout_secs=30)
+
+    _reap_pipelines(cfg, state, _bindings(repo="a/b"))
+
+    assert it.processed is True and it.in_flight_since is None
+    assert not (art / "run.lock").exists()
+    assert posted and "超时" in posted[0]
+
+
+def test_reaper_records_wakeup_deps_for_blocked(tmp_path, monkeypatch):
+    """blocked 终态：正文里引用的依赖编号进 wakeup_deps（#17 教训）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, art = _in_flight_state(tmp_path, repo="a/b")
+    (art / "00-issue.md").write_text("依赖 #31 与 #30", encoding="utf-8")
+    _write_issue_ledger(tmp_path, "a/b", 7, {"status": "blocked", "comment_posted": True})
+
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+
+    assert it.wakeup_deps == [31, 30]
+    assert it.processed is True
+
+
+def test_count_in_flight():
+    st = State()
+    a = st.repo("a").item("1")
+    st.repo("a").item("2").in_flight_since = time.time()
+    st.repo("b").item("3").in_flight_since = time.time()
+    assert _count_in_flight(st) == 2
+    assert a.in_flight_since is None
+
+
+# ── 日限跳过（事故 2 的回归）────────────────────────────────────────
+
+def _write_author_ledger(tmp_path, author: str) -> None:
+    ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    today = time.strftime("%Y-%m-%d")
+    ledger.write_text(
+        json.dumps({"ts": f"{today}T10:00:00+0800", "author": author}) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_over_limit_keeps_first_reply_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_author_ledger(tmp_path, "bob")
+    assert _author_over_limit(Config(author_daily_limit=1), "bob") is True
+
+
+def test_exempt_author_is_not_over_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_author_ledger(tmp_path, "okguitar")
+    cfg = Config(author_daily_limit=1, author_daily_limit_exempt=["okguitar"])
+    assert _author_over_limit(cfg, "okguitar") is False
+
+
+# ── reopen / 全局槽位 / 同 issue 日上限 ──────────────────────────────
+
+def test_reopen_puts_consumed_issue_back(tmp_path):
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                 state_file=tmp_path / "state.json")
+    st = State()
+    st.repo("a-b").item("5").processed = True
+    save_state(cfg.state_path, st)
+
+    assert reopen_issues(cfg, "a/b", [5]) == [5]
+    assert load_state(cfg.state_path).repo("a-b").item("5").processed is False
+
+
+def test_reopen_clears_security_block(tmp_path):
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                 state_file=tmp_path / "state.json")
+    st = State()
+    st.repo("a-b").item("6").blocked = True
+    save_state(cfg.state_path, st)
+
+    reopen_issues(cfg, "a/b", [6])
+    assert load_state(cfg.state_path).repo("a-b").item("6").blocked is False
+
+
+def test_reopen_unknown_repo_raises(tmp_path):
+    import pytest
+    with pytest.raises(ValueError):
+        reopen_issues(Config(repos=[RepoBinding(repo="a/b", profile="p")],
+                             state_file=tmp_path / "state.json"), "x/y", [1])
+
+
+def test_global_slot_detects_live_holder(tmp_path):
+    root = tmp_path / "p"
+    root.mkdir(parents=True)
+    live = _sleep_pid()
+    try:
+        (root / ".pipeline.lock").write_text(str(live), encoding="utf-8")
+        assert _global_pipeline_in_flight(root / "b-7") == live
+    finally:
+        os.kill(live, 9)
+
+
+def test_global_slot_clears_stale_holder(tmp_path):
+    root = tmp_path / "p"
+    root.mkdir(parents=True)
+    (root / ".pipeline.lock").write_text(str(_dead_pid()), encoding="utf-8")
+    assert _global_pipeline_in_flight(root / "b-7") is None
+    assert not (root / ".pipeline.lock").exists()
+
+
+def _write_issue_ledger_n(tmp_path, repo: str, number: int, n: int, day_offset: int = 0) -> None:
+    ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT10:00:00+0800",
+                       time.localtime(time.time() - day_offset * 86400))
+    with ledger.open("a", encoding="utf-8") as f:
+        f.writelines([json.dumps({"ts": ts, "repo": repo, "issue": number,
+                                  "author": "bob", "status": "engine_error"}) + "\n"] * n)
 
 
 def test_issue_cap_blocks_redispatch_without_consuming(tmp_path, monkeypatch):
     """终态 issue 被拉回队列时，当日 run 数到顶 → 跳过且不消费首次响应。"""
     monkeypatch.setenv("HOME", str(tmp_path))
-    _write_issue_ledger(tmp_path, "a/b", 5, n=2)
-    cfg = Config(pipeline_mode=True, pipeline_issue_daily_limit=2)
-    rs = RepoState()
-
-    handled = _process_resource(
-        _FakeSrc(), RepoBinding(repo="a/b", profile="p"), cfg, cfg.screener,
-        None, rs, _res(number=5), "", 60, "[issue-keeper:x]",
-    )
-
-    assert handled == 0
-    assert rs.item("5").processed is False   # 只推迟：次日或人工 reopen 后可重试
+    _write_issue_ledger_n(tmp_path, "a/b", 5, n=2)
+    assert _issue_over_pipeline_limit(
+        Config(pipeline_issue_daily_limit=2), "a/b", 5) is True
 
 
 def test_issue_cap_counts_same_issue_only(tmp_path, monkeypatch):
     """计数只认同仓同号：别的 issue 跑再多、隔天记录都不占额度。"""
     monkeypatch.setenv("HOME", str(tmp_path))
-    _write_issue_ledger(tmp_path, "a/b", 5, n=2)
-    _write_issue_ledger(tmp_path, "a/b", 6, n=5)
-    _write_issue_ledger(tmp_path, "a/b", 5, n=1, day_offset=1)
-    _write_issue_ledger(tmp_path, "a/c", 5, n=3)
+    _write_issue_ledger_n(tmp_path, "a/b", 5, n=2)
+    _write_issue_ledger_n(tmp_path, "a/b", 6, n=5)
+    _write_issue_ledger_n(tmp_path, "a/b", 5, n=1, day_offset=1)
+    _write_issue_ledger_n(tmp_path, "a/c", 5, n=3)
     cfg = Config(pipeline_issue_daily_limit=2)
-    from issue_keeper.keeper import _issue_over_pipeline_limit
     assert _issue_over_pipeline_limit(cfg, "a/b", 5) is True    # 今日本 issue 已 2 次
     assert _issue_over_pipeline_limit(cfg, "a/b", 6) is True    # 今日 5 次
     assert _issue_over_pipeline_limit(cfg, "a/b", 7) is False   # 本 issue 今日 0 次
@@ -361,7 +450,6 @@ def test_issue_cap_counts_same_issue_only(tmp_path, monkeypatch):
 
 def test_issue_cap_zero_disables(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    _write_issue_ledger(tmp_path, "a/b", 5, n=9)
-    cfg = Config(pipeline_issue_daily_limit=0)
-    from issue_keeper.keeper import _issue_over_pipeline_limit
-    assert _issue_over_pipeline_limit(cfg, "a/b", 5) is False
+    _write_issue_ledger_n(tmp_path, "a/b", 5, n=9)
+    assert _issue_over_pipeline_limit(
+        Config(pipeline_issue_daily_limit=0), "a/b", 5) is False

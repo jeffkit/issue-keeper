@@ -389,6 +389,12 @@ def _process_resource(
     kind = res.kind
     label = f"{binding.repo} {kind}#{res.number}"
 
+    # ── 管线在途：整体跳过（回评/状态/看板由 reaper 收尾）────────────
+    # 2026-09-29 派发解耦：dispatch 只负责把 run 拉起来（后台），完成后的
+    # 兜底回评、processed、kanban 全部由每轮开头的 _reap_pipelines 处理。
+    if getattr(it, "in_flight_since", None):
+        return handled
+
     # ── review 状态自动 review ─────────────────────────────────────
     # issue 在 review 状态时，判断当前 keeper 是否应自动 review 通过
     if res.status == "review":
@@ -443,47 +449,21 @@ def _process_resource(
 
             # ── plaita 管线模式：整段 agent 工作交给 issue-pipeline flow ──
             if config.pipeline_mode:
-                pres = _invoke_pipeline(config, binding, res, label)
-                if pres is not None and pres.get("status") == ALREADY_RUNNING:
-                    # 同 issue 已有 run 在跑（典型：launchd KeepAlive 重启 keeper，
-                    # 旧 bridge 变成孤儿仍在改同一个 worktree）。不置 processed、
-                    # 不回评、不动看板——锁释放后下一轮自然重派，避免两个 run
-                    # 抢同一分支/同一次 main 推送。
+                in_flight = _count_in_flight(state)
+                if in_flight >= max(1, config.pipeline_max_in_flight):
+                    # 全局并发上限（默认 2）：不标记 processed，下轮腾出槽位再派。
+                    log.info("[%s] 在途管线 run %d/%d，本轮不派发", label,
+                             in_flight, config.pipeline_max_in_flight)
+                    return 0
+                pres = _dispatch_pipeline(config, binding, res, it, label)
+                if pres.get("status") == ALREADY_RUNNING:
+                    # 同 issue 已有 run 在跑（run.lock 的 pid 活着）。不置 processed、
+                    # 不回评——锁释放后下一轮自然重派。
                     log.info("[%s] 同 issue 已有 pipeline run 在跑，本轮跳过派发", label)
                     return 0
-                if pres is None:
-                    _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
-                               actor_type="agent", comment="管线异常，回退")
-                    return 0
-                if not pres.get("comment_posted", pres.get("posted")):
-                    # D1/D2 兜底：管线没发出任何回评 → keeper 补一条（带 bot marker 防循环）
-                    # key 双读兼容旧 bridge；文案区分引擎异常与「终态但回评未发出」
-                    if pres.get("status") == "engine_error":
-                        reason = "管线引擎异常终止（未发出回评）"
-                    else:
-                        reason = f"管线终态（status={pres.get('status')}），但未确认发出回评"
-                    try:
-                        src.post_comment(
-                            binding.repo, res,
-                            f"{config.bot_marker}\n[issue-pipeline] {reason}，请人工查看。")
-                    except Exception as e:
-                        log.error("[%s] 兜底回评失败: %s", label, e)
-                it.processed = True
+                # 已后台派发：回评由 flow 的 post 节点发；兜底/状态/看板由
+                # _reap_pipelines 在 run 结束的下一轮收尾。
                 handled += 1
-                status = pres.get("status", "")
-                # 依赖唤醒监视：blocked = 依赖未就绪。记录正文引用的依赖编号，
-                # 每轮检查就绪后唤醒重跑（此前 blocked 即永久沉默——#17 教训）。
-                if status == "blocked" and res.kind == "issue":
-                    deps = [n for n in _extract_issue_refs(res.body) if n != res.number]
-                    if deps:
-                        rs.item(res.resource_key).wakeup_deps = deps
-                        log.info("[%s] blocked，监视依赖 %s 就绪后唤醒", label, deps)
-                if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
-                    _safe_move(src, binding, res, "todo", actor=_agent_label(binding, config),
-                               actor_type="agent", comment=f"pipeline {status}，待人工")
-                else:
-                    _safe_move(src, binding, res, "review", actor=_agent_label(binding, config),
-                               actor_type="agent", comment=f"pipeline {status}，待 review")
                 return handled
 
             log.info("[%s] 新 %s，调用 agent (profile=%s)", label, kind, binding.profile)
@@ -637,9 +617,9 @@ def _should_auto_review(
 def run_once(config: Config) -> int:
     """执行一轮全量扫描。返回处理条目总数。"""
     state = load_state(config.state_path)
+    total = _reap_pipelines(config, state, config.repos)
     profile_cache: dict[str, ProfileEntry] = {}
     source_cache: dict[str, IssueSource] = {}
-    total = 0
     for binding in config.repos:
         kinds = ["issue"] + (["pr"] if binding.monitor_prs else [])
         log.info(
@@ -1035,37 +1015,77 @@ def _release_pipeline_lock(lock: Path, pid: int) -> None:
         lock.unlink(missing_ok=True)
 
 
-def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
-    """以子进程跑 issue-pipeline flow（bridge），返回 RESULT dict；异常返回 None。
+def _count_in_flight(state) -> int:
+    """当前在途管线 run 数（跨仓；worker 池大小的依据）。"""
+    return sum(
+        1
+        for rs in state.repos.values()
+        for it in rs.items.values()
+        if getattr(it, "in_flight_since", None)
+    )
 
-    子进程 start_new_session + 超时 killpg：flow 内部还会再起 recursive/claude
-    子树，超时必须连整棵树一起清（2026-09-27 孤儿事故）。
+
+def _gh_post_comment(kind: str, repo: str, number: int, body: str) -> None:
+    """reaper 的兜底回评：不依赖 IssueSource（收尸阶段还没建 source）。"""
+    import subprocess as _sp
+    cmd = ["gh", kind, "comment", str(number), "--repo", repo, "--body", body]
+    r = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError(f"gh comment 失败: {(r.stderr or r.stdout or '')[-200:]}")
+
+
+def _latest_pipeline_record(repo_full: str, number: int, since_ts: float) -> dict | None:
+    """读台账里该 issue 最晚的一条记录（dispatch 之后写的才算）。"""
+    import json
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    if not ledger.exists():
+        return None
+    best: dict | None = None
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("repo") != repo_full or str(rec.get("issue")) != str(number):
+                continue
+            ts = rec.get("ts", "")
+            try:
+                t = time.mktime(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                continue
+            if t >= since_ts - 1 and (best is None or ts >= (best.get("ts") or "")):
+                best = rec
+    except OSError:
+        return None
+    return best
+
+
+def _dispatch_pipeline(config, binding, res, it, label: str) -> dict:
+    """后台派发一次管线 run（bridge），立即返回；完成由 _reap_pipelines 收尾。
+
+    bridge 需要的 payload 走 dispatch.json 文件（后台进程不再有 stdin 可写），
+    stdout/stderr 追加到 artifact_dir/bridge-<时刻>.log 供人工排查。
     """
     import json
-    import os
-    import signal
     import subprocess
     import sys
     import time
-    from pathlib import Path
 
     bridge = Path(config.pipeline_bridge).expanduser()
     if not bridge.exists():
         log.error("[%s] pipeline bridge 不存在: %s", label, bridge)
-        return None
+        return {"status": "engine_error", "comment_posted": False}
 
     slug = binding.repo.split("/")[-1]
     artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{res.number}").expanduser()
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     # 互斥检查必须在写 00-issue.md 之前——在跑的 run 正用着这份产物。
-    # 先看全局槽位：别的 issue 在跑也一律不派发（全局并发 1，跨进程）。
     global_holder = _global_pipeline_in_flight(artifact_dir)
     if global_holder is not None:
-        log.warning("[%s] 已有另一个 pipeline run 在跑 (pid=%s)，本轮不派发（全局并发 1）",
-                    label, global_holder)
+        log.warning("[%s] 已有另一个 pipeline run 在跑 (pid=%s)，本轮不派发", label, global_holder)
         return {"status": ALREADY_RUNNING, "comment_posted": True}
-
     holder = _pipeline_in_flight(artifact_dir)
     if holder is not None:
         log.warning("[%s] 同 issue 已有 pipeline run 在跑 (pid=%s)，跳过本轮派发", label, holder)
@@ -1089,8 +1109,6 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
         "review_mode": config.pipeline_review_mode,
         "push_mode": config.pipeline_push_mode,
     }
-    # 混合形态（2026-09-28）：定义源 console + 执行观测上报。bridge 侧对两者都
-    # fail-open——拉不到定义退 stale 缓存/本地文件，Redis 不可达静默跳过上报。
     pc = config.pipeline.console
     if pc.url and pc.api_key:
         payload["console"] = {
@@ -1100,16 +1118,24 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
     if config.pipeline.observability_redis:
         payload["observability_redis"] = config.pipeline.observability_redis
 
-    log.info("[%s] 提交 issue-pipeline run (push_mode=%s, review_mode=%s)",
-             label, payload["push_mode"], payload["review_mode"])
-    t0 = time.time()
-    proc = subprocess.Popen(
-        [sys.executable, str(bridge)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
-    )
-    # 锁里写 bridge 的 pid 而不是 keeper 自己的：keeper 被重启后 bridge 还活着，
-    # 新实例据此就能发现「已经有人在跑」。两把：本 issue 一把 + 全局槽位一把。
+    payload_file = artifact_dir / "dispatch.json"
+    payload_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    log_path = artifact_dir / f"bridge-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    log_fh = open(log_path, "ab")
+    log.info("[%s] 提交 issue-pipeline run（后台，push_mode=%s, review_mode=%s, 日志 %s）",
+             label, payload["push_mode"], payload["review_mode"], log_path.name)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(bridge), str(payload_file)],
+            stdin=subprocess.DEVNULL, stdout=log_fh, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True, close_fds=True,
+        )
+    finally:
+        log_fh.close()
+
+    # 锁里写 bridge 的 pid：keeper 被 KeepAlive 重启后，新实例据此发现「已在跑」；
+    # reaper 也据 pid 判断 run 是否结束。两把：本 issue 一把 + 全局槽位一把。
     lock = artifact_dir / PIPELINE_LOCK_NAME
     global_lock = artifact_dir.parent / GLOBAL_LOCK_NAME
     for lk in (lock, global_lock):
@@ -1117,43 +1143,106 @@ def _invoke_pipeline(config, binding, res, label: str) -> dict | None:
             lk.write_text(str(proc.pid), encoding="utf-8")
         except OSError as e:
             log.warning("[%s] 写 pipeline 锁失败（%s，并发保护失效）: %s", label, lk.name, e)
-    try:
-        out, err = proc.communicate(
-            input=json.dumps(payload, ensure_ascii=False),
-            timeout=config.pipeline_timeout_secs,
-        )
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            proc.kill()
-        try:
-            proc.communicate(timeout=10)
-        except Exception:
-            pass
-        log.error("[%s] pipeline 超时（%ss），进程组已清", label, config.pipeline_timeout_secs)
-        return None
-    finally:
-        _release_pipeline_lock(lock, proc.pid)
-        _release_pipeline_lock(global_lock, proc.pid)
 
-    if proc.returncode != 0:
-        log.error("[%s] pipeline bridge 退出码 %s: %s", label, proc.returncode,
-                  (err or "")[-400:])
-        return None
+    it.in_flight_since = time.time()
 
-    status, posted, duration = None, None, round(time.time() - t0, 1)
-    for line in (out or "").splitlines():
-        if line.startswith("RESULT "):
-            try:
-                pres = json.loads(line[len("RESULT "):])
-                status = pres.get("status")
-                posted = pres.get("comment_posted")
-            except Exception:
-                pass
-    if status is None:
-        log.error("[%s] pipeline 无 RESULT 输出", label)
-        return None
-    log.info("[%s] pipeline 完成: status=%s comment_posted=%s 耗时=%ss",
-             label, status, posted, duration)
-    return {"status": status, "comment_posted": posted}
+    # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
+    # 2026-09-29 与另一会话在同一 issue 上撞车的教训。
+    if config.pipeline_claim_comment:
+        try:
+            _gh_post_comment(
+                res.kind, binding.repo, res.number,
+                f"{config.bot_marker}\n[issue-pipeline] 已认领本 issue 开始处理"
+                f"（run {time.strftime('%H:%M:%S')} 起）。"
+                "如有并行会话在做同一件事，请在本条下留言，避免重复动工。")
+        except Exception as e:
+            log.warning("[%s] 认领评论失败（不影响派发）: %s", label, e)
+    return {"status": "dispatched", "comment_posted": True}
+
+
+def _reap_pipelines(config, state, bindings) -> int:
+    """收尸：对所有 in_flight 条目判「run 是否已结束」，结束则补回评/状态/看板。
+
+    返回本轮收尾的条数。判定：
+    - run.lock 的 pid 活着且未超 pipeline_timeout_secs → 还在跑，跳过；
+    - pid 活着但超时 → killpg（bridge 是 start_new_session，整组清）+ engine_error；
+    - pid 死了 → bridge 已退出：读台账该 issue 最晚一条记录拿 status/comment_posted；
+      台账缺失（bridge 极早崩溃）按 engine_error 处理。
+    """
+    import os as _os
+    import signal as _signal
+    import time as _time
+
+    finalized = 0
+    now = _time.time()
+    for binding in bindings:
+        rs = state.repo(binding.repo_slug)
+        for key, it in list(rs.items.items()):
+            since = getattr(it, "in_flight_since", None)
+            if not since:
+                continue
+            label = f"{binding.repo} #{key}"
+            slug = binding.repo.split("/")[-1]
+            artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{key}").expanduser()
+            lock = artifact_dir / PIPELINE_LOCK_NAME
+            holder = _lock_holder(lock)
+            timed_out = (now - since) > config.pipeline_timeout_secs
+            if holder is not None and not timed_out:
+                continue  # 还在跑
+            if holder is not None and timed_out:
+                try:
+                    _os.killpg(_os.getpgid(holder), _signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+                lock.unlink(missing_ok=True)
+                log.error("[%s] pipeline 超时（%ss），进程组已清",
+                          label, config.pipeline_timeout_secs)
+
+            rec = _latest_pipeline_record(binding.repo, int(key), since) or {}
+            status = rec.get("status") or "engine_error"
+            posted = bool(rec.get("comment_posted"))
+            err = str(rec.get("error") or "")
+            if holder is None and not rec:
+                status, err = "engine_error", "bridge 进程已退出且未写台账"
+            if timed_out and not err:
+                err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
+
+            # ── 收尾（与旧同步路径同一套语义）─────────────────────────
+            lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
+            if not posted:
+                if status == "engine_error":
+                    reason = "管线引擎异常终止（未发出回评）"
+                else:
+                    reason = f"管线终态，但未确认发出回评"
+                reason += f"（status={status}）"
+                if err:
+                    reason += f"：{err[:140]}"
+                try:
+                    kind = "pr" if key.startswith("pr:") else "issue"
+                    _gh_post_comment(
+                        kind, binding.repo, int(key.split(":")[-1]),
+                        f"{config.bot_marker}\n[issue-pipeline] {reason}，请人工查看。")
+                except Exception as e:
+                    log.error("[%s] 兜底回评失败: %s", label, e)
+            it.processed = True
+            it.in_flight_since = None
+            finalized += 1
+            status_for_board = status
+            if status == "blocked" and not key.startswith("pr:"):
+                body = ""
+                try:
+                    body = (artifact_dir / "00-issue.md").read_text(encoding="utf-8")
+                except OSError:
+                    pass
+                deps = [n for n in _extract_issue_refs(body) if n != int(key)]
+                if deps:
+                    it.wakeup_deps = deps
+                    log.info("[%s] blocked，监视依赖 %s 就绪后唤醒", label, deps)
+            if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
+                log.info("[%s] pipeline 完成: status=%s（已收尾，看板→todo）", label, status)
+            else:
+                log.info("[%s] pipeline 完成: status=%s（已收尾，看板→review）", label, status)
+    return finalized
+
+
+
