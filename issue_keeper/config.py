@@ -136,6 +136,11 @@ class Config:
     author_daily_limit_exempt: list = field(default_factory=list)
     # 同作者每日最多触发次数（读 pipeline runs.jsonl 台账，防资源滥用）
     author_daily_limit: int = 3
+    # 同一 issue 每日最多管线 run 次数（读 runs.jsonl 台账）。防终态（guarded/
+    # engine_error 等）被反复重派的空转：单次 run 半小时起步，#40 实证一夜连烧
+    # 5 轮全部超时/拦截。0 = 不限；到顶后本轮跳过、不消费首次响应（次日自动重试，
+    # 人工处置后也可 reopen 立即重派）。
+    pipeline_issue_daily_limit: int = 2
     # 混合形态（定义归 console + 观测进 console，执行留本地 bridge）
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     # 回评礼仪化：agent 原始输出发布前消毒 + LLM 改写为 issue 礼仪评论。

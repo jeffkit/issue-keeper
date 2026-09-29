@@ -313,3 +313,55 @@ def test_both_locks_released_after_run(tmp_path, monkeypatch):
     assert out == {"status": "done", "comment_posted": True}
     assert not (root / ".pipeline.lock").exists()
     assert not (root / "b-7" / "run.lock").exists()
+
+
+# ── 同 issue 管线日上限（#40 空转事故的回归，2026-09-29）──────────────
+
+def _write_issue_ledger(tmp_path, repo: str, number: int, n: int, day_offset: int = 0) -> None:
+    """写 n 条该 (repo, issue) 今日（或 day_offset 天前）的 run 台账。"""
+    ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT10:00:00+0800", time.localtime(time.time() - day_offset * 86400))
+    lines = [json.dumps({"ts": ts, "repo": repo, "issue": number,
+                         "author": "bob", "status": "engine_error"}) + "\n"] * n
+    with ledger.open("a", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def test_issue_cap_blocks_redispatch_without_consuming(tmp_path, monkeypatch):
+    """终态 issue 被拉回队列时，当日 run 数到顶 → 跳过且不消费首次响应。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_issue_ledger(tmp_path, "a/b", 5, n=2)
+    cfg = Config(pipeline_mode=True, pipeline_issue_daily_limit=2)
+    rs = RepoState()
+
+    handled = _process_resource(
+        _FakeSrc(), RepoBinding(repo="a/b", profile="p"), cfg, cfg.screener,
+        None, rs, _res(number=5), "", 60, "[issue-keeper:x]",
+    )
+
+    assert handled == 0
+    assert rs.item("5").processed is False   # 只推迟：次日或人工 reopen 后可重试
+
+
+def test_issue_cap_counts_same_issue_only(tmp_path, monkeypatch):
+    """计数只认同仓同号：别的 issue 跑再多、隔天记录都不占额度。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_issue_ledger(tmp_path, "a/b", 5, n=2)
+    _write_issue_ledger(tmp_path, "a/b", 6, n=5)
+    _write_issue_ledger(tmp_path, "a/b", 5, n=1, day_offset=1)
+    _write_issue_ledger(tmp_path, "a/c", 5, n=3)
+    cfg = Config(pipeline_issue_daily_limit=2)
+    from issue_keeper.keeper import _issue_over_pipeline_limit
+    assert _issue_over_pipeline_limit(cfg, "a/b", 5) is True    # 今日本 issue 已 2 次
+    assert _issue_over_pipeline_limit(cfg, "a/b", 6) is True    # 今日 5 次
+    assert _issue_over_pipeline_limit(cfg, "a/b", 7) is False   # 本 issue 今日 0 次
+    assert _issue_over_pipeline_limit(cfg, "a/c", 5) is True
+
+
+def test_issue_cap_zero_disables(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_issue_ledger(tmp_path, "a/b", 5, n=9)
+    cfg = Config(pipeline_issue_daily_limit=0)
+    from issue_keeper.keeper import _issue_over_pipeline_limit
+    assert _issue_over_pipeline_limit(cfg, "a/b", 5) is False

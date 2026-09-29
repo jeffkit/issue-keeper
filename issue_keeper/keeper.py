@@ -422,6 +422,11 @@ def _process_resource(
             # 这样被静默丢掉的（2026-09-28）。这里只推迟，不消费首次响应。
             log.info("[%s] %s 作者 %s 今日触发次数已达上限，本轮跳过（未标记已处理，次日重试）",
                      label, kind, res.author)
+        elif config.pipeline_mode and _issue_over_pipeline_limit(config, binding.repo, res.number):
+            # 同 issue 管线日上限（#40 空转事故）：终态 issue 被拉回队列时不再
+            # 无限重派整轮 run（半小时起步）。同样只推迟、不消费首次响应。
+            log.info("[%s] 本 issue 今日管线 run 已达上限（%d），本轮跳过（未标记已处理）",
+                     label, config.pipeline_issue_daily_limit)
         else:
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
@@ -949,6 +954,36 @@ def _author_over_limit(config, author: str | None) -> bool:
 PIPELINE_LOCK_NAME = "run.lock"
 GLOBAL_LOCK_NAME = ".pipeline.lock"
 ALREADY_RUNNING = "already_running"
+
+
+def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
+    """同 issue 每日管线 run 次数上限（读 runs.jsonl 台账；台账缺失视为未超限）。
+
+    与作者日限互补：作者日限防「一人刷多 issue」，这里防「同一 issue 的终态被
+    反复重派」——guarded/engine_error 完成后任何把条目拉回队的路径都会再花
+    半小时起步跑一整轮，#40 一夜连烧 5 轮全是超时/护栏拦截（2026-09-29）。
+    """
+    import json
+    import time
+    if config.pipeline_issue_daily_limit <= 0:
+        return False
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    if not ledger.exists():
+        return False
+    today = time.strftime("%Y-%m-%d")
+    n = 0
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number) \
+                    and str(rec.get("ts", "")).startswith(today):
+                n += 1
+    except Exception:
+        return False
+    return n >= config.pipeline_issue_daily_limit
 
 
 def _read_pipeline_lock(lock: Path) -> int | None:
