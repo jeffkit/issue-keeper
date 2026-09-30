@@ -566,6 +566,9 @@ def load_config(path: str | os.PathLike) -> Config:
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
+        # 2026-09-30 修复：与 max_in_flight 同款死旋钮——yaml 无人读取，恒为
+        # 默认 2，#67/#70（各 2 run）被误判日上限锁死（runtime yaml 实配 10）。
+        pipeline_issue_daily_limit=max(1, int(raw.get("pipeline_issue_daily_limit", 3))),
         pipeline_push_mode=(raw.get("pipeline_push_mode") or "branch").strip(),
         pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
