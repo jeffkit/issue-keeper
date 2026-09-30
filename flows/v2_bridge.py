@@ -123,11 +123,11 @@ def main() -> None:
     elif v == "failed-preserved":
         _finish({"status": "failed", "pushed": False, "merged": False,
                  "stage": verdict.get("stage"),
-                 "error": str(verdict.get("why") or verdict.get("gate") or "failed")[:500]},
+                 "error": str(verdict.get("why") or verdict.get("gate") or "failed")[-500:]},
                 False, started, payload, t0, {"run_id": run_id})
     else:
         _finish({"status": "engine_error",
-                 "error": str(verdict.get("why") or "unknown")[:500]},
+                 "error": str(verdict.get("why") or "unknown")[-500:]},
                 False, started, payload, t0, {"run_id": run_id})
 
 

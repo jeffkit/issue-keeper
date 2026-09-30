@@ -575,7 +575,7 @@ def main() -> None:
         result = result if isinstance(result, dict) else {"status": str(result)}
         ok = True
     except Exception as e:  # 引擎层异常（含超时）：结构化为失败结果，让 keeper 兜底回评
-        result = {"status": "engine_error", "error": str(e)[:500]}
+        result = {"status": "engine_error", "error": str(e)[-500:]}
         ok = False
 
     result = normalize_result(result)

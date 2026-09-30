@@ -1462,21 +1462,45 @@ def _reap_pipelines(config, state, bindings) -> int:
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
             wip_note = ""
-            if status == "engine_error" and not key.startswith("pr:") and binding.cwd:
+            gate_ctx = ""
+            if status == "engine_error" and not key.startswith("pr:"):
                 # 引擎异常终止：worktree 可能留着无 journal 的半成品（#33/#51 实证），
                 # 就地快照成 wip 提交防丢，兜底回评里告知位置。
-                wip_note = _snapshot_worktree_wip(
-                    Path(binding.cwd) / ".worktrees" / f"issue-{number}", f"issue-{number}")
-                if wip_note:
-                    log.warning("[%s] %s", label, wip_note)
+                worktree_dir = (Path(binding.cwd) / ".worktrees" / f"issue-{number}"
+                                if binding.cwd else None)
+                if worktree_dir is not None:
+                    wip_note = _snapshot_worktree_wip(worktree_dir, f"issue-{number}")
+                # #4：gate 名/命令/cwd 来自台账与 dispatch.json（容错缺失，不影响兜底回评）
+                gate_failed = str(rec.get("gate_failed") or "").strip()
+                if gate_failed:
+                    gate_ctx += f"gate={gate_failed}；"
+                try:
+                    dispatch = json.loads(
+                        (artifact_dir / "dispatch.json").read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    dispatch = {}
+                cmd = str(dispatch.get("test_command") or "").strip()
+                wt_path = (dispatch.get("worktree_dir") or
+                           (str(worktree_dir) if worktree_dir else ""))
+                exists = "存在" if wt_path and Path(wt_path).is_dir() else "不存在"
+                # #4：无论有无脏改动都留一条日志，目录不存在这条路径不再静默
+                log.warning("[%s] engine_error 收尾：worktree 目录%s%s", label, exists,
+                            f"；{wip_note}" if wip_note else "")
+                gate_ctx += f"cmd={cmd or '未知'}；worktree={wt_path or '未知'}（{exists}）"
             if not posted:
                 if status == "engine_error":
                     reason = "管线引擎异常终止（未发出回评）"
                 else:
                     reason = f"管线终态，但未确认发出回评"
                 reason += f"（status={status}）"
+                if gate_ctx:
+                    reason += f"；{gate_ctx}"
                 if err:
-                    reason += f"：{err[:140]}"
+                    # #4：尾部截断——多层异常链的最内层（FileNotFoundError 路径）在链尾
+                    err_tail = err[-280:]
+                    if len(err) > len(err_tail):
+                        err_tail = "..." + err_tail
+                    reason += f"：{err_tail}"
                 if wip_note:
                     reason += f"；{wip_note}"
                 try:
