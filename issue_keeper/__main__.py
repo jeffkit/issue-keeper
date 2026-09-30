@@ -381,14 +381,14 @@ def _run_onboard(args) -> int:
 
     # 2) 可选：生成自我介绍
     if args.gen_intro:
-        if not os.environ.get("DEEPSEEK_API_KEY"):
-            print("未设置 DEEPSEEK_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
+        if not os.environ.get("GLM_API_KEY"):
+            print("未设置 GLM_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
         else:
             from .profile import ProfileEntry, invoke_agent
             env = {
-                "ANTHROPIC_API_KEY": os.environ["DEEPSEEK_API_KEY"],
-                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
-                "CLAUDE_MODEL": "deepseek-chat",
+                "ANTHROPIC_API_KEY": os.environ["GLM_API_KEY"],
+                "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+                "CLAUDE_MODEL": "glm-5.3-flash",
             }
             entry = ProfileEntry(name=args.profile, is_hub=True, cwd=str(project_path),
                                  env=env, timeout_secs=180)

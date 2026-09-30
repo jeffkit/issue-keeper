@@ -30,6 +30,9 @@ class ReplyPolishConfig:
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
+    # 附加请求体字段（openai 协议；如 {"reasoning_effort": "low"}——glm-5.3-flash
+    # 这类始终思考模型不压档位会烧掉 max_tokens 还交不出 content）
+    extra_body: dict | None = None
     # 喂给改写调用的最大字符数（超长原文截断——改写是发布把关，不是全文翻译）
     max_chars: int = 16000
     timeout_secs: int = 60
@@ -104,7 +107,7 @@ def _call_llm(cfg: ReplyPolishConfig, prompt: str) -> str:
         }
     else:
         url = _openai_chat_url(cfg.base_url or "")
-        payload = {
+        payload: dict = {
             "model": cfg.model,
             "max_tokens": 2048,
             "temperature": 0,
@@ -113,6 +116,8 @@ def _call_llm(cfg: ReplyPolishConfig, prompt: str) -> str:
                 {"role": "user", "content": prompt},
             ],
         }
+        if cfg.extra_body:
+            payload.update(cfg.extra_body)
         headers = {
             "content-type": "application/json",
             "authorization": f"Bearer {cfg.api_key or ''}",

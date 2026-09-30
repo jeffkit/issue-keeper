@@ -20,8 +20,9 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
 
 角色分离：
   - glm-52         investigate / plan / implement / fix（实施方）
-  - deepseek-flash review（独立审查方：异构厂商模型，只看 diff+计划+issue 原文，
-                     不看实施者自述——不是 self review）
+  - glm53-flash    review（独立审查方，只看 diff+计划+issue 原文，不看实施者自述
+                     ——不是 self review。09-30 起由 deepseek-flash 换防：DeepSeek
+                     账户欠费 402，按拍板全部统一 GLM-5.3-flash，异构厂商性让位于可用性）
   - glm-turbo      triage / document / reply（轻量段）
 
 设计要点（09-27 三方审查后定稿：DSL 严谨性 / 编排设计 / 运维安全）：
@@ -394,9 +395,9 @@ def issue_pipeline(INPUT):
         )
         return {"status": "nochange", "posted": post_nochange.posted}
 
-    # ── 5. 独立 review：异构厂商模型，只看 diff+计划+issue 原文 ──
+    # ── 5. 独立 review：只看 diff+计划+issue 原文 ──
     review = AGENTRUN(
-        agent="deepseek-flash",
+        agent="glm53-flash",
         repo=INPUT.worktree_dir,
         # 审查员要读整份 diff + 对照计划/验收再自检：600s（#42/#43 被掐）→ 1800 →
         # 2400 → 2700（v1.0.9）。#19 连续两跑都在这里被掐（implement 只用 98s，

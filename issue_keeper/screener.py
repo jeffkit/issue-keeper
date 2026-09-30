@@ -73,6 +73,7 @@ class ScreenerConfig:
     model: str | None
     on_unsafe: str  # "skip" | "comment"
     max_chars: int  # 单条文本喂给 screener 的最大字符数，避免超长 issue 爆 token
+    extra_body: dict | None = None  # 附加请求体字段（openai 协议；如 {"reasoning_effort": "low"}）
     backend: str = "classic"  # "classic" | "decision" | "flow"
     min_confidence: float = 0.8  # decision 后端：低于此置信度按不安全处理
     # flow 后端：判定配置的来源（plaita-console）
@@ -199,7 +200,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 def _call_openai(cfg: ScreenerConfig, prompt: str, *, source_label: str) -> str:
     """OpenAI 兼容协议（DeepSeek / OpenAI / Moonshot / Together 等）。"""
     url = _openai_chat_url(cfg.base_url)
-    payload = {
+    payload: dict = {
         "model": cfg.model,
         "max_tokens": 200,
         "temperature": 0,
@@ -208,6 +209,8 @@ def _call_openai(cfg: ScreenerConfig, prompt: str, *, source_label: str) -> str:
             {"role": "user", "content": prompt},
         ],
     }
+    if cfg.extra_body:
+        payload.update(cfg.extra_body)
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url,
@@ -303,6 +306,7 @@ def _screen_decision(text: str, cfg: ScreenerConfig, *, source_label: str) -> Ve
         api_base=cfg.base_url,
         api_key=cfg.api_key,
         model=cfg.model,
+        extra_body=cfg.extra_body,
         timeout_secs=30,
         min_confidence=cfg.min_confidence,
         on_low_confidence="error",
@@ -418,6 +422,7 @@ def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> di
             "api_base": _resolve_flow_field(node.get("api_base"), text),
             "api_key": _resolve_flow_field(node.get("api_key"), text),
             "model": _resolve_flow_field(node.get("model"), text),
+            "extra_body": node.get("extra_body"),
             "min_confidence": min_conf,
             "on_low_confidence": node.get("on_low_confidence", "error"),
         }

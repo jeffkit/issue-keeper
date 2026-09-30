@@ -112,7 +112,7 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
                      └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
                         └─ implement(agent 30min, 禁 .github/**, 不 commit/push)
                            └─ 无改动 → 回评 → END
-                              └─ review(agent=deepseek-flash 独立审查, 解析失败=abort)
+                              └─ review(agent=glm53-flash 独立审查, 解析失败=abort)
                                  ├─ abort → 回评 → END
                                  ├─ fix → fix_review(实施方按指令修)
                                  └─ approve ▼
@@ -128,7 +128,7 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
 ## 对三方审查的处置
 
 **已落进 flow**：screener 结论消费（入口闸）、body 不进 prompt（body_file 引用）、
-独立 review（deepseek-flash 异构模型 + fail-safe abort）、质量门命令参数化、
+独立 review（glm53-flash 独立审查方，09-30 前 deepseek-flash 异构模型 + fail-safe abort）、质量门命令参数化、
 HITL 条件化+未批准即停、partial/hold 如实「未推送」、deliver/回评幂等（标记去重+
 ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害前消毒
 （本机路径/密钥模式 → [REDACTED]）、git fetch 同步（origin/main 基线）、
