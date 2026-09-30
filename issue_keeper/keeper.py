@@ -441,10 +441,6 @@ def _process_resource(
         if _is_bot_output(res.body or "", config.bot_marker, visible_prefix):
             log.info("[%s] %s 由 issue-keeper 自己创建，跳过首次回复", label, kind)
             it.processed = True  # 标记已处理，后续只看评论
-        elif me and res.author and res.author.lower() == me.lower():
-            # 自己（当前账号）提的 issue 也不自己回自己
-            log.info("[%s] %s 由当前账号 %s 创建，跳过首次回复", label, kind, me)
-            it.processed = True
         elif not _author_allowed(config, res.author):
             # 作者 allowlist：非名单内作者不触发 agent（防注入骚扰/资源滥用，S7）
             log.info("[%s] %s 作者 %s 不在 allowlist，跳过首次回复", label, kind, res.author)
