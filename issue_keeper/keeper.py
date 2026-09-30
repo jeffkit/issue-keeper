@@ -1168,6 +1168,44 @@ def _snapshot_worktree_wip(worktree_dir: Path, label: str) -> str:
         return f"worktree 快照检查失败：{str(e)[:160]}"
 
 
+def _pipeline_commit_note(worktree_dir: Path | None, base_branch: str) -> str:
+    """引擎异常终止后，报告管线分支上已有的提交位置（#4 评论区新增诉求）。
+
+    wip 快照只兜「未提交的脏改动」；recursive#67 实证另一半情况——implement 已把
+    工作提交到 pipeline/issue-N（甚至已推送 origin），随后 GATE 崩溃，兜底回评却只有
+    engine_error，人得去 `git branch -r` 里翻。这里就地读 worktree 的 HEAD
+    （分支@短SHA、领先基线多少、是否已推送），把「干了活但没报到」变成一眼可查。
+    容错：目录不存在 / git 不可用 / HEAD 无超出基线的独立提交 → 空串，不影响兜底回评。
+    """
+    import subprocess as _sp
+    if worktree_dir is None or not worktree_dir.is_dir():
+        return ""
+    def _git(args: list[str], t: int = 60) -> subprocess.CompletedProcess:
+        return _sp.run(["git", "-C", str(worktree_dir), *args],
+                       capture_output=True, text=True, timeout=t)
+    try:
+        if _git(["rev-parse", "--verify", "HEAD"]).returncode != 0:
+            return ""
+        branch = (_git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip()
+        sha = (_git(["rev-parse", "--short", "HEAD"]).stdout or "").strip()
+        remote_contains = _git(["branch", "-r", "--contains", "HEAD"])
+        pushed = (remote_contains.returncode == 0 and any(
+            ln.strip().startswith("origin/") for ln in remote_contains.stdout.splitlines()))
+        details: list[str] = []
+        base = (base_branch or "").strip()
+        if base:
+            ahead = _git(["rev-list", "--count", f"origin/{base}..HEAD"])
+            if ahead.returncode == 0:
+                n = (ahead.stdout or "0").strip()
+                if n == "0":
+                    return ""  # HEAD 没有超出基线的独立提交，报了也是噪音
+                details.append(f"领先 origin/{base} {n} 个提交")
+        details.append("已推送 origin" if pushed else "仅本地未推送")
+        return f"工作已提交到 {branch}@{sha}（{'，'.join(details)}）"
+    except Exception:
+        return ""
+
+
 def _latest_pipeline_record(repo_full: str, number: int, since_ts: float) -> dict | None:
     """读台账里该 issue 最晚的一条记录（dispatch 之后写的才算）。"""
     import json
@@ -1463,6 +1501,7 @@ def _reap_pipelines(config, state, bindings) -> int:
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
             wip_note = ""
+            commit_note = ""
             gate_ctx = ""
             if status == "engine_error" and not key.startswith("pr:"):
                 # 引擎异常终止：worktree 可能留着无 journal 的半成品（#33/#51 实证），
@@ -1484,9 +1523,14 @@ def _reap_pipelines(config, state, bindings) -> int:
                 wt_path = (dispatch.get("worktree_dir") or
                            (str(worktree_dir) if worktree_dir else ""))
                 exists = "存在" if wt_path and Path(wt_path).is_dir() else "不存在"
+                # #4 评论区：管线分支上已有的提交也报位置——recursive#67 实证
+                # 「工作已提交甚至已推送、只有回评崩了」的情况，人工不该去 branch -r 里捞
+                commit_note = _pipeline_commit_note(
+                    worktree_dir, str(dispatch.get("base_branch") or ""))
                 # #4：无论有无脏改动都留一条日志，目录不存在这条路径不再静默
-                log.warning("[%s] engine_error 收尾：worktree 目录%s%s", label, exists,
-                            f"；{wip_note}" if wip_note else "")
+                log.warning("[%s] engine_error 收尾：worktree 目录%s%s%s", label, exists,
+                            f"；{wip_note}" if wip_note else "",
+                            f"；{commit_note}" if commit_note else "")
                 gate_ctx += f"cmd={cmd or '未知'}；worktree={wt_path or '未知'}（{exists}）"
             if not posted:
                 if status == "engine_error":
@@ -1504,6 +1548,8 @@ def _reap_pipelines(config, state, bindings) -> int:
                     reason += f"：{err_tail}"
                 if wip_note:
                     reason += f"；{wip_note}"
+                if commit_note:
+                    reason += f"；{commit_note}"
                 try:
                     _gh_post_comment(
                         kind, binding.repo, number,

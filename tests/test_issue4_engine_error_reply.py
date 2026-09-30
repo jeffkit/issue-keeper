@@ -3,7 +3,9 @@
 来自 recursive#67（issue-keeper#4 复刻）：fix_loop→GATE 崩溃后兜底回评
 1) err 只保留头部 140 字符——多层 NodeExecutionError 链的最内层
    FileNotFoundError 路径恰好被切掉；
-2) 回评不含 gate 名/命令/cwd/目录存在性，崩溃无法自查。
+2) 回评不含 gate 名/命令/cwd/目录存在性，崩溃无法自查；
+3) （评论区补充）impl 已把工作提交到管线分支、甚至已推送，回评却只有
+   engine_error，人工得去 git branch -r 里捞分支——回评要带 branch@sha。
 """
 
 import json
@@ -107,3 +109,84 @@ def test_engine_error_checks_worktree_and_logs(reap_env, tmp_path, monkeypatch, 
 
     assert "wip(issue-7)" in g("log", "-1", "--format=%s").stdout     # 检查确实发生
     assert any("worktree" in r.message for r in caplog.records), caplog.text
+
+
+# ── #4 评论区：分支上已有提交也要报位置 ──────────────────────────────────
+
+def _init_pipeline_worktree(repo_dir, number=7, *, push: bool):
+    """构造「管线分支已有提交（可选已推送 origin）」的 worktree，返回 (worktree, git, 基线分支名)。"""
+    origin = repo_dir.parent / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    wt = repo_dir / ".worktrees" / f"issue-{number}"
+    g = _init_git_wt(wt)
+    g("remote", "add", "origin", str(origin))
+    base_branch = g("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    g("push", "-q", "origin", base_branch)
+    g("checkout", "-qb", f"pipeline/issue-{number}")
+    (wt / "work.txt").write_text("实现成果", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-qm", "impl: real work")
+    if push:
+        g("push", "-q", "origin", f"pipeline/issue-{number}")
+    return wt, g, base_branch
+
+
+def _reap_with_worktree(tmp_path, monkeypatch, repo_dir, base_branch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, art = _in_flight_state(tmp_path, repo="a/b")
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    monkeypatch.setattr("issue_keeper.keeper._channel_reply_posted",
+                        lambda *a, **kw: False)
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "engine_error", "comment_posted": False,
+                         "error": "NodeExecutionError: GATE 崩了"})
+    (art / "dispatch.json").write_text(json.dumps({
+        "test_command": "cargo test",
+        "worktree_dir": str(repo_dir / ".worktrees" / "issue-7"),
+        "base_branch": base_branch,
+    }), encoding="utf-8")
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state,
+                    [RepoBinding(repo="a/b", profile="p", cwd=str(repo_dir))])
+    return posted
+
+
+def test_engine_error_reply_reports_pushed_branch(tmp_path, monkeypatch):
+    """recursive#67 同款：工作已提交且已推送、只有回评崩——回评必须带 branch@sha。"""
+    repo_dir = tmp_path / "clone"
+    wt, g, base_branch = _init_pipeline_worktree(repo_dir, push=True)
+    sha = g("rev-parse", "--short", "HEAD").stdout.strip()
+
+    posted = _reap_with_worktree(tmp_path, monkeypatch, repo_dir, base_branch)
+
+    assert len(posted) == 1
+    body = posted[0]
+    assert "工作已提交到 pipeline/issue-7@" in body
+    assert sha in body                                 # 具体 commit 可查
+    assert "已推送 origin" in body                     # 不必人工去 branch -r 里捞
+
+
+def test_engine_error_reply_reports_local_only_branch(tmp_path, monkeypatch):
+    """已提交但未推送：也要报 branch@sha，并明示仅本地。"""
+    repo_dir = tmp_path / "clone"
+    wt, g, base_branch = _init_pipeline_worktree(repo_dir, push=False)
+    sha = g("rev-parse", "--short", "HEAD").stdout.strip()
+
+    posted = _reap_with_worktree(tmp_path, monkeypatch, repo_dir, base_branch)
+
+    body = posted[0]
+    assert "工作已提交到 pipeline/issue-7@" in body
+    assert sha in body
+    assert "仅本地未推送" in body
+
+
+def test_engine_error_no_note_when_head_equals_base(tmp_path, monkeypatch):
+    """HEAD 没有超出基线的独立提交（空分支/纯失败）→ 不报「工作已提交」噪音。"""
+    repo_dir = tmp_path / "clone"
+    wt, g, base_branch = _init_pipeline_worktree(repo_dir, push=True)
+    g("checkout", "-q", base_branch)  # 回到基线：管线分支上没有新东西
+
+    posted = _reap_with_worktree(tmp_path, monkeypatch, repo_dir, base_branch)
+
+    assert "工作已提交到" not in posted[0]
