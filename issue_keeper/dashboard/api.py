@@ -350,6 +350,51 @@ def close_issue(
     return _resource_to_dict(fresh) if fresh else _resource_to_dict(res)
 
 
+# ── 项目名带 / 的路由形态（如 jeffkit/agentproc）──────────────────────
+# uvicorn 会把 %2F 解码成真实斜杠再进路由，单段 {project} 永远匹配不上
+# 带 / 的项目名——前端 encodeURIComponent 后全部 404。这里为每个端点
+# 补一份 {owner}/{name} 双段形态，转发到单段 handler。
+
+
+@router.get("/projects/{owner}/{name}/issues")
+def list_issues_slashed(owner: str, name: str, kind: str = "issue",
+                        ctx: DashboardCtx = Depends(_ctx)) -> list[dict[str, Any]]:
+    return list_issues(project=f"{owner}/{name}", kind=kind, ctx=ctx)
+
+
+@router.get("/projects/{owner}/{name}/issues/{number}")
+def get_issue_slashed(owner: str, name: str, number: int, kind: str = "issue",
+                      ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    return get_issue(project=f"{owner}/{name}", kind=kind, number=number, ctx=ctx)
+
+
+@router.post("/projects/{owner}/{name}/issues")
+def create_issue_slashed(owner: str, name: str, req: CreateIssueReq,
+                         ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    return create_issue(project=f"{owner}/{name}", req=req, ctx=ctx)
+
+
+@router.post("/projects/{owner}/{name}/issues/{number}/comments")
+def add_comment_slashed(owner: str, name: str, number: int, req: AddCommentReq,
+                        ctx: DashboardCtx = Depends(_ctx), kind: str = "issue") -> dict[str, Any]:
+    return add_comment(project=f"{owner}/{name}", number=number, req=req,
+                       ctx=ctx, kind=kind)
+
+
+@router.post("/projects/{owner}/{name}/issues/{number}/move")
+def move_issue_slashed(owner: str, name: str, number: int, req: MoveReq,
+                       ctx: DashboardCtx = Depends(_ctx), kind: str = "issue") -> dict[str, Any]:
+    return move_issue(project=f"{owner}/{name}", number=number, req=req,
+                      ctx=ctx, kind=kind)
+
+
+@router.post("/projects/{owner}/{name}/issues/{number}/close")
+def close_issue_slashed(owner: str, name: str, number: int, req: CloseReq,
+                        ctx: DashboardCtx = Depends(_ctx), kind: str = "issue") -> dict[str, Any]:
+    return close_issue(project=f"{owner}/{name}", number=number, req=req,
+                       ctx=ctx, kind=kind)
+
+
 # ── Pipeline 观测面（L2）：消费 bridge MetricsRecorder 的 metrics 落盘 ──
 
 
