@@ -563,6 +563,9 @@ def load_config(path: str | os.PathLike) -> Config:
             raw.get("pipeline_bridge")
             or "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py"),
         pipeline_timeout_secs=max(300, int(raw.get("pipeline_timeout_secs", 5400))),
+        # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
+        # 恒为 dataclass 默认 2（「调并发」实际不生效）。
+        pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
         pipeline_push_mode=(raw.get("pipeline_push_mode") or "branch").strip(),
         pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
