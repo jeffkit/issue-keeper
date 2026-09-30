@@ -27,6 +27,7 @@ from .state import load_state
 
 PIPELINE_DIR = pathlib.Path("~/.issue-keeper/pipeline").expanduser()
 STATE_PATH = pathlib.Path("~/.issue-keeper/state.json").expanduser()
+LEDGER_PATH = pathlib.Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
 GH_CACHE_TTL = 120.0
 
 # run 终态 → 工作台阶段与理由
@@ -93,10 +94,67 @@ def gh_open_issues(repo: str, fetcher=None, cache_ttl: float = GH_CACHE_TTL,
         return None, str(e)[:120]
 
 
+def _ledger_last_runs(days: int, ledger_path: pathlib.Path | None = None) -> dict:
+    """台账兜底：metrics 2026-09-30 才启用，此前的 run 只在 runs.jsonl。
+
+    台账没有节点级数据（故无 gate_failed），阶段推导只依赖 status。
+    """
+    out: dict[tuple, dict] = {}
+    path = ledger_path or LEDGER_PATH
+    cutoff = time.time() - days * 86400
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            r = json.loads(line)
+            ts = time.mktime(time.strptime((r.get("ts") or "")[:19], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            continue
+        if ts < cutoff:
+            continue
+        key = (r.get("repo"), int(r.get("issue") or -1))
+        prev = out.get(key)
+        if prev is None or (r.get("ts") or "") > (prev.get("started") or ""):
+            out[key] = {
+                "execution_id": r.get("execution_id"),
+                "status": r.get("status"),
+                "started": r.get("ts"),
+                "duration_secs": r.get("duration_secs"),
+                "gate_failed": r.get("gate_failed"),
+                "flow_version": r.get("flow_version"),
+                "source": "ledger",
+            }
+    return out
+
+
+def _metric_last_runs(days: int, metrics_dir: pathlib.Path | None) -> dict:
+    """metrics 口径的最新 run（含节点级事实，优先于台账）。"""
+    out: dict[tuple, dict] = {}
+    for rec in metrics.iter_runs(days=days, metrics_dir=metrics_dir):
+        key = (rec.get("repo"), int(rec.get("issue") or -1))
+        if key in out:
+            continue
+        nodes = rec.get("nodes") or []
+        out[key] = {
+            "execution_id": rec.get("execution_id"),
+            "status": rec.get("status"),
+            "started": rec.get("started"),
+            "duration_secs": rec.get("duration_secs"),
+            "gate_failed": next((n.get("gate") for n in nodes
+                                 if n.get("type") == "gate" and n.get("passed") is not True), None),
+            "flow_version": rec.get("flow_version"),
+            "source": "metrics",
+        }
+    return out
+
+
 def build_workbench(bindings: list[dict], *, days: int = 45,
                     metrics_dir: pathlib.Path | None = None,
                     state_path: pathlib.Path | None = None,
                     lock_root: pathlib.Path | None = None,
+                    ledger_path: pathlib.Path | None = None,
                     gh_fetcher=None, now: float | None = None) -> dict:
     """bindings: [{name, source}]（source 以 github 开头的才进工作台）。
 
@@ -110,11 +168,9 @@ def build_workbench(bindings: list[dict], *, days: int = 45,
     except Exception:
         state = None
 
-    # 最新 run 记录 per (repo, issue)
-    last_run: dict[tuple[str, int], dict] = {}
-    for rec in metrics.iter_runs(days=days, metrics_dir=metrics_dir):
-        key = (rec.get("repo"), int(rec.get("issue") or -1))
-        last_run.setdefault(key, rec)
+    # 最新 run：metrics（节点级）优先，台账兜底（历史 run 只在台账）
+    last_run = _ledger_last_runs(days, ledger_path)
+    last_run.update(_metric_last_runs(days, metrics_dir))
 
     groups: dict[str, list[dict]] = {k: [] for k in
                                      ("needs-human", "doing", "blocked", "queued", "settled")}
@@ -143,6 +199,7 @@ def build_workbench(bindings: list[dict], *, days: int = 45,
                 if rec is not None:
                     stage, reason = _STATUS_STAGE.get(rec.get("status") or "",
                                                       ("queued", ""))
+            rec = last_run.get((repo, res.number))
             card = {
                 "repo": repo,
                 "issue": res.number,
@@ -155,23 +212,10 @@ def build_workbench(bindings: list[dict], *, days: int = 45,
                 "reason": reason,
                 "in_flight": in_flight,
                 "running_since": since,
-                "last_run": None,
+                "last_run": rec,
             }
-            rec = last_run.get((repo, res.number))
-            if rec is not None:
-                nodes = rec.get("nodes") or []
-                card["last_run"] = {
-                    "execution_id": rec.get("execution_id"),
-                    "status": rec.get("status"),
-                    "started": rec.get("started"),
-                    "duration_secs": rec.get("duration_secs"),
-                    "gate_failed": next((n.get("gate") for n in nodes
-                                         if n.get("type") == "gate"
-                                         and n.get("passed") is not True), None),
-                    "flow_version": rec.get("flow_version"),
-                }
-                if stage == "doing" and rec.get("started"):
-                    card["running_since"] = card.get("running_since") or rec.get("started")
+            if rec is not None and stage == "doing" and rec.get("started"):
+                card["running_since"] = card.get("running_since") or rec.get("started")
             groups[stage].append(card)
             counts[stage] += 1
 

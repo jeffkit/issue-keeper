@@ -383,54 +383,60 @@ section h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight:
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #3a414f; }
 
-/* ── Pipeline 观测面（L2）────────────────────────────────────────── */
+/* ── Pipeline 观测面（L2）──────────────────────────────────────────
+   全部走主题变量（本看板是暗色主题：--bg 近黑 / --text 近白）。
+   曾用硬编码白底 → 白底白字不可读，勿再引入 #fff/#f7f8fa 这类固定色。 */
 .pipeline { padding: 16px 20px; }
-.pl-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+.pl-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 .repo-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-bottom: 16px; }
-.repo-card { border: 1px solid var(--border, #ddd); border-radius: 8px; padding: 10px 12px; cursor: pointer; background: #fff; }
-.repo-card.active { border-color: #4a7dbe; box-shadow: 0 0 0 2px rgba(74,125,190,.2); }
+.repo-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; cursor: pointer; background: var(--panel); }
+.repo-card:hover { border-color: var(--accent); }
+.repo-card.active { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(79,140,255,.25); }
 .rc-name { font-weight: 600; margin-bottom: 4px; }
 .rc-stats { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; }
-.rc-stats .bad { color: #c0392b; font-weight: 600; }
+.rc-stats .bad { color: var(--danger); font-weight: 600; }
 .rc-gates { font-size: 12px; margin-top: 4px; }
-.rc-gates.bad { color: #c0392b; }
+.rc-gates.bad { color: var(--danger); }
 .rc-statuses { font-size: 11px; margin-top: 4px; }
-.muted { color: #888; }
-.bad { color: #c0392b; }
-table.runs { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
-table.runs th, table.runs td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; white-space: nowrap; }
+.muted { color: var(--muted); }
+.bad { color: var(--danger); }
+table.runs { width: 100%; border-collapse: collapse; font-size: 13px; background: var(--panel); }
+table.runs th { color: var(--muted); font-weight: 600; background: var(--panel-2); }
+table.runs th, table.runs td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; white-space: nowrap; }
 .run-row { cursor: pointer; }
-.run-row:hover { background: #f5f8fc; }
-.chip { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #eef; }
-.st-done { background: #d9f2e3; color: #1e7c43; }
-.st-bad { background: #fde3e1; color: #b03028; }
-.st-early { background: #eef1f5; color: #5a6b7d; }
-.st-mid { background: #fdf3d7; color: #8a6d1a; }
-.segbar { display: flex; height: 10px; width: 160px; border-radius: 5px; overflow: hidden; background: #eee; }
+.run-row:hover { background: var(--panel-2); }
+.chip { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: rgba(138,147,163,.18); color: var(--text); }
+.st-done { background: rgba(76,201,138,.18); color: #7fe0ac; }
+.st-bad { background: rgba(255,107,107,.18); color: #ff9d9d; }
+.st-early { background: rgba(138,147,163,.18); color: #b7c0cf; }
+.st-mid { background: rgba(240,173,78,.18); color: #f2c879; }
+.segbar { display: flex; height: 10px; width: 160px; border-radius: 5px; overflow: hidden; background: var(--panel-2); }
 .seg { height: 100%; }
-.drawer { position: fixed; right: 0; top: 52px; bottom: 0; width: 52%; min-width: 560px; background: #fff; border-left: 1px solid #ddd; box-shadow: -6px 0 18px rgba(0,0,0,.08); padding: 14px 18px; overflow: auto; z-index: 30; }
+.drawer { position: fixed; right: 0; top: 52px; bottom: 0; width: 52%; min-width: 560px; background: var(--panel); border-left: 1px solid var(--border); box-shadow: -6px 0 18px rgba(0,0,0,.45); padding: 14px 18px; overflow: auto; z-index: 30; }
 .drawer-head { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
 table.nodes { width: 100%; border-collapse: collapse; font-size: 12.5px; }
-table.nodes th, table.nodes td { border-bottom: 1px solid #eee; padding: 5px 7px; text-align: left; }
-table.nodes tr.row-bad { background: #fdf0ef; }
+table.nodes th, table.nodes td { border-bottom: 1px solid var(--border); padding: 5px 7px; text-align: left; }
+table.nodes tr.row-bad { background: rgba(255,107,107,.10); }
 
 .datasets { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
-.dataset-chip { border: 1px solid #ddd; border-radius: 12px; padding: 2px 10px; background: #fafbfc; }
+.dataset-chip { border: 1px solid var(--border); border-radius: 12px; padding: 2px 10px; background: var(--panel-2); }
 
 /* ── 工作台（V1）────────────────────────────────────────────────── */
 .workbench { padding: 16px 20px; }
-.wb-columns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; align-items: start; }
-.wb-col { background: #f7f8fa; border-radius: 8px; padding: 8px; min-height: 120px; }
+/* minmax(0,1fr)：1fr 的 min-content 会被卡片里 nowrap 的长标题撑宽，
+   导致「排队」列远宽于其它列 */
+.wb-columns { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; align-items: start; }
+.wb-col { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 8px; min-height: 120px; min-width: 0; }
 .wb-col-head { font-weight: 600; margin-bottom: 8px; font-size: 13.5px; }
-.wb-needs { background: #fdf1f0; }
-.wb-needs .wb-col-head { color: #b03028; }
-.wb-doing { background: #f0f6fc; }
-.wb-card { background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 7px 9px; margin-bottom: 7px; font-size: 12.5px; }
-.wb-card-hot { border-color: #e8b4b0; }
+.wb-needs { background: rgba(255,107,107,.07); }
+.wb-needs .wb-col-head { color: var(--danger); }
+.wb-doing { background: rgba(79,140,255,.07); }
+.wb-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; margin-bottom: 7px; font-size: 12.5px; min-width: 0; }
+.wb-card-hot { border-color: rgba(255,107,107,.55); }
 .wb-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wb-card-title a { color: inherit; text-decoration: none; }
-.wb-card-title a:hover { color: #4a7dbe; }
+.wb-card-title a { color: var(--text); text-decoration: none; }
+.wb-card-title a:hover { color: var(--accent); }
 .wb-card-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 11.5px; align-items: center; }
-.wb-reason { color: #b03028; }
+.wb-reason { color: var(--danger); }
 .wb-empty { text-align: center; padding: 14px 0; font-size: 12px; }
 .wb-note { margin-top: 12px; font-size: 12px; }

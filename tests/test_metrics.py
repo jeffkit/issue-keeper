@@ -139,3 +139,37 @@ def test_segments_of_excludes_glue_nodes(tmp_path):
     rec["nodes"].append({"id": "_n1", "type": "if", "duration_ms": 5})
     segs = m.segments_of(rec)
     assert "investigate" in segs and "_n1" not in segs
+
+
+def test_iter_runs_ledger_fallback(tmp_path):
+    """metrics 目录为空时，历史 run 由 runs.jsonl 兜底（并保留 gate/tokens 口径）。"""
+    import json as _json
+    ledger = tmp_path / "runs.jsonl"
+    ledger.write_text(_json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "repo": "jeffkit/a", "issue": 3,
+        "status": "partial", "duration_secs": 500.0, "flow_version": "1.0.11",
+        "execution_id": "led-1", "gate_failed": "test", "tokens_total": 1234,
+        "ok": False, "comment_posted": True,
+    }) + "\n", encoding="utf-8")
+
+    runs = m.iter_runs(days=45, metrics_dir=tmp_path / "empty", ledger_path=ledger)
+    assert len(runs) == 1 and runs[0]["source"] == "ledger"
+    s = m.summarize(days=45, metrics_dir=tmp_path / "empty", ledger_path=ledger)
+    assert s["total_runs"] == 1
+    assert s["gate_failures"] == {"test": 1}
+    assert s["tokens_total"] == 1234
+    assert s["by_repo"]["jeffkit/a"]["by_status"] == {"partial": 1}
+
+
+def test_metrics_record_wins_over_ledger(tmp_path):
+    """同一 execution_id 既有 metrics 又有台账时，metrics（节点级）优先。"""
+    import json as _json
+    ledger = tmp_path / "runs.jsonl"
+    ledger.write_text(_json.dumps({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "repo": "jeffkit/a", "issue": 1,
+        "status": "done", "execution_id": "dup-1"}) + "\n", encoding="utf-8")
+    _seed(tmp_path, "dup-1", "jeffkit/a", "done", 100.0)
+
+    runs = m.iter_runs(days=45, metrics_dir=tmp_path / "metrics", ledger_path=ledger)
+    assert len(runs) == 1
+    assert runs[0].get("source") != "ledger"      # metrics 版本胜出

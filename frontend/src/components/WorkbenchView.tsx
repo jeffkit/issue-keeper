@@ -59,7 +59,7 @@ export function WorkbenchView() {
     <div className="workbench">
       <div className="pl-controls">
         <span className="muted">
-          {data ? `${data.counts["needs-human"] || 0} 条需要你 · 共 ${Object.values(data.counts).reduce((a, b) => a + b, 0)} 张卡` : "加载中…"}
+          {data ? `GitHub open issues：${Object.values(data.counts).reduce((a, b) => a + b, 0)} 张卡 · 其中 ${data.counts["needs-human"] || 0} 条需要你` : "加载中…"}
         </span>
         <span className="muted">更新于 {updatedAt}（每 60s 自动刷新）</span>
         <button className="mini" onClick={refresh}>刷新</button>
@@ -83,7 +83,7 @@ export function WorkbenchView() {
         })}
       </div>
       <div className="muted wb-note">
-        派生只读视图：GitHub 是 issue 的唯一权威。改状态/评论请点卡片标题去 GitHub 操作。
+        派生只读：GitHub 是 issue 的唯一权威（改状态/评论请点标题去 GitHub）；这里只叠加管线阶段——需要你/在途/受阻来自 run 状态，排队 = 提了但没跑过管线。
       </div>
     </div>
   );

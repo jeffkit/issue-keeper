@@ -15,51 +15,111 @@ from collections import Counter
 from statistics import median
 
 METRICS_DIR = pathlib.Path("~/.issue-keeper/pipeline/metrics").expanduser()
+LEDGER_PATH = pathlib.Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
 
 # agent/gate 节点才参与「段耗时」口径（if/assignment 等 glue 节点无意义）
 SEGMENT_TYPES = ("agentrun", "gate")
 
 
+def _ledger_records(days: int | None, repo: str | None,
+                    ledger_path: pathlib.Path | None = None) -> list[dict]:
+    """台账兜底记录：metrics 自 2026-09-30 才落盘，此前的 run 只在 runs.jsonl。
+
+    台账没有节点级事实——把 gate_failed/tokens_total 映射成合成节点，保持
+    下游（summarize/segments）单一数据形状；duration_ms 为 None 不进段耗时。
+    """
+    path = ledger_path or LEDGER_PATH
+    out: list[dict] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return out
+    cutoff = time.time() - days * 86400 if days else None
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if not r.get("execution_id"):
+            continue
+        if repo and r.get("repo") != repo:
+            continue
+        if cutoff is not None and not _ts_after(r.get("ts") or "", cutoff):
+            continue
+        nodes: list[dict] = []
+        if r.get("gate_failed"):
+            nodes.append({"id": "gate", "type": "gate", "status": "error",
+                          "duration_ms": None, "gate": r["gate_failed"], "passed": False})
+        if r.get("tokens_total"):
+            nodes.append({"id": "agentrun", "type": "agentrun", "status": "success",
+                          "duration_ms": None,
+                          "tokens": {"input": r["tokens_total"], "output": 0}})
+        out.append({
+            "schema": 1,
+            "execution_id": r.get("execution_id"),
+            "repo": r.get("repo"), "issue": r.get("issue"),
+            "started": r.get("ts"), "ended": None,
+            "status": r.get("status"), "ok": r.get("ok"),
+            "error": r.get("error"),
+            "duration_secs": r.get("duration_secs"),
+            "flow_source": r.get("flow_source"), "flow_version": r.get("flow_version"),
+            "nodes": nodes, "source": "ledger",
+        })
+    return out
+
+
 def iter_runs(days: int | None = None, repo: str | None = None,
-              metrics_dir: pathlib.Path | None = None) -> list[dict]:
-    """按新→旧返回 run 记录；days/window 与 repo 可选过滤。"""
+              metrics_dir: pathlib.Path | None = None,
+              ledger_fallback: bool = True,
+              ledger_path: pathlib.Path | None = None) -> list[dict]:
+    """按新→旧返回 run 记录；days/window 与 repo 可选过滤。
+
+    metrics 优先；ledger_fallback=True 时用 runs.jsonl 补齐 metrics 里没有的
+    execution_id（历史 run 只在台账）。
+    """
     root = metrics_dir or METRICS_DIR
     cutoff = time.time() - days * 86400 if days else None
     out: list[dict] = []
-    if not root.exists():
-        return out
-    for path in sorted(root.glob("*/*.json"), reverse=True):
-        try:
-            rec = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if not isinstance(rec, dict) or not rec.get("execution_id"):
-            continue
-        if repo and rec.get("repo") != repo:
-            continue
-        if cutoff is not None and not _ts_after(rec.get("started") or "", cutoff):
-            continue
-        rec["_path"] = str(path)
-        out.append(rec)
+    if root.exists():
+        for path in sorted(root.glob("*/*.json"), reverse=True):
+            try:
+                rec = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(rec, dict) or not rec.get("execution_id"):
+                continue
+            if repo and rec.get("repo") != repo:
+                continue
+            if cutoff is not None and not _ts_after(rec.get("started") or "", cutoff):
+                continue
+            rec["_path"] = str(path)
+            out.append(rec)
+    if ledger_fallback:
+        seen = {r.get("execution_id") for r in out}
+        for rec in _ledger_records(days, repo, ledger_path):
+            if rec["execution_id"] not in seen:
+                out.append(rec)
     out.sort(key=lambda r: r.get("started") or "", reverse=True)
     return out
 
 
 def run_detail(execution_id: str, metrics_dir: pathlib.Path | None = None) -> dict | None:
-    for rec in iter_runs(metrics_dir=metrics_dir):
+    for rec in iter_runs(metrics_dir=metrics_dir, ledger_fallback=False):
         if rec.get("execution_id") == execution_id:
             return rec
     return None
 
 
 def summarize(days: int = 30, repo: str | None = None,
-              metrics_dir: pathlib.Path | None = None) -> dict:
+              metrics_dir: pathlib.Path | None = None,
+              ledger_path: pathlib.Path | None = None) -> dict:
     """按仓聚合观测口径：成功率/时长分布/状态分布/失败门 top/token/段耗时。
 
     success_rate 只把 status=done 记成功；readonly/blocked/invalid/nochange 等
     业务早退按各自状态计数（不算失败，也不算 done）。
     """
-    runs = iter_runs(days=days, repo=repo, metrics_dir=metrics_dir)
+    runs = iter_runs(days=days, repo=repo, metrics_dir=metrics_dir,
+                     ledger_path=ledger_path)
     by_repo: dict[str, dict] = {}
     gate_failures: Counter[str] = Counter()
     failure_nodes: Counter[str] = Counter()

@@ -179,3 +179,29 @@ def test_workbench_endpoint(client, tmp_path, monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["groups"]["needs-human"][0]["repo"] == "jeffkit/a"
+
+
+def test_ledger_fallback_when_metrics_empty(tmp_path):
+    """metrics 是 09-30 才启用：历史 run 只在 runs.jsonl，工作台要能吃台账。"""
+    import json as _json
+    ledger = tmp_path / "runs.jsonl"
+    ledger.write_text("\n".join([
+        _json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "repo": "jeffkit/a",
+                     "issue": 5, "status": "partial", "duration_secs": 900.0,
+                     "execution_id": "old-1", "flow_version": "1.0.11"}),
+        _json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "repo": "jeffkit/a",
+                     "issue": 6, "status": "done", "duration_secs": 60.0,
+                     "execution_id": "old-2", "flow_version": "1.0.11"}),
+    ]) + "\n", encoding="utf-8")
+
+    out = wb.build_workbench(
+        [{"name": "jeffkit/a", "source": "github_cli"}],
+        metrics_dir=tmp_path / "empty-metrics",      # metrics 无数据
+        state_path=tmp_path / "absent.json",
+        lock_root=tmp_path / "pipeline",
+        ledger_path=ledger,
+        gh_fetcher=lambda: _FakeGH([_res("jeffkit/a", 5), _res("jeffkit/a", 6)]))
+    nh = out["groups"]["needs-human"]
+    assert [c["issue"] for c in nh] == [5]
+    assert nh[0]["last_run"]["source"] == "ledger"
+    assert [c["issue"] for c in out["groups"]["settled"]] == [6]

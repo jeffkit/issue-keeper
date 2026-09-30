@@ -134,7 +134,7 @@ export default function App() {
             <button
               className={view === "workbench" ? "tab active" : "tab"}
               onClick={() => setView("workbench")}
-            >工作台</button>
+            >GitHub</button>
             <button
               className={view === "team" ? "tab active" : "tab"}
               onClick={() => setView("team")}
