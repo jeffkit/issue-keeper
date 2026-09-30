@@ -1,17 +1,19 @@
 """keeper 的防循环判定与 review 自动通过逻辑测试（纯逻辑，不调 agent）。"""
 
-from issue_keeper.config import Config, RepoBinding, KeeperPatrolConfig
+import types
+
+from issue_keeper.config import Config, RepoBinding, KeeperPatrolConfig, ScreenerConfig
 from issue_keeper.keeper import (
     _is_bot_output, _should_auto_review, _agent_label, _visible_prefix, _preamble,
-    keeper_patrol, _find_keeper_binding, _patrol_candidates,
+    keeper_patrol, _find_keeper_binding, _patrol_candidates, _process_resource,
 )
 from issue_keeper.sources import Resource
 
 
-def _res(*, status="inbox", author="alice", actor_type="human", number=1) -> Resource:
+def _res(*, status="inbox", author="alice", actor_type="human", number=1, labels=None) -> Resource:
     return Resource(
         kind="issue", number=number, title="t", body="", state="open",
-        labels=[], author=author, created_at="", updated_at="",
+        labels=labels or [], author=author, created_at="", updated_at="",
         status=status, actor_type=actor_type,
     )
 
@@ -219,3 +221,56 @@ class TestKeeperPatrol:
         assert _find_keeper_binding(Config(repos=[
             RepoBinding(repo="a", profile="p", role="agent"),
         ])) is None
+
+
+class TestOptOutLabels:
+    """opt-out 标签：带标签的资源完全不进处理循环（先于 allowlist/screener/agent）。"""
+
+    def _run(self, labels, allowlist=("alice",)):
+        """返回 (handled, rs_item 被查询次数)。rs_item 被查 = 越过了豁免层。"""
+        item_calls = []
+
+        def _item(key):
+            item_calls.append(key)
+            return types.SimpleNamespace(
+                in_flight_since=None, processed=False, blocked=False,
+                processed_comment_ids=set(), session_id="")
+
+        cfg = Config(author_allowlist=list(allowlist), pipeline_mode=False,
+                     opt_out_labels=["keeper-ignore"])
+        entry = object()  # 豁免层必须在触碰 profile/agent 之前返回
+        src = types.SimpleNamespace(
+            move_status=lambda *a, **k: (True, "x"),
+            list_comments=lambda *a, **k: [],
+        )
+        handled = _process_resource(
+            src=src,
+            binding=RepoBinding(repo="a/b", profile="p", agent_label="alpha-agent"),
+            config=cfg,
+            screener=ScreenerConfig(enabled=False, provider="openai", api_key=None,
+                                    base_url=None, model=None, on_unsafe="skip",
+                                    max_chars=8000),
+            entry=entry, rs=types.SimpleNamespace(item=_item),
+            res=_res(labels=labels), me="ik", timeout=60,
+            visible_prefix="[issue-keeper:alpha-agent]",
+        )
+        return handled, len(item_calls)
+
+    def test_opt_out_label_skips_entirely(self):
+        handled, item_calls = self._run(labels=["keeper-ignore"])
+        assert handled == 0
+        assert item_calls == 0  # 连状态条目都没建——任何后续逻辑都未执行
+
+    def test_label_match_is_case_insensitive(self):
+        handled, item_calls = self._run(labels=["Keeper-Ignore"])
+        assert handled == 0
+        assert item_calls == 0
+
+    def test_issue_without_label_enters_normal_loop(self):
+        # 无标签：越过豁免层进入正常分流（alice 不在 allowlist → 首响静默跳过）
+        handled, item_calls = self._run(labels=[], allowlist=("bob",))
+        assert handled == 0
+        assert item_calls == 1
+
+    def test_default_config_carries_keeper_ignore(self):
+        assert "keeper-ignore" in Config().opt_out_labels

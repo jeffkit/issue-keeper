@@ -402,9 +402,19 @@ def _process_resource(
 ) -> int:
     """处理单个 issue/PR，返回本轮处理条目数。"""
     handled = 0
-    it = rs.item(res.resource_key)
     kind = res.kind
     label = f"{binding.repo} {kind}#{res.number}"
+
+    # ── 0) 显式豁免（2026-09-30）：带 opt-out 标签的资源完全不进处理循环 ──
+    # 人工协调线程/公告类 issue 用；先于 allowlist/self_identity/screener 生效，
+    # agent 连读都不读。摘掉标签后下一轮按正常流程处理。
+    opt_out = {str(x).strip().lower()
+               for x in (getattr(config, "opt_out_labels", None) or [])}
+    if opt_out and any(str(lb).strip().lower() in opt_out for lb in (res.labels or [])):
+        log.info("[%s] %s 带 opt-out 标签，keeper 完全跳过（首响/评论均不处理）", label, kind)
+        return handled
+
+    it = rs.item(res.resource_key)
 
     # ── 管线在途：整体跳过（回评/状态/看板由 reaper 收尾）────────────
     # 2026-09-29 派发解耦：dispatch 只负责把 run 拉起来（后台），完成后的

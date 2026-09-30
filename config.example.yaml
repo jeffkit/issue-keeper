@@ -61,6 +61,10 @@ reply_polish:
   # min_chars: 120            # 短于此的原文跳过改写（只消毒）
 
 # ─── 触发门槛（防注入骚扰/资源滥用）──────────────────────────────────
+# 显式豁免标签：带任一标签的 issue/PR 被 keeper 完全跳过——首响、评论、screener
+# 一律不碰（比 allowlist 更早生效）。用途：人工协调线程/公告等不想被 automation
+# 消费的 issue；摘掉标签后下一轮恢复处理。
+opt_out_labels: ["keeper-ignore"]
 # 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）。
 # agent 自提 issue 的作者默认不在名单 → 静默跳过（S7 防滥用）。
 author_allowlist: ["okguitar", "kongjie", "jeffkit"]

@@ -203,6 +203,10 @@ class Config:
     pipeline_repos: dict = field(default_factory=dict)
     # 作者 allowlist：非空时仅名单内作者的新 issue 触发 agent（大小写不敏感）
     author_allowlist: list = field(default_factory=list)
+    # 显式豁免标签（大小写不敏感）：带任一标签的 issue/PR 被 keeper 完全跳过——
+    # 首响、评论、screener 一律不碰。用途：人工协调线程/公告等不想被 automation
+    # 消费的 issue；在所有触发门槛之前生效，摘掉标签后下一轮恢复处理。
+    opt_out_labels: list = field(default_factory=lambda: ["keeper-ignore"])
     # 豁免作者日限的作者名单（大小写不敏感）：名单内作者触发次数不限。
     # 典型用途：核心贡献者账号批量提 issue 时不被日限积压（2026-09-28 okguitar）。
     author_daily_limit_exempt: list = field(default_factory=list)
@@ -560,6 +564,9 @@ def load_config(path: str | os.PathLike) -> Config:
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
         pipeline_repos=pipeline_repos,
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],
+        opt_out_labels=[str(x).strip()
+                        for x in (raw.get("opt_out_labels") or ["keeper-ignore"])
+                        if str(x).strip()],
         author_daily_limit_exempt=[str(a).strip() for a in (raw.get("author_daily_limit_exempt") or [])
                                    if str(a).strip()],
         author_daily_limit=max(1, int(raw.get("author_daily_limit", 3))),
