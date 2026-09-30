@@ -140,3 +140,35 @@ export interface PipelineRunDetail {
 }
 
 export interface BenchmarkInfo { name: string; latest_version: number | null; versions: Record<string, any>; }
+
+// ── 工作台（V1 派生只读视图）─────────────────────────────────────────
+
+export interface WorkbenchCard {
+  repo: string;
+  issue: number;
+  title: string;
+  url: string;
+  author: string;
+  created_at: string;
+  labels: string[];
+  stage: string;
+  reason: string;
+  in_flight: boolean;
+  running_since: string | null;
+  last_run: {
+    execution_id: string;
+    status: string;
+    started: string;
+    duration_secs: number | null;
+    gate_failed: string | null;
+    flow_version: string;
+  } | null;
+}
+
+export interface WorkbenchData {
+  generated_at: string;
+  window_days: number;
+  counts: Record<string, number>;
+  groups: Record<string, WorkbenchCard[]>;
+  errors: Record<string, string>;
+}

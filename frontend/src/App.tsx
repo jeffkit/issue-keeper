@@ -17,8 +17,9 @@ import { CreateIssueModal } from "./components/CreateIssueModal";
 import { CreateProjectModal } from "./components/CreateProjectModal";
 import { TeamPanel } from "./components/TeamPanel";
 import { PipelineView } from "./components/PipelineView";
+import { WorkbenchView } from "./components/WorkbenchView";
 
-type View = "board" | "team" | "pipeline";
+type View = "board" | "workbench" | "team" | "pipeline";
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -131,6 +132,10 @@ export default function App() {
               onClick={() => setView("board")}
             >看板</button>
             <button
+              className={view === "workbench" ? "tab active" : "tab"}
+              onClick={() => setView("workbench")}
+            >工作台</button>
+            <button
               className={view === "team" ? "tab active" : "tab"}
               onClick={() => setView("team")}
             >团队成员{teamCount > 0 ? `（${teamCount}）` : ""}</button>
@@ -182,6 +187,8 @@ export default function App() {
 
       {view === "team" ? (
         <TeamPanel />
+      ) : view === "workbench" ? (
+        <WorkbenchView />
       ) : view === "pipeline" ? (
         <PipelineView />
       ) : (

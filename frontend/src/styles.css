@@ -416,3 +416,21 @@ table.nodes tr.row-bad { background: #fdf0ef; }
 
 .datasets { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 12.5px; }
 .dataset-chip { border: 1px solid #ddd; border-radius: 12px; padding: 2px 10px; background: #fafbfc; }
+
+/* ── 工作台（V1）────────────────────────────────────────────────── */
+.workbench { padding: 16px 20px; }
+.wb-columns { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; align-items: start; }
+.wb-col { background: #f7f8fa; border-radius: 8px; padding: 8px; min-height: 120px; }
+.wb-col-head { font-weight: 600; margin-bottom: 8px; font-size: 13.5px; }
+.wb-needs { background: #fdf1f0; }
+.wb-needs .wb-col-head { color: #b03028; }
+.wb-doing { background: #f0f6fc; }
+.wb-card { background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 7px 9px; margin-bottom: 7px; font-size: 12.5px; }
+.wb-card-hot { border-color: #e8b4b0; }
+.wb-card-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wb-card-title a { color: inherit; text-decoration: none; }
+.wb-card-title a:hover { color: #4a7dbe; }
+.wb-card-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 11.5px; align-items: center; }
+.wb-reason { color: #b03028; }
+.wb-empty { text-align: center; padding: 14px 0; font-size: 12px; }
+.wb-note { margin-top: 12px; font-size: 12px; }

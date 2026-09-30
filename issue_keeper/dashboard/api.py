@@ -451,3 +451,17 @@ def benchmarks_label(name: str, req: LabelReq) -> dict[str, Any]:
         return b.label_case(name, req.case_id, req.expected)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── 工作台（V1）：GitHub open issues × 管线状态 → 派生只读队列 ─────────
+
+
+@router.get("/workbench")
+def workbench(days: int = 45, ctx: DashboardCtx = Depends(_ctx)) -> dict[str, Any]:
+    """按派生阶段聚合所有 github 绑定仓的 open issues（needs-human 置顶由前端排）。"""
+    from .. import workbench as wb
+    src = _source(ctx)
+    metas = src.list_projects_meta()
+    bindings = [{"name": row["name"], "source": row["source"]} for row in metas]
+    days = max(7, min(days, 180))
+    return wb.build_workbench(bindings, days=days)

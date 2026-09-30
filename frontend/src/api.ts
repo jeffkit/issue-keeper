@@ -11,6 +11,7 @@ import type {
   Kind,
   Role,
   TeamMember,
+  WorkbenchData,
 } from "./types";
 
 // 同源相对路径：本地 127.0.0.1:7433 与公网 /ik/ 前缀下都解析正确
@@ -163,4 +164,8 @@ export function pipelineRunDetail(executionId: string): Promise<PipelineRunDetai
 
 export function benchmarksList(): Promise<BenchmarkInfo[]> {
   return j(fetch(`${BASE}/benchmarks`));
+}
+
+export function workbench(days: number): Promise<WorkbenchData> {
+  return j(fetch(`${BASE}/workbench?days=${days}`));
 }
