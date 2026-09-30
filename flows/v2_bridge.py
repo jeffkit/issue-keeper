@@ -28,6 +28,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pipeline_bridge as pb  # noqa: E402  (复用 append_ledger / normalize_result)
 
+# launchd PATH 没有 ~/.cargo/bin——v2 的 GATE 节点跑 cargo 会 FileNotFoundError
+# （#40 旧同款、#67 v2 首单复刻：impl 成功、门禁全灭）。在派生子进程前补齐
+# PATH（plaita 沙箱白名单的 PATH 从本进程 os.environ 取，改这里即全局生效）。
+pb.ensure_tool_path()
+
 V2_TIMEOUT_SECS = 28800
 
 
