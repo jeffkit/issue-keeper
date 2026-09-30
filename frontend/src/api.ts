@@ -13,8 +13,8 @@ import type {
   TeamMember,
 } from "./types";
 
-// 同源 / 开发代理都走 /api 相对路径
-const BASE = "/api";
+// 同源相对路径：本地 127.0.0.1:7433 与公网 /ik/ 前缀下都解析正确
+const BASE = "./api";
 
 async function j<T>(resP: Promise<Response>): Promise<T> {
   const res = await resP;
