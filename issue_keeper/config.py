@@ -73,6 +73,9 @@ class PipelineRepoConfig:
     """
     # false = 该仓不走管线（回退 legacy 单 agent 路径）
     enabled: bool = True
+    # pipeline = issue-pipeline flow（默认）；v2 = self-improve v2 引擎
+    # （recursive .dev/flows 的库节点版：agentrun/gate/git_publish）
+    engine: str = "pipeline"
     # full = 九段管线；readonly = 只调查不开工不交付（数据/分发/镜像仓）
     mode: str = "full"
     # worktree 基线 & 集成分支（argusai 家族 = develop；deepseek-harness = master）
@@ -251,6 +254,9 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
         mode = str(item.get("mode") or "full").strip()
         if mode not in ("full", "readonly"):
             raise ValueError(f"pipeline_repos[{repo}].mode 只能是 full|readonly，得到 {mode!r}")
+        engine = str(item.get("engine") or "pipeline").strip()
+        if engine not in ("pipeline", "v2"):
+            raise ValueError(f"pipeline_repos[{repo}].engine 只能是 pipeline|v2，得到 {engine!r}")
         push_mode = str(item.get("push_mode") or "").strip()
         if push_mode and push_mode not in ("branch", "pr", "main", "none"):
             raise ValueError(
@@ -278,6 +284,7 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
         out[repo] = PipelineRepoConfig(
             enabled=bool(item.get("enabled", True)),
             mode=mode,
+            engine=engine,
             base_branch=base_branch,
             setup_command=str(item.get("setup_command") or ""),
             setup_timeout_secs=max(60, int(item.get("setup_timeout_secs", 1800))),
@@ -357,6 +364,10 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
     if not isinstance(console, dict):
         raise ValueError("screener.console 需要是映射（url/api_key/flow_id/refresh_secs/cache_path）")
 
+    extra_body = raw.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError("screener.extra_body 需要是映射（如 {reasoning_effort: low}）")
+
     cfg = ScreenerConfig(
         enabled=enabled,
         provider=provider,
@@ -365,6 +376,7 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
         model=model,
         on_unsafe=on_unsafe,
         max_chars=max_chars,
+        extra_body=extra_body,
         backend=backend,
         min_confidence=min_confidence,
         console_url=_expand_env(console.get("url") or "").strip() or None,
@@ -435,12 +447,16 @@ def _load_reply_polish(raw: dict[str, Any], screener: ScreenerConfig) -> ReplyPo
     provider = str(rp_raw.get("provider") or screener.provider or "openai").strip().lower()
     if provider not in ("openai", "anthropic"):
         raise ValueError("reply_polish.provider 只能是 'openai' 或 'anthropic'")
+    extra_body = rp_raw.get("extra_body")
+    if extra_body is not None and not isinstance(extra_body, dict):
+        raise ValueError("reply_polish.extra_body 需要是映射（如 {reasoning_effort: low}）")
     return ReplyPolishConfig(
         enabled=bool(rp_raw.get("enabled", True)),
         provider=provider,
         api_key=_expand_env(rp_raw.get("api_key") or "").strip() or screener.api_key,
         base_url=_expand_env(rp_raw.get("base_url") or "").strip() or screener.base_url,
         model=_expand_env(rp_raw.get("model") or "").strip() or screener.model,
+        extra_body=extra_body if extra_body is not None else screener.extra_body,
         max_chars=max(1000, int(rp_raw.get("max_chars", 16000))),
         timeout_secs=max(10, int(rp_raw.get("timeout_secs", 60))),
         min_chars=max(0, int(rp_raw.get("min_chars", 120))),

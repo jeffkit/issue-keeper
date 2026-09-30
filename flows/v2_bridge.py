@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""v2 engine bridge——keeper 派发契约的 self-improve v2 适配层。
+
+与 pipeline_bridge 完全同一派发契约：dispatch.json（argv 传入）/ 台账 ledger /
+`RESULT {json}` stdout 行——keeper 的 reaper/兜底回评/看板无需感知差异。
+差异只在中段：不跑 issue-pipeline flow，改为调 recursive 仓的 self-improve
+v2 引擎（.dev/flows/self_improve_bridge_v2.py，agentrun/gate/git_publish
+库节点版）；screener/triage/回评仍由 keeper 负责。
+
+verdict 映射：
+  committed        → status=done,      pushed/merged=True
+  skip-commit      → status=done,      pushed/merged=False（无改动）
+  failed-preserved → status=failed,    error=why（worktree/现场已保全）
+  engine_error     → status=engine_error, error=why
+
+超时：V2_TIMEOUT_SECS（默认 8h，对齐 pipeline_timeout_secs）；到点杀进程树
+（recursive 桥自身也有 killpg 层）并落 engine_error。
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import pipeline_bridge as pb  # noqa: E402  (复用 append_ledger / normalize_result)
+
+V2_TIMEOUT_SECS = 28800
+
+
+def _read_verdict(main_clone: str, run_id: str) -> dict:
+    state = Path(main_clone) / ".flowcast" / "runs" / run_id / "state.json"
+    try:
+        return json.loads(state.read_text(encoding="utf-8")).get("verdict") or {}
+    except Exception:
+        return {}
+
+
+def _finish(result: dict, ok: bool, started: str, payload: dict, t0: float,
+            extra: dict | None = None) -> None:
+    result = pb.normalize_result(result)
+    pb.append_ledger({
+        "ts": started,
+        "repo": payload.get("repo_full"),
+        "issue": payload.get("issue_number"),
+        "author": payload.get("author"),
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "comment_posted": result.get("comment_posted"),
+        "pushed": result.get("pushed"),
+        "ok": ok,
+        "duration_secs": round(time.time() - t0, 1),
+        "flow_source": "v2",
+        "flow_version": "self-improve-v2",
+        **(extra or {}),
+    })
+    print("RESULT " + json.dumps(result, ensure_ascii=False, default=str))
+
+
+def main() -> None:
+    t0 = time.time()
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    payload = (json.load(open(sys.argv[1], encoding="utf-8")) if len(sys.argv) > 1
+               else json.load(sys.stdin))
+    main_clone = payload.get("main_clone") or ""
+    v2 = Path(main_clone) / ".dev" / "flows" / "self_improve_bridge_v2.py" if main_clone else None
+    if not v2 or not v2.exists():
+        _finish({"status": "engine_error", "error": f"v2 bridge not found: {v2}"},
+                False, started, payload, t0)
+        return
+
+    artifact = Path(payload["artifact_dir"])
+    body = ""
+    bf = payload.get("body_file")
+    if bf and Path(bf).exists():
+        body = Path(bf).read_text(encoding="utf-8")
+    goal = (f"#{payload.get('issue_number')} {payload.get('title', '')}\n\n"
+            f"{body}").strip()
+    gf = artifact / "v2-goal.md"
+    gf.write_text(goal, encoding="utf-8")
+
+    run_id = f"pipeline-{payload.get('issue_number')}-{time.strftime('%m%d%H%M%S')}"
+    # agent 名与 issue-pipeline flow 同款（agents.json 已验证）：实现/修复
+    # glm-52，评审 glm53-flash（独立 provider 复核）
+    cmd = [sys.executable, str(v2),
+           "--goal-file", str(gf), "--repo", main_clone, "--run-id", run_id,
+           "--agent", payload.get("agent") or "glm-52",
+           "--reviewer", payload.get("reviewer") or "glm53-flash"]
+    if payload.get("dry_run"):
+        cmd.append("--dry-run")
+
+    log_path = artifact / "v2-run.log"
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=V2_TIMEOUT_SECS)
+        log_path.write_text(
+            (r.stdout or "")[-8000:] + "\n--- stderr ---\n" + (r.stderr or "")[-4000:])
+        verdict = _read_verdict(main_clone, run_id)
+        if not verdict:
+            verdict = {"verdict": "engine_error",
+                       "why": f"v2 run exit={r.returncode} without verdict（见 v2-run.log）"}
+    except subprocess.TimeoutExpired:
+        verdict = {"verdict": "engine_error",
+                   "why": f"v2 run timeout after {V2_TIMEOUT_SECS}s"}
+
+    v = verdict.get("verdict")
+    if v == "committed":
+        _finish({"status": "done", "pushed": True, "merged": True,
+                 "note": verdict.get("via") or ""}, True, started, payload, t0,
+                {"run_id": run_id})
+    elif v == "skip-commit":
+        _finish({"status": "done", "pushed": False, "merged": False,
+                 "note": verdict.get("why") or "no changes"}, True,
+                started, payload, t0, {"run_id": run_id})
+    elif v == "failed-preserved":
+        _finish({"status": "failed", "pushed": False, "merged": False,
+                 "stage": verdict.get("stage"),
+                 "error": str(verdict.get("why") or verdict.get("gate") or "failed")[:500]},
+                False, started, payload, t0, {"run_id": run_id})
+    else:
+        _finish({"status": "engine_error",
+                 "error": str(verdict.get("why") or "unknown")[:500]},
+                False, started, payload, t0, {"run_id": run_id})
+
+
+if __name__ == "__main__":
+    main()

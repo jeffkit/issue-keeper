@@ -1226,6 +1226,10 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         pc = config.pipeline_repo_cfg(binding.repo)
 
     bridge = Path(config.pipeline_bridge).expanduser()
+    if pc.engine == "v2":
+        # engine=v2：接单切 self-improve v2 引擎（同目录 v2_bridge 适配同一
+        # 派发契约——dispatch.json / 台账 ledger / RESULT 行）。
+        bridge = bridge.parent / "v2_bridge.py"
     if not bridge.exists():
         log.error("[%s] pipeline bridge 不存在: %s", label, bridge)
         return {"status": "engine_error", "comment_posted": False}
