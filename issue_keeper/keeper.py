@@ -19,7 +19,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
@@ -917,6 +917,23 @@ def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
             changed.append(n)
     if changed:
         save_state(config.state_path, state)
+        # 状态透明化（okguitar 2026-09-30 建议）：拦截/终态评论只有「已拦」形态
+        # 没有「已解除」，外部无法从 issue 页面区分排队中/被拦——reopen 时补一条
+        # 带 bot marker 的状态评论（marker + self_identity 双保险，不会被评论层
+        # 当新输入处理）。发布失败不阻塞 state 语义（重新入队已生效）。
+        src_cache: dict[str, IssueSource] = {}
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+        for n in changed:
+            try:
+                src = _ensure_source(binding, src_cache)
+                src.post_comment(binding.repo, Resource(
+                    kind="issue", number=n, title="", body="", state="open",
+                    labels=[], author="", created_at="", updated_at="",
+                    status="", actor_type="human", source_ref=""),
+                    f"{config.bot_marker}\n[issue-keeper] 本条已于 {stamp} "
+                    "解除处理终态并重新入队（值守处置），将按依赖顺序重新派发。\n")
+            except Exception as e:
+                log.warning("[reopen] %s#%s 状态评论发布失败: %s", binding.repo, n, e)
     return changed
 
 

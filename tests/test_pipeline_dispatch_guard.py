@@ -792,3 +792,24 @@ def test_dispatch_payload_single_command_repo(tmp_path, monkeypatch):
     assert seen["test_command"] == "pnpm test:run"
     assert seen["gate_timeout_secs"] == 2400   # 单命令默认预算
     assert not (art / "gates.json").exists()
+
+
+def test_reopen_posts_status_comment(tmp_path):
+    """reopen 时补「已解除、重新入队」状态评论（okguitar 2026-09-30 建议：
+    拦截评论只有「已拦」没有「已解除」，外部无法区分排队中/被拦）。"""
+    import sqlite3
+
+    db = tmp_path / "internal.db"
+    cfg = Config(repos=[RepoBinding(repo="a/b", profile="p", source="internal",
+                                internal_db=str(db))],
+                 state_file=tmp_path / "state.json")
+    st = State()
+    st.repo("a-b").item("7").blocked = True
+    save_state(cfg.state_path, st)
+
+    assert reopen_issues(cfg, "a/b", [7]) == [7]
+
+    rows = sqlite3.connect(db).execute(
+        "select body from comments where project='a/b'").fetchall()
+    assert any("issue-keeper-bot" in body and "重新入队" in body
+               for (body,) in rows)
