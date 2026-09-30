@@ -341,6 +341,179 @@ def test_count_in_flight():
     assert a.in_flight_since is None
 
 
+# ── reaper 跨渠道读回 + WIP 快照 + 看板收尾（recursive#2 的三个可修点）──
+
+def test_reaper_readback_suppresses_false_fallback(tmp_path, monkeypatch):
+    """台账漏记 comment_posted（#31/#32 的 null），渠道读回确认已回评 → 不补发兜底。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, _art = _in_flight_state(tmp_path, repo="a/b")
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "blocked", "comment_posted": None, "ok": True})
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    monkeypatch.setattr("issue_keeper.keeper._channel_reply_posted",
+                        lambda *a, **kw: True)
+
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+
+    assert posted == []
+    assert it.processed is True
+
+
+def test_reaper_readback_failure_keeps_fallback(tmp_path, monkeypatch):
+    """渠道读不到（gh 挂/无网）→ 维持兜底回评（fail-safe，不因校验失能而静默）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    state, it, _art = _in_flight_state(tmp_path, repo="a/b")
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "engine_error", "comment_posted": False})
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    monkeypatch.setattr("issue_keeper.keeper._channel_reply_posted",
+                        lambda *a, **kw: False)
+
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+
+    assert len(posted) == 1 and "engine_error" in posted[0]
+    assert it.processed is True
+
+
+def test_channel_reply_posted_detection_rules(monkeypatch):
+    """读回判定：管线标记=硬证据；自己账号非机器评论=兜底；认领/兜底评论不算。"""
+    import subprocess
+    from issue_keeper.keeper import _channel_reply_posted
+
+    def _comments(lst):
+        class _R:
+            returncode = 0
+            stdout = json.dumps({"comments": lst})
+            stderr = ""
+        return lambda *a, **kw: _R()
+
+    def _c(body, created, login="keeper-bot"):
+        return {"body": body, "createdAt": created,
+                "author": {"login": login}}
+
+    # GitHub createdAt 是 UTC（Z）；dispatch 时刻也用 UTC 构造，避免本地时区歧义
+    from datetime import datetime, timezone
+    since = datetime(2026, 9, 28, 8, 0, tzinfo=timezone.utc).timestamp()
+    after = "2026-09-28T08:05:00Z"
+    before = "2026-09-28T07:00:00Z"
+    monkeypatch.setattr("issue_keeper.keeper._gh_login", lambda: "keeper-bot")
+
+    # 标记硬证据（不分作者、不论是否机器文本）
+    monkeypatch.setattr(subprocess, "run",
+                        _comments([_c("<!-- issue-pipeline -->\n说明", after, "someone")]))
+    assert _channel_reply_posted("a/b", 7, since, "<!-- issue-keeper-bot -->") is True
+    # 自己账号、无标记、非机器文本 → 兜底命中（覆盖无标记的历史回评）
+    monkeypatch.setattr(subprocess, "run",
+                        _comments([_c("暂不开工，依赖 #5 未合入", after)]))
+    assert _channel_reply_posted("a/b", 7, since, "<!-- issue-keeper-bot -->") is True
+    # keeper 机器评论（认领/兜底）不算回评
+    monkeypatch.setattr(subprocess, "run",
+                        _comments([_c("<!-- issue-keeper-bot -->\n[issue-pipeline] 已认领", after)]))
+    assert _channel_reply_posted("a/b", 7, since, "<!-- issue-keeper-bot -->") is False
+    # 派发之前的评论不算
+    monkeypatch.setattr(subprocess, "run",
+                        _comments([_c("<!-- issue-pipeline -->\n旧回评", before)]))
+    assert _channel_reply_posted("a/b", 7, since, "<!-- issue-keeper-bot -->") is False
+    # 别人的普通评论不算
+    monkeypatch.setattr(subprocess, "run",
+                        _comments([_c("+1", after, "alice")]))
+    assert _channel_reply_posted("a/b", 7, since, "<!-- issue-keeper-bot -->") is False
+
+
+def _init_git_wt(path) -> None:
+    """最小 git 仓（带一个基线提交），充当管线 worktree。"""
+    path.mkdir(parents=True)
+
+    def g(*args):
+        return subprocess.run(["git", "-C", str(path), *args],
+                              capture_output=True, text=True)
+
+    g("init", "-q")
+    g("config", "user.email", "t@t")
+    g("config", "user.name", "t")
+    (path / "base.txt").write_text("base", encoding="utf-8")
+    g("add", "-A")
+    g("commit", "-qm", "base")
+    return g
+
+
+def test_snapshot_wip_commits_dirty_worktree(tmp_path):
+    from issue_keeper.keeper import _snapshot_worktree_wip
+    wt = tmp_path / "wt"
+    g = _init_git_wt(wt)
+    (wt / "half.txt").write_text("半成品", encoding="utf-8")
+
+    note = _snapshot_worktree_wip(wt, "issue-33")
+
+    assert "已快照" in note
+    assert "wip(issue-33)" in g("log", "-1", "--format=%s").stdout
+    assert (wt / "half.txt").exists()          # 提交而非丢弃
+    assert not (subprocess.run(["git", "-C", str(wt), "status", "--porcelain"],
+                               capture_output=True, text=True).stdout.strip())
+
+
+def test_snapshot_wip_skips_clean_or_missing(tmp_path):
+    from issue_keeper.keeper import _snapshot_worktree_wip
+    wt = tmp_path / "wt"
+    _init_git_wt(wt)
+    assert _snapshot_worktree_wip(wt, "issue-1") == ""     # 干净工作区
+    assert _snapshot_worktree_wip(tmp_path / "nope", "issue-1") == ""  # 目录不存在
+
+
+def test_reaper_snapshots_dirty_worktree_on_engine_error(tmp_path, monkeypatch):
+    """引擎异常终止 + worktree 有半成品 → 自动 wip 快照，兜底回评告知位置（#33/#51）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    repo_dir = tmp_path / "clone"
+    wt = repo_dir / ".worktrees" / "issue-7"
+    g = _init_git_wt(wt)
+    (wt / "half.txt").write_text("Goal 394 半成品", encoding="utf-8")
+
+    state, it, _art = _in_flight_state(tmp_path, repo="a/b")
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "engine_error", "comment_posted": False})
+    posted = []
+    monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",
+                        lambda kind, repo, number, body: posted.append(body))
+    monkeypatch.setattr("issue_keeper.keeper._channel_reply_posted",
+                        lambda *a, **kw: False)
+
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state,
+                    [RepoBinding(repo="a/b", profile="p", cwd=str(repo_dir))])
+
+    assert "wip(issue-7)" in g("log", "-1", "--format=%s").stdout
+    assert any("快照" in body for body in posted)
+
+
+def test_reaper_moves_internal_board(tmp_path, monkeypatch):
+    """收尸后看板真实移动（原 status_for_board 是死变量）：done+已回评→review，
+    引擎异常→todo；不支持状态机的 source 静默跳过。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    moves = []
+
+    class _FakeBoard:
+        def move_status(self, repo, resource, to_status, *, actor="", actor_type="human",
+                        comment=""):
+            moves.append((repo, resource.number, to_status))
+            return True, "doing"
+
+    _write_issue_ledger(tmp_path, "a/b", 7, {"status": "done", "comment_posted": True})
+    _write_issue_ledger(tmp_path, "a/b", 8,
+                        {"status": "engine_error", "comment_posted": False})
+    for n in (7, 8):
+        state, it, _art = _in_flight_state(tmp_path, repo="a/b", number=n)
+        monkeypatch.setattr("issue_keeper.keeper._gh_post_comment", lambda *a, **kw: None)
+        monkeypatch.setattr("issue_keeper.keeper._channel_reply_posted",
+                            lambda *a, **kw: False)
+        monkeypatch.setattr("issue_keeper.keeper._ensure_source",
+                            lambda binding, cache: _FakeBoard())
+        _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+    assert sorted(moves) == [("a/b", 7, "review"), ("a/b", 8, "todo")]
+
+
 # ── 日限跳过（事故 2 的回归）────────────────────────────────────────
 
 def _write_author_ledger(tmp_path, author: str) -> None:

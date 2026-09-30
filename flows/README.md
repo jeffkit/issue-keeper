@@ -197,6 +197,32 @@ JSON 粘成一段，`json.loads` 必然失败 → fail-safe abort：整轮 ~22 �
 失败测试再跑 cargo，而 worktree 的 `target/` 是空的，冷构建常十几分钟；#42 同节点 381s）。
 两处一并发布 console **v1.0.4**。
 
+## recursive#2 处置（2026-09-30）：回评/状态同步 + worktree WIP 语义
+
+recursive 侧 agent 实测报来的两个可修点（+一条跨渠道校验建议），逐条落法：
+
+1. **回评已写出、状态却记 blocked（未发出回评）**：#31/#32 跑在 09-27 夜里，早于
+   #1 复盘的 `normalize_result`（09-28 12:48），台账 `comment_posted=null` → reaper
+   按「未确认发出回评」补了兜底评论，与 issue 上已有的完整 blocked 回评自相矛盾。
+   根治分三层：①台账/归一化（已修，见 #1 复盘第 1 条）；②**跨渠道读回校验**——
+   reaper 在补兜底前先从目标渠道（GitHub comments）读回：派发之后出现过
+   `<!-- issue-pipeline -->` 标记评论（硬证据，**flow 全部出害口现在机械携带该标记**，
+   不再只靠最终回评的提示词自觉）或自己账号的非机器评论即认定已回评，跳过兜底；
+   渠道读不到时维持兜底（fail-safe）。③工作台派生视角修正：blocked 终态按
+   `comment_posted` 分叉——已回评 = blocked（依赖未就绪、唤醒监视中），未发出 =
+   needs-human。
+2. **引擎崩溃后 worktree 静默留脏**：#33（Goal 394）/ #51 两次实证。语义定为
+   **快照（snapshot）**：reaper 收尾 engine_error 时，若 `.worktrees/issue-N` 有
+   未提交改动，就地 `git add -A` + commit 到管线分支自身（`wip(issue-N): 管线异常
+   终止自动快照`）——半成品变成可 diff/可恢复/可继续的原子提交，不推送、不跑测试，
+   下轮 run 按既有提示词「侦察已有进展、就地修正」接着干；快照位置写进兜底回评与
+   日志。其余终态（partial/guarded/abort）**有意**保留脏 worktree 等人工接手，不变。
+3. **看板收尾补真**：reaper 原来只算 `status_for_board` 没用（死变量）、日志虚报
+   「看板→todo/review」。现在对支持状态机的 source（internal 看板）真实移动：
+   done/invalid/readonly/nochange 且已回评 → review；blocked/引擎异常/未回评 → todo
+   （依赖闭合自动唤醒或人工接手）。GitHub 仓不经此路径——工作台是从台账/metrics
+   派生的只读视图。
+
 ## v1.0.5（2026-09-28）：document 提示词 + 质量门转真
 
 - **`document` 段会张冠李戴**：#43 落地时发现它写的 CHANGELOG 条目描述的是 **#45** 的改动

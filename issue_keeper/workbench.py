@@ -6,8 +6,9 @@
           ③state.json（blocked/in_flight 簿记）+ run.lock 存活检测
 阶段推导（先命中先算）：
   doing       在途 run（lock 活着）
-  needs-human onhold/guarded/partial/abort/engine_error/rejected、安全过滤拦截
-  blocked     依赖未就绪（wakeup 监视中）
+  needs-human onhold/guarded/partial/abort/engine_error/rejected、安全过滤拦截、
+              blocked 终态但未确认发出回评（recursive#2：回评没出去就得有人看）
+  blocked     依赖未就绪（wakeup 监视中；已回评说明原因）
   settled     done（已落地）/ readonly/nochange/invalid（有结论无改动）
   queued      其余（新 issue 待派 / 无 run 记录）
 """
@@ -120,6 +121,7 @@ def _ledger_last_runs(days: int, ledger_path: pathlib.Path | None = None) -> dic
             out[key] = {
                 "execution_id": r.get("execution_id"),
                 "status": r.get("status"),
+                "comment_posted": r.get("comment_posted"),
                 "started": r.get("ts"),
                 "duration_secs": r.get("duration_secs"),
                 "gate_failed": r.get("gate_failed"),
@@ -140,6 +142,7 @@ def _metric_last_runs(days: int, metrics_dir: pathlib.Path | None) -> dict:
         out[key] = {
             "execution_id": rec.get("execution_id"),
             "status": rec.get("status"),
+            "comment_posted": rec.get("comment_posted"),
             "started": rec.get("started"),
             "duration_secs": rec.get("duration_secs"),
             "gate_failed": next((n.get("gate") for n in nodes
@@ -199,6 +202,14 @@ def build_workbench(bindings: list[dict], *, days: int = 45,
                 if rec is not None:
                     stage, reason = _STATUS_STAGE.get(rec.get("status") or "",
                                                       ("queued", ""))
+                    if rec.get("status") == "blocked":
+                        # blocked 语义分叉（recursive#2）：回评发出 = 等依赖（已回评
+                        # 说明原因）；没发出 = issue 上没有任何解释，必须有人看。
+                        # 历史 None（旧台账漏记）按已回评算，不夸大警报。
+                        if rec.get("comment_posted") is False:
+                            stage, reason = "needs-human", "blocked 终态但未确认发出回评"
+                        else:
+                            stage, reason = "blocked", "依赖未就绪（已回评说明，唤醒监视中）"
             rec = last_run.get((repo, res.number))
             card = {
                 "repo": repo,

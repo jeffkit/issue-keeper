@@ -18,6 +18,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from .config import Config, PipelineRepoConfig, RepoBinding, load_config
@@ -1041,6 +1042,101 @@ def _gh_post_comment(kind: str, repo: str, number: int, body: str) -> None:
         raise RuntimeError(f"gh comment 失败: {(r.stderr or r.stdout or '')[-200:]}")
 
 
+@lru_cache(maxsize=1)
+def _gh_login() -> str:
+    """当前 gh 认证账号（跨渠道读回比对作者用）；失败返回空串。"""
+    import subprocess as _sp
+    try:
+        r = _sp.run(["gh", "api", "user", "--jq", ".login"],
+                    capture_output=True, text=True, timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _gh_created_epoch(created_at: str) -> float:
+    """GitHub ISO8601（Z 结尾 UTC）→ epoch 秒；解析失败返回 0（永不命中）。"""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(created_at.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _channel_reply_posted(repo: str, number: int, since_ts: float,
+                          bot_marker: str, kind: str = "issue") -> bool:
+    """跨渠道读回校验：目标渠道上派发之后是否真的出现过管线回评。
+
+    台账的 comment_posted 由 bridge 进程收尾时写——bridge 在「评论已发出」与
+    「台账落盘」之间崩溃，或旧版 bridge 根本没归一化该键（recursive #31/#32 的
+    comment_posted=null），reaper 就会把「已回评」误报成「未发出回评」。
+    写到哪、就从哪读回验证（recursive#2 建议）：
+
+    - 硬证据：派发后新出现的评论正文含管线标记 ``<!-- issue-pipeline -->``
+      （flow 全部出害口从 v1.0.15 起机械携带）；
+    - 兜底（覆盖无标记的历史回评）：派发后新出现、作者为 keeper 自己的账号、
+      且不是 keeper 自身机器评论（认领/兜底都带 bot_marker 或 [issue-pipeline]）。
+    """
+    import json as _json
+    import subprocess as _sp
+    try:
+        r = _sp.run(["gh", kind, "view", str(number), "-R", repo,
+                     "--json", "comments"],
+                    capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return False
+        comments = (_json.loads(r.stdout or "{}").get("comments") or [])
+    except Exception:
+        return False
+    me = _gh_login()
+    machinery = ("[issue-pipeline]", bot_marker)
+    for c in comments:
+        body = str(c.get("body") or "")
+        created = _gh_created_epoch(str(c.get("createdAt") or ""))
+        if created < since_ts - 5:
+            continue
+        if "<!-- issue-pipeline -->" in body:
+            return True
+        author = str((c.get("author") or {}).get("login") or "")
+        if me and author == me and not any(m in body for m in machinery):
+            return True
+    return False
+
+
+def _snapshot_worktree_wip(worktree_dir: Path, label: str) -> str:
+    """引擎异常终止后，把 worktree 里的未提交改动快照成本地 wip 提交。
+
+    recursive #33/#51 实证：引擎半路崩溃时 implement 的改动以脏工作区形式留在
+    `.worktrees/issue-N`——无 journal、无提交，下次 run 复用就是踩半成品。
+    这里在收尸时把脏改动 commit 到管线分支自身（分支本就是管线私有产物），
+    让半成品变成可 diff、可恢复、可继续的原子快照；不推送、不跑测试。
+    返回给人看的快照结论（空串 = 没有脏改动/目录不存在，无需说明）。
+    """
+    import subprocess as _sp
+    if not worktree_dir.is_dir():
+        return ""
+    def _git(args: list[str], t: int = 60) -> subprocess.CompletedProcess:
+        return _sp.run(["git", "-C", str(worktree_dir), *args],
+                       capture_output=True, text=True, timeout=t)
+    try:
+        dirty = _git(["status", "--porcelain"]).stdout or ""
+        if not dirty.strip():
+            return ""
+        n_files = len([ln for ln in dirty.splitlines() if ln.strip()])
+        _git(["add", "-A"])
+        msg = (f"wip({label}): 管线异常终止自动快照（未验证、未推送；keeper 收尸兜底）")
+        # --no-verify：这是 keeper 的保全性快照不是正式变更，不被仓库 commit 钩子拦/改
+        r = _git(["commit", "--no-verify", "-m", msg])
+        if r.returncode != 0:
+            return (f"worktree 仍有 {n_files} 个文件的未提交改动，自动快照失败："
+                    f"{(r.stderr or '').strip()[-160:]}")
+        branch = (_git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout or "").strip()
+        sha = (_git(["rev-parse", "--short", "HEAD"]).stdout or "").strip()
+        return f"worktree 未提交改动（{n_files} 个文件）已快照为本地提交 {branch}@{sha}（未推送）"
+    except Exception as e:
+        return f"worktree 快照检查失败：{str(e)[:160]}"
+
+
 def _latest_pipeline_record(repo_full: str, number: int, since_ts: float) -> dict | None:
     """读台账里该 issue 最晚的一条记录（dispatch 之后写的才算）。"""
     import json
@@ -1287,8 +1383,26 @@ def _reap_pipelines(config, state, bindings) -> int:
             if timed_out and not err:
                 err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
 
+            # ── 跨渠道读回校验（recursive#2）：台账说没回评，先去目标渠道核实——
+            # bridge 在「评论已发出」与「台账落盘」之间崩溃、或旧版台账键漏记
+            # （#31/#32 的 comment_posted=null），不能把已回评误报成未发出。
+            number = int(key.split(":")[-1])
+            kind = "pr" if key.startswith("pr:") else "issue"
+            if not posted and _channel_reply_posted(
+                    binding.repo, number, since, config.bot_marker, kind):
+                posted = True
+                log.info("[%s] 台账漏记回评，渠道读回确认已发出（status=%s）", label, status)
+
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
+            wip_note = ""
+            if status == "engine_error" and not key.startswith("pr:") and binding.cwd:
+                # 引擎异常终止：worktree 可能留着无 journal 的半成品（#33/#51 实证），
+                # 就地快照成 wip 提交防丢，兜底回评里告知位置。
+                wip_note = _snapshot_worktree_wip(
+                    Path(binding.cwd) / ".worktrees" / f"issue-{number}", f"issue-{number}")
+                if wip_note:
+                    log.warning("[%s] %s", label, wip_note)
             if not posted:
                 if status == "engine_error":
                     reason = "管线引擎异常终止（未发出回评）"
@@ -1297,17 +1411,17 @@ def _reap_pipelines(config, state, bindings) -> int:
                 reason += f"（status={status}）"
                 if err:
                     reason += f"：{err[:140]}"
+                if wip_note:
+                    reason += f"；{wip_note}"
                 try:
-                    kind = "pr" if key.startswith("pr:") else "issue"
                     _gh_post_comment(
-                        kind, binding.repo, int(key.split(":")[-1]),
+                        kind, binding.repo, number,
                         f"{config.bot_marker}\n[issue-pipeline] {reason}，请人工查看。")
                 except Exception as e:
                     log.error("[%s] 兜底回评失败: %s", label, e)
             it.processed = True
             it.in_flight_since = None
             finalized += 1
-            status_for_board = status
             if status == "blocked" and not key.startswith("pr:"):
                 body = ""
                 try:
@@ -1318,11 +1432,33 @@ def _reap_pipelines(config, state, bindings) -> int:
                 if deps:
                     it.wakeup_deps = deps
                     log.info("[%s] blocked，监视依赖 %s 就绪后唤醒", label, deps)
-            if status in ("partial", "guarded", "onhold", "abort", "engine_error"):
-                log.info("[%s] pipeline 完成: status=%s（已收尾，看板→todo）", label, status)
-            else:
-                log.info("[%s] pipeline 完成: status=%s（已收尾，看板→review）", label, status)
+            _move_board_after_reap(binding, status, posted, kind, number, label)
+            log.info("[%s] pipeline 完成: status=%s posted=%s（已收尾）", label, status, posted)
     return finalized
+
+
+def _move_board_after_reap(binding: RepoBinding, status: str, posted: bool,
+                           kind: str, number: int, label: str) -> None:
+    """收尸后的看板收尾（recursive#2：原 status_for_board 算完没用、日志虚报「看板→todo」）。
+
+    仅对支持状态机的 source（internal 看板）生效；GitHub 是 issue 唯一权威，
+    其工作台阶段由 workbench 从台账/metrics 派生，不经这里。
+    映射：回评已发出且非 blocked → review（issue 上有说明，等人确认）；blocked →
+    todo（依赖闭合后自动唤醒重派）；未回评（引擎异常/护栏等）→ todo（兜底回评已
+    指到人工）。
+    """
+    to_status = "review" if (posted and status != "blocked") else "todo"
+    try:
+        src = _ensure_source(binding, {})
+        if not _supports_status(src):
+            return
+        res = Resource(kind=kind, number=number, title="", body="", state="open",
+                       labels=[], author="", created_at="", updated_at="",
+                       status="", actor_type="agent")
+        _safe_move(src, binding, res, to_status, actor="issue-keeper-agent",
+                   actor_type="agent", comment=f"pipeline 收尾 status={status}")
+    except Exception as e:
+        log.warning("[%s] 看板收尾失败: %s", label, e)
 
 
 

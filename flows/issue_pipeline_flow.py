@@ -36,6 +36,9 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
     是 no-op，从本地 HEAD 切分支会把未推送提交夹带进管线分支）
   - push_mode=main 时 ff 合并 origin/<branch>（不是 origin/<base_branch>——合并错了对象 base 不含修复）
   - 成功回评尾部由管线追加核验行（分支/推送/合并事实），落地判定不信 agent 自由文本
+  - 全部出害口（含 blocked/invalid/abort/partial 等早退回评）正文首行带机器可读标记
+    `<!-- issue-pipeline -->`——keeper 收尸时据此跨渠道读回校验「回评是否真的发出」
+    （recursive#2：台账 comment_posted 漏记 → 误报「未发出回评」的根治）
   - triage 前置依赖预检（正文 #N 引用 → gh 查状态注入）；依赖未合入 base → 硬判据
     blocked，明令禁止就地实现依赖
   - code 节点显式 sandbox_backend="subprocess"（本机可信部署；多租户必须另行收窄，见 README）
@@ -58,7 +61,8 @@ def issue_pipeline(INPUT):
         post_reject = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=F.concat('该 issue 未通过自动安全初筛（screener_verdict=', INPUT.screener_verdict, '），已停止自动处理，请人工查看。'),
+            text=F.concat('<!-- issue-pipeline -->\n该 issue 未通过自动安全初筛（screener_verdict=',
+                          INPUT.screener_verdict, '），已停止自动处理，请人工查看。'),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "rejected", "posted": post_reject.posted}
@@ -160,7 +164,7 @@ def issue_pipeline(INPUT):
         post_blocked = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_blocked.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_blocked.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "blocked", "posted": post_blocked.posted}
@@ -180,7 +184,7 @@ def issue_pipeline(INPUT):
         post_invalid = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_invalid.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_invalid.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "invalid", "posted": post_invalid.posted}
@@ -238,7 +242,7 @@ def issue_pipeline(INPUT):
         post_setup_fail = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_setup_fail.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_setup_fail.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "partial", "posted": post_setup_fail.posted}
@@ -283,7 +287,7 @@ def issue_pipeline(INPUT):
         post_ro = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_ro.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_ro.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "readonly", "posted": post_ro.posted}
@@ -323,7 +327,7 @@ def issue_pipeline(INPUT):
             post_hold = GITHUB_COMMENT(
                 repo=INPUT.repo_full,
                 issue_number=INPUT.issue_number,
-                text=reply_hold.text,
+                text=F.concat('<!-- issue-pipeline -->\n', reply_hold.text),
                 artifact_dir=INPUT.artifact_dir,
             )
             return {"status": "onhold", "posted": post_hold.posted}
@@ -385,7 +389,7 @@ def issue_pipeline(INPUT):
         post_nochange = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_nochange.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_nochange.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "nochange", "posted": post_nochange.posted}
@@ -435,7 +439,7 @@ def issue_pipeline(INPUT):
         post_abort = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_abort.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_abort.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "abort", "posted": post_abort.posted}
@@ -539,7 +543,7 @@ def issue_pipeline(INPUT):
             post_partial = GITHUB_COMMENT(
                 repo=INPUT.repo_full,
                 issue_number=INPUT.issue_number,
-                text=reply_partial.text,
+                text=F.concat('<!-- issue-pipeline -->\n', reply_partial.text),
                 artifact_dir=INPUT.artifact_dir,
             )
             return {"status": "partial", "posted": post_partial.posted}
@@ -582,7 +586,7 @@ def issue_pipeline(INPUT):
         post_guard = GITHUB_COMMENT(
             repo=INPUT.repo_full,
             issue_number=INPUT.issue_number,
-            text=reply_guard.text,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_guard.text),
             artifact_dir=INPUT.artifact_dir,
         )
         return {"status": "guarded", "posted": post_guard.posted}

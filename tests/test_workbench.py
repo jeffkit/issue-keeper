@@ -35,7 +35,7 @@ class _FakeGH:
 
 
 def _seed_metrics(tmp: Path, eid: str, repo: str, issue: int, status: str,
-                  gate: str | None = None) -> None:
+                  gate: str | None = None, comment_posted: bool | None = None) -> None:
     d = tmp / time.strftime("%Y-%m")
     d.mkdir(parents=True, exist_ok=True)
     nodes = []
@@ -45,6 +45,7 @@ def _seed_metrics(tmp: Path, eid: str, repo: str, issue: int, status: str,
     (d / f"{eid}.json").write_text(json.dumps({
         "schema": 1, "execution_id": eid, "repo": repo, "issue": issue,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "status": status,
+        "comment_posted": comment_posted,
         "ok": status == "done", "duration_secs": 60.0, "flow_version": "2.0.0",
         "nodes": nodes}), encoding="utf-8")
 
@@ -89,6 +90,29 @@ def test_stage_derivation_matrix(tmp_path):
     assert partial["reason"] == "全量测试两轮未过"
     assert partial["last_run"]["gate_failed"] == "test"
     assert partial["url"].endswith("/issues/2")
+
+
+def test_blocked_stage_splits_on_comment_posted(tmp_path):
+    """recursive#2：blocked 语义分叉——回评已发出 = 等依赖（blocked）；
+    未发出 = issue 上没解释，必须有人看（needs-human）；历史 None 按已回评算。"""
+    md = tmp_path / "metrics"
+    _seed_metrics(md, "r-b1", "jeffkit/a", 1, "blocked", comment_posted=True)
+    _seed_metrics(md, "r-b2", "jeffkit/a", 2, "blocked", comment_posted=False)
+    _seed_metrics(md, "r-b3", "jeffkit/a", 3, "blocked")   # 旧台账/旧 metrics 无此键
+
+    issues = [_res("jeffkit/a", i) for i in (1, 2, 3)]
+    out = wb.build_workbench(
+        [{"name": "jeffkit/a", "source": "github_cli"}],
+        metrics_dir=md, state_path=tmp_path / "absent.json",
+        lock_root=tmp_path / "pipeline",
+        gh_fetcher=lambda: _FakeGH(issues))
+
+    by_issue = {c["issue"]: (c["stage"], c["reason"])
+                for c in out["groups"]["blocked"] + out["groups"]["needs-human"]}
+    assert by_issue[1][0] == "blocked"
+    assert by_issue[2][0] == "needs-human"
+    assert "未确认发出回评" in by_issue[2][1]
+    assert by_issue[3][0] == "blocked"
 
 
 def test_in_flight_beats_terminal_status(tmp_path):
