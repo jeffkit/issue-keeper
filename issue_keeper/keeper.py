@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -1207,6 +1209,29 @@ def _gate_runner_invocation(config: Config, pc: PipelineRepoConfig, artifact_dir
 
 
 
+_DEP_RE = re.compile(r"depends-on[:：]\s*#(\d+)", re.IGNORECASE)
+
+
+def _parse_depends_on(body: str) -> list[int]:
+    """解析正文依赖声明 `depends-on: #N`（大小写不敏感；可声明多个，去重升序）。"""
+    return sorted({int(m) for m in _DEP_RE.findall(body or "")})
+
+
+def _dep_settled(config, repo_full: str, num: int) -> bool:
+    """依赖 #N 是否已终态：state 里该 item 存在且 processed=True（管线已收尾）。
+
+    依赖项尚未进过管线（未 screen/未派发）= 未就绪。依赖 run 以失败收尾也算
+    settled（v1 语义：失败由人看，不级联阻塞）——严格失败阻断留待有真实需求再加。
+    """
+    try:
+        st = json.loads(Path(config.state_file).expanduser().read_text())
+    except Exception:
+        return False
+    it = (st.get("repos", {}).get(repo_full.replace("/", "-"), {})
+            .get("items", {}).get(str(num)))
+    return bool(it and it.get("processed"))
+
+
 def _dispatch_pipeline(config, binding, res, it, label: str,
                        pc: PipelineRepoConfig | None = None) -> dict:
     """后台派发一次管线 run（bridge），立即返回；完成由 _reap_pipelines 收尾。
@@ -1238,11 +1263,19 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
     artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{res.number}").expanduser()
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
-    # 互斥检查必须在写 00-issue.md 之前——在跑的 run 正用着这份产物。
-    global_holder = _global_pipeline_in_flight(artifact_dir)
-    if global_holder is not None:
-        log.warning("[%s] 已有另一个 pipeline run 在跑 (pid=%s)，本轮不派发", label, global_holder)
-        return {"status": ALREADY_RUNNING, "comment_posted": True}
+    # 并发闸（2026-09-30 重构）：二值全局锁此前把并发压成事实串行（12 连发
+    # issue 只消化得动 1 条），已移除——并发上限由调用方的计数闸
+    # （pipeline_max_in_flight，state 口径）统一管。同 issue 互斥保留二值锁
+    # （同一 issue 的产物目录不能两 run 共用）。
+    # 依赖声明：正文 `depends-on: #N`（可多行/逗号多个）——依赖项未走到终态
+    # （processed）则本轮 hold，不消费首次响应，下一轮重查。
+    deps = _parse_depends_on(res.body or "")
+    if deps:
+        waiting = [d for d in deps if not _dep_settled(config, binding.repo, d)]
+        if waiting:
+            log.info("[%s] 依赖未就绪 %s，本轮 hold（depends-on: %s）",
+                     label, waiting, deps)
+            return {"status": ALREADY_RUNNING, "comment_posted": True}
     holder = _pipeline_in_flight(artifact_dir)
     if holder is not None:
         log.warning("[%s] 同 issue 已有 pipeline run 在跑 (pid=%s)，跳过本轮派发", label, holder)

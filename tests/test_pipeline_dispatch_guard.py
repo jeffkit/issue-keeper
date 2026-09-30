@@ -163,11 +163,17 @@ def test_dispatch_skipped_while_same_issue_in_flight(tmp_path, monkeypatch):
     assert it.in_flight_since is None
 
 
-def test_dispatch_deferred_when_global_slot_taken(tmp_path, monkeypatch):
-    """别的 issue 在跑 → 本轮不派发，也不动产物。"""
+def test_dispatch_proceeds_despite_global_lock(tmp_path, monkeypatch):
+    """2026-09-30 并发重构：二值全局锁已移除（曾把并发压成事实串行）——
+    全局锁文件存在不再阻止派发，并发上限由调用方计数闸
+    （pipeline_max_in_flight，见 process_repo）统一管。"""
     monkeypatch.setenv("HOME", str(tmp_path))
     bridge = tmp_path / "bridge.py"
-    bridge.write_text("raise SystemExit(1)\n", encoding="utf-8")
+    bridge.write_text(
+        "import json, shutil, sys\n"
+        "shutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
     root = tmp_path / ".issue-keeper" / "pipeline"
     root.mkdir(parents=True)
     (root / ".pipeline.lock").write_text(str(os.getpid()), encoding="utf-8")
@@ -177,8 +183,42 @@ def test_dispatch_deferred_when_global_slot_taken(tmp_path, monkeypatch):
         _res(number=7), ItemState(), "a/b issue#7",
     )
 
+    assert out.get("status") != ALREADY_RUNNING
+    assert (root / "b-7" / "dispatch.json").exists()
+
+
+def test_dispatch_holds_on_unsatisfied_dependency(tmp_path, monkeypatch):
+    """正文 `depends-on: #8` 且 #8 未收尾 → hold（不派发不消费）；依赖收尾后放行。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".issue-keeper").mkdir(parents=True)
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, shutil, sys\n"
+        "shutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
+    state_file = tmp_path / ".issue-keeper" / "state.json"
+
+    def _state(processed: bool):
+        state_file.write_text(json.dumps(
+            {"repos": {"a-b": {"items": {"8": {"processed": processed}}}}}),
+            encoding="utf-8")
+
+    _state(False)
+    out = _dispatch_pipeline(
+        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
+        _res(number=9, body="实现 B，depends-on: #8"), ItemState(), "a/b issue#9",
+    )
     assert out == {"status": ALREADY_RUNNING, "comment_posted": True}
-    assert not (root / "b-7" / "00-issue.md").exists()
+    assert not (tmp_path / ".issue-keeper" / "pipeline" / "b-9" / "dispatch.json").exists()
+
+    _state(True)
+    out2 = _dispatch_pipeline(
+        _pipeline_cfg(bridge), RepoBinding(repo="a/b", profile="p"),
+        _res(number=9, body="实现 B，depends-on: #8"), ItemState(), "a/b issue#9",
+    )
+    assert out2.get("status") != ALREADY_RUNNING
+    assert (tmp_path / ".issue-keeper" / "pipeline" / "b-9" / "dispatch.json").exists()
 
 
 def test_dispatch_is_detached_and_writes_payload(tmp_path, monkeypatch):
