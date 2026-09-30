@@ -12,11 +12,14 @@
 
 spec 格式（{"base": "main", "gates": [...]}，base 可省略默认 main）：
     {"gates": [
-      {"name": "fmt", "command": "cargo fmt --all --check", "timeout_secs": 300},
+      {"name": "fmt", "command": "cargo fmt --all --check", "timeout_secs": 300,
+       "autofix": "cargo fmt --all"},
       {"name": "tui-mutants",
        "command": "bash .dev/scripts/tui-mutants.sh", "timeout_secs": 3600,
        "paths": ["crates/recursive-tui/**"]}
     ]}
+autofix（可选）：门失败时先跑该命令再重检一次，通过则记 PASS（autofix 后重检
+通过）；autofix 自身失败则保留原失败并附 autofix 输出。只配机械可修的门。
 
 判定「本次改动」：未提交改动（diff HEAD + untracked）∪ 分支已提交（diff
 origin/<base>...HEAD）——门跑在未提交工作区上，路径条件必须两边都看。
@@ -153,8 +156,24 @@ def main() -> int:
             continue
         print(f"== {name} ==")
         status, detail = run_gate(gate, cwd)
+        # 确定性自愈（2026-09-30 #70）：fmt 这类机械可修的门失败时，先跑 autofix
+        # 再重检一次——别把 fix-loop 的 LLM 预算烧在 `cargo fmt` 能解决的事情上。
+        # 只给 fmt 配；clippy/test 等语义门不配，仍走 fix-loop。
+        fixed_note = ""
+        autofix = str(gate.get("autofix") or "").strip()
+        if status != "ok" and autofix:
+            print(f"AUTO-FIX {name}: {autofix}")
+            fx_status, fx_detail = run_gate(
+                {"name": f"{name}:autofix", "command": autofix,
+                 "timeout_secs": max(30, int(gate.get("autofix_timeout_secs", 600)))},
+                cwd)
+            if fx_status == "ok":
+                fixed_note = "（autofix 后重检通过）"
+                status, detail = run_gate(gate, cwd)
+            else:
+                detail = f"autofix 自身失败:\n{fx_detail}\n--- 原门失败 ---\n{detail}"
         if status == "ok":
-            print(f"PASS {name}")
+            print(f"PASS {name}{fixed_note}")
         else:
             failures += 1
             print(f"FAIL {name} ({status})")

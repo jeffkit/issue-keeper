@@ -60,6 +60,9 @@ class GateSpec:
     command: str
     timeout_secs: int = 900
     paths: list = field(default_factory=list)
+    # 确定性自愈命令（可选）：门失败时先跑它再重检一次。只配机械可修的门
+    # （fmt → `cargo fmt --all`）；语义门（clippy/test）别配，交给 fix-loop。
+    autofix: str = ""
 
 
 @dataclass
@@ -281,6 +284,7 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
                 command=str(g["command"]),
                 timeout_secs=max(30, int(g.get("timeout_secs", 900))),
                 paths=[str(p) for p in (g.get("paths") or []) if str(p).strip()],
+                autofix=str(g.get("autofix") or "").strip(),
             ))
 
         timeout_overrides = {str(k): max(60, int(v))

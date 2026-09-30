@@ -1229,7 +1229,8 @@ def _gate_runner_invocation(config: Config, pc: PipelineRepoConfig, artifact_dir
     spec = {
         "base": pc.base_branch,
         "gates": [{"name": g.name, "command": g.command,
-                   "timeout_secs": g.timeout_secs, "paths": g.paths}
+                   "timeout_secs": g.timeout_secs, "paths": g.paths,
+                   "autofix": g.autofix}
                   for g in pc.gates],
     }
     spec_file = artifact_dir / "gates.json"

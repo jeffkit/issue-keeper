@@ -132,3 +132,37 @@ def test_repo_local_discovery(repo, tmp_path):
         [sys.executable, str(RUNNER), "--cwd", str(repo)],
         capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and "PASS local" in r.stdout
+
+
+def test_autofix_recovers_mechanical_gate(repo, tmp_path):
+    """autofix：门失败→跑确定性修复→重检通过（#70 fmt 教训：别烧 fix-loop 预算）。"""
+    spec = _spec(tmp_path, [{"name": "marker",
+                             "command": "test -f done.marker",
+                             "autofix": "touch done.marker"}])
+    r = _run(spec, repo)
+    assert r.returncode == 0
+    assert "AUTO-FIX marker" in r.stdout
+    assert "PASS marker" in r.stdout and "autofix 后重检通过" in r.stdout
+
+
+def test_autofix_useless_keeps_gate_failed(repo, tmp_path):
+    """autofix 自身失败 → 保留原失败（附 autofix 输出），不重检、退出码非零。"""
+    spec = _spec(tmp_path, [{"name": "hopeless",
+                             "command": "echo ran >> runs.log; exit 7",
+                             "autofix": "echo nope >&2; exit 3"}])
+    r = _run(spec, repo)
+    assert r.returncode == 1
+    assert "FAIL hopeless" in r.stdout
+    assert "autofix 自身失败" in r.stdout and "原门失败" in r.stdout
+    assert (repo / "runs.log").read_text().count("ran") == 1  # autofix 失败：原门只跑一次
+
+
+def test_autofix_ok_but_gate_still_fails(repo, tmp_path):
+    """autofix 成功但门仍不过 → 恰好重检一次后按原样失败（不死循环）。"""
+    spec = _spec(tmp_path, [{"name": "hopeless",
+                             "command": "echo ran >> runs.log; exit 7",
+                             "autofix": "true"}])
+    r = _run(spec, repo)
+    assert r.returncode == 1
+    assert "FAIL hopeless" in r.stdout
+    assert (repo / "runs.log").read_text().count("ran") == 2  # 恰好重检一次，不死循环
