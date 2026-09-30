@@ -26,16 +26,24 @@ from pathlib import Path
 from .config import Config, PipelineRepoConfig, RepoBinding, load_config
 from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
 from .reply import polish
-from .screener import ScreenerConfig, screen as screen_text
+from .screener import ScreenerConfig, Verdict, screen as screen_text
 from .sources import IssueSource, Resource, make_source
 from .state import State, load_state, save_state
 
 log = logging.getLogger("issue-keeper")
 
 _UNSAFE_COMMENT_BODY = (
-    "⚠️ 这条内容触发了 issue-keeper 的安全过滤（疑似指令注入或越权诱导），"
-    "已跳过自动处理。维护者可人工查看。"
+    "⚠️ 这条内容触发了 issue-keeper 的前置安全过滤，本轮跳过自动处理。"
+    "判定详情：{reason}维护者可人工查看；确认误拦可清状态重新入队。"
 )
+
+
+def _public_reason(reason: str) -> str:
+    """拦截原因会发到公开 issue 上：压成一行、截断，避免内部长报错刷屏。"""
+    text = " ".join(str(reason or "").split())
+    if not text:
+        return "疑似指令注入或越权诱导（screener 未给出原因）"
+    return text[:200] + ("…" if len(text) > 200 else "")
 
 # 给 agent 的系统提示，告诉它角色和能力。不提 stdout / 协议细节。
 _AGENT_PREAMBLE = (
@@ -186,11 +194,15 @@ def _publish_reply(
 
 def _post_unsafe_notice(
     source: IssueSource, binding: RepoBinding, res: Resource,
-    bot_marker: str, visible_prefix: str,
+    bot_marker: str, visible_prefix: str, reason: str = "",
 ) -> None:
-    body = f"{bot_marker}\n{visible_prefix}\n{_UNSAFE_COMMENT_BODY}"
+    body = (
+        f"{bot_marker}\n{visible_prefix}\n"
+        f"{_UNSAFE_COMMENT_BODY.format(reason=_public_reason(reason))}"
+    )
     source.post_comment(binding.repo, res, body)
-    log.info("[%s %s#%d] 已发表安全过滤提示评论", binding.repo, res.kind, res.number)
+    log.info("[%s %s#%d] 已发表安全过滤提示评论（reason=%s）",
+             binding.repo, res.kind, res.number, _public_reason(reason))
 
 
 def _ensure_profile(binding: RepoBinding, cache: dict[str, ProfileEntry]) -> ProfileEntry:
@@ -202,17 +214,17 @@ def _ensure_profile(binding: RepoBinding, cache: dict[str, ProfileEntry]) -> Pro
 
 def _screen_or_block(
     message: str, cfg: ScreenerConfig, source_label: str
-) -> bool:
-    """返回 True 表示通过安全过滤，可以投递给 agent。"""
+) -> Verdict:
+    """返回 Verdict；.safe 为 True 表示通过安全过滤，可以投递给 agent。"""
     verdict = screen_text(message, cfg, source_label=source_label)
     if verdict.safe:
         log.debug("[%s] screener 通过: %s", source_label, verdict.reason)
-        return True
+        return verdict
     log.warning(
         "[%s] screener 拦截: reason=%s raw=%r",
         source_label, verdict.reason, verdict.raw[:200],
     )
-    return False
+    return verdict
 
 
 def _extract_issue_refs(text: str) -> list[int]:
@@ -442,11 +454,14 @@ def _process_resource(
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
 
-            if screener.enabled and not _screen_or_block(message, screener, source):
-                it.blocked = True
-                if screener.on_unsafe == "comment":
-                    _post_unsafe_notice(src, binding, res, config.bot_marker, visible_prefix)
-                return 0
+            if screener.enabled:
+                verdict = _screen_or_block(message, screener, source)
+                if not verdict.safe:
+                    it.blocked = True
+                    if screener.on_unsafe == "comment":
+                        _post_unsafe_notice(src, binding, res, config.bot_marker,
+                                            visible_prefix, reason=verdict.reason)
+                    return 0
 
             # 调 agent 前推到 doing
             _safe_move(src, binding, res, "doing", actor=_agent_label(binding, config),
@@ -524,11 +539,14 @@ def _process_resource(
         message = _compose_comment_message(binding, res, c, src, _agent_label(binding, config), config)
         source = f"{label} comment {c.id}"
 
-        if screener.enabled and not _screen_or_block(message, screener, source):
-            it.processed_comment_ids.add(c.id)
-            if screener.on_unsafe == "comment":
-                _post_unsafe_notice(src, binding, res, config.bot_marker, visible_prefix)
-            continue
+        if screener.enabled:
+            verdict = _screen_or_block(message, screener, source)
+            if not verdict.safe:
+                it.processed_comment_ids.add(c.id)
+                if screener.on_unsafe == "comment":
+                    _post_unsafe_notice(src, binding, res, config.bot_marker,
+                                        visible_prefix, reason=verdict.reason)
+                continue
 
         # 如果 issue 在 done/closed 状态收到新评论，推回 doing 重新处理
         if res.status in ("done", "closed") and _supports_status(src):
@@ -802,7 +820,8 @@ def keeper_patrol(
             keeper_binding, config, target_binding, res, comments, keeper_label,
         )
         source = f"[patrol] {label}"
-        if config.screener.enabled and not _screen_or_block(message, config.screener, source):
+        if config.screener.enabled and not _screen_or_block(
+                message, config.screener, source).safe:
             log.warning("[patrol] [%s] 被安全过滤跳过", label)
             # 仍推进快照，避免下轮反复筛
             state.mark_patrolled(key, res.updated_at, None)
