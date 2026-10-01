@@ -162,6 +162,31 @@ P0 审计项：迁移后抽检 checkpoint 内容确认无 key。
 | P3 演练 | kill -9 worker / 磁盘打满 / LLM 端点断三类注入 | **无孤儿竞态的干净续跑**成功率 ≥80% | 0.5 天 |
 | P4 收尾 | 默认档切 v2-console；v2 bridge 降级为 goal 组装器；文档 | 批次无回归 | 0.5 天 |
 
+## 5.5 P0 验收结果（2026-10-01 实测，判定：**不达标——先修 worker 再进 P1**）
+
+环境事实（好消息）：worker 已配 `PLAITA_NODE_MODULES=plaita_nodes`（editable 安装可导入）、
+plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.plaita/providers.json`
+（worker 无需 GLM_API_KEY 环境变量，G2 的 env 形态比预想更简单）。
+
+**e2e PASS**：重启 worker（旧进程 9/2 起未消费、队列积压 54 条自测噪音已清）后，
+`p0-agentrun-min` 全链跑通——recursive CLI → GLM-5.3-flash → "PONG"，usage 完整落
+`$NODE.agent`。附带实证：`session_id: ""`（L2 缺口实锤）。
+
+**四路径清场 FAIL（3/4 路径实测，第 4 条同构推定）**：
+
+| 路径 | 结果 | 证据 |
+|---|---|---|
+| A. cancel | **不可达** | running execution **未注册进 DB**（`/api/executions` total=43 无此行、`?status=running` 为 0），cancel 无从发起——与 09-28 旧结论「首节点期间 state 未落库」吻合，且是可见性层失败（先于进程清场） |
+| B. SIGTERM | **孤儿** | worker 日志走完优雅退出（心跳停/注销/已停止）但进程滞留 SN 态，recursive+sleep 全部存活 |
+| C. SIGKILL | **孤儿** | worker 立死，agent 进程树无人回收（`start_new_session` 脱离进程组），手工清场 |
+| D. OOM | 同 C（同构推定） | — |
+
+**P1 前置修复清单（worker/引擎侧，即 G3 的落地）**：
+1. execution 启动即写 DB（修可见性，cancel 的前提）；
+2. AGENTRUN 节点内进程组追踪 + runner 取消路径 killpg（先例：e13d296 code 沙箱同款）；
+3. `worker.stop()` 优雅等待在途消息完成或限期后 killpg 清场（SIGTERM 路径）；
+4. （可选）节点启动前 worktree 存活检测/flock，防孤儿与新 run 并发写。
+
 ## 6. 风险与缓解
 
 | 风险 | 缓解 |
