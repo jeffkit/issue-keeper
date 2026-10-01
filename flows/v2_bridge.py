@@ -120,6 +120,12 @@ def main() -> None:
         _finish({"status": "done", "pushed": False, "merged": False,
                  "note": verdict.get("why") or "no changes"}, True,
                 started, payload, t0, {"run_id": run_id})
+    elif v == "retry-later":
+        # 环境性失败（磁盘守卫等）：keeper 不消费、自动重派（daily-limit 兜底）
+        _finish({"status": "retry-later", "pushed": False, "merged": False,
+                 "stage": verdict.get("stage"),
+                 "error": str(verdict.get("why") or "retry-later")[-500:]},
+                False, started, payload, t0, {"run_id": run_id})
     elif v == "failed-preserved":
         _finish({"status": "failed", "pushed": False, "merged": False,
                  "stage": verdict.get("stage"),

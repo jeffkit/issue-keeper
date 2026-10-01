@@ -1219,6 +1219,44 @@ def _pipeline_commit_note(worktree_dir: Path | None, base_branch: str) -> str:
         return ""
 
 
+
+
+def _append_pipeline_record(repo_full: str, number: int, record: dict) -> None:
+    """reaper 代记台账行（bridge 未写台账的崩溃路径，使连续 engine_error 计数可用）。"""
+    import json
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    with ledger.open("a", encoding="utf-8") as f:
+        f.write(json.dumps({"repo": repo_full, "issue": number,
+                            "ts": time.strftime("%Y-%m-%dT%H:%M:%S+0800"),
+                            **record}) + "\n")
+
+def _consecutive_engine_errors(repo_full: str, number: int) -> int:
+    """台账里该 issue 末尾连续 engine_error 的条数（engine_error 自动重试封顶用）。"""
+    import json
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    if not ledger.exists():
+        return 0
+    rows: list[str] = []
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number):
+                rows.append(str(rec.get("status") or ""))
+    except OSError:
+        return 0
+    n = 0
+    for s in reversed(rows):
+        if s == "engine_error":
+            n += 1
+        else:
+            break
+    return n
+
+
 def _latest_pipeline_record(repo_full: str, number: int, since_ts: float) -> dict | None:
     """读台账里该 issue 最晚的一条记录（dispatch 之后写的才算）。"""
     import json
@@ -1496,20 +1534,44 @@ def _reap_pipelines(config, state, bindings) -> int:
             status = rec.get("status") or "engine_error"
             posted = bool(rec.get("comment_posted"))
             err = str(rec.get("error") or "")
+            number = int(key.split(":")[-1])
+            kind = "pr" if key.startswith("pr:") else "issue"
             if holder is None and not rec:
                 status, err = "engine_error", "bridge 进程已退出且未写台账"
+                # 代记台账行：连续 engine_error 计数跨尝试可用（否则永不封顶）
+                _append_pipeline_record(binding.repo, number,
+                                        {"status": "engine_error", "error": err,
+                                         "comment_posted": False})
             if timed_out and not err:
                 err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
 
             # ── 跨渠道读回校验（recursive#2）：台账说没回评，先去目标渠道核实——
             # bridge 在「评论已发出」与「台账落盘」之间崩溃、或旧版台账键漏记
             # （#31/#32 的 comment_posted=null），不能把已回评误报成未发出。
-            number = int(key.split(":")[-1])
-            kind = "pr" if key.startswith("pr:") else "issue"
             if not posted and _channel_reply_posted(
                     binding.repo, number, since, config.bot_marker, kind):
                 posted = True
                 log.info("[%s] 台账漏记回评，渠道读回确认已发出（status=%s）", label, status)
+
+            # ── retry-later / engine_error 自动重试（2026-10-01）──────────
+            # 环境性失败（磁盘守卫）与引擎级崩溃不消费首响：清在途标记与锁，
+            # 下一轮自动重派。engine_error 连续 2 次才升级人工（防系统性崩溃
+            # 刷跑）；daily-limit 在派发路径兜底总量。兜底评论仅在升级时发。
+            if status == "retry-later":
+                lock.unlink(missing_ok=True)
+                it.in_flight_since = None
+                finalized += 1
+                log.info("[%s] pipeline retry-later（%s）——不消费，自动重派", label, err[:80])
+                continue
+            if status == "engine_error" and not posted and not timed_out:
+                n_err = _consecutive_engine_errors(binding.repo, number) + 1  # 含本次
+                if n_err < 2:
+                    lock.unlink(missing_ok=True)
+                    it.in_flight_since = None
+                    finalized += 1
+                    log.info("[%s] engine_error 自动重试（连续第 %d 次）：%s", label, n_err, err[:80])
+                    continue
+                log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
 
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
