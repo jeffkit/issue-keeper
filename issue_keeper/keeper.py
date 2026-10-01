@@ -1221,6 +1221,28 @@ def _pipeline_commit_note(worktree_dir: Path | None, base_branch: str) -> str:
 
 
 
+
+
+_ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07")
+
+
+def _sanitize_public_comment(text: str) -> str:
+    """对外评论的卫生化（2026-10-01）：兜底回评会把引擎 err/gate_ctx 原样带上，
+    其中含 ANSI 转义码（recursive CLI 的彩色日志）与本机绝对路径（HOME/仓库结构）
+    ——对公开仓的外部读者是噪音加泄露。剥 ANSI、HOME 打码为 ~、压空白。"""
+    if not text:
+        return ""
+    t = _ANSI_ESC_RE.sub("", text)
+    home = str(Path.home())
+    if home and home != "/":
+        t = t.replace(home, "~")
+    # 不依赖运行时 HOME：macOS 用户目录一律打码（/Users/<name>/… → ~/…）
+    t = re.sub(r"/Users/[^/\s]+/", "~/", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
 def _append_pipeline_record(repo_full: str, number: int, record: dict) -> None:
     """reaper 代记台账行（bridge 未写台账的崩溃路径，使连续 engine_error 计数可用）。"""
     import json
@@ -1628,7 +1650,7 @@ def _reap_pipelines(config, state, bindings) -> int:
                 try:
                     _gh_post_comment(
                         kind, binding.repo, number,
-                        f"{config.bot_marker}\n[issue-pipeline] {reason}，请人工查看。")
+                        f"{config.bot_marker}\n[issue-pipeline] {_sanitize_public_comment(reason)}，请人工查看。")
                 except Exception as e:
                     log.error("[%s] 兜底回评失败: %s", label, e)
             it.processed = True

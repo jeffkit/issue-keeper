@@ -62,7 +62,7 @@ def test_engine_error_reply_keeps_innermost_exception_tail(reap_env, tmp_path):
     assert len(posted) == 1
     body = posted[0]
     assert "No such file or directory" in body          # 最内层异常类型可见
-    assert "/Users/x/.cargo/bin/cargo" in body          # 文件名/路径不被切掉
+    assert "~/.cargo/bin/cargo" in body                 # 文件名不被切掉（用户段已卫生化打码，2026-10-01）
 
 
 def test_engine_error_reply_includes_gate_context(reap_env, tmp_path):
@@ -190,3 +190,21 @@ def test_engine_error_no_note_when_head_equals_base(tmp_path, monkeypatch):
     posted = _reap_with_worktree(tmp_path, monkeypatch, repo_dir, base_branch)
 
     assert "工作已提交到" not in posted[0]
+
+
+def test_fallback_comment_strips_ansi_and_home_paths(reap_env, tmp_path):
+    """兜底回评对外卫生化：ANSI 转义剥除、HOME 打码为 ~（jeffkit 2026-10-01）。"""
+    state, it, art, posted = reap_env
+    err = ("\x1b[2m2026-10-01T03:55:32Z\x1b[0m WARN agent.step: retrying "
+           "\x1b[3mattempt\x1b[0m=\x1b[0m1 status=429 step=1\n"
+           "Error: LLM error (GLM-5.2): HTTP 429 Too Many Requests "
+           "cmd=python3 /Users/kong/projects/infra4agent/issue-keeper/flows/gates/gate_runner.py")
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "engine_error", "comment_posted": False, "error": err})
+    _reap_pipelines(_pipeline_cfg(tmp_path / "b"), state, _bindings(repo="a/b"))
+    assert posted, "兜底回评应发出"
+    body = posted[0]
+    assert "\x1b" not in body, "ANSI 转义码不应出现在公开评论"
+    assert "/Users/kong" not in body, "本机绝对路径不应出现在公开评论"
+    assert "~" in body and "gate_runner.py" in body, "路径打码但保留语义"
+    assert "HTTP 429" in body, "错误语义保留"
