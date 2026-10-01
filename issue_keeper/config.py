@@ -220,6 +220,9 @@ class Config:
     # 5 轮全部超时/拦截。0 = 不限；到顶后本轮跳过、不消费首次响应（次日自动重试，
     # 人工处置后也可 reopen 立即重派）。
     pipeline_issue_daily_limit: int = 2
+    # 评论层异步 agent 的全局并发上限（2026-10-01 评论层后台化）：跨仓计数，
+    # 同 issue 内天然串行（同 issue 有在途任务则不再派发新评论）。
+    comment_max_in_flight: int = 3
     # 同时刻在跑的管线 run 上限（跨仓；worktree 天然隔离不同 issue）。
     # 2026-09-29 派发解耦后 keeper 不再被长 run 阻塞，这个池子才有意义。
     pipeline_max_in_flight: int = 2
@@ -566,6 +569,7 @@ def load_config(path: str | os.PathLike) -> Config:
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
+        comment_max_in_flight=max(1, int(raw.get("comment_max_in_flight", 3))),
         # 2026-09-30 修复：与 max_in_flight 同款死旋钮——yaml 无人读取，恒为
         # 默认 2，#67/#70（各 2 run）被误判日上限锁死（runtime yaml 实配 10）。
         pipeline_issue_daily_limit=max(1, int(raw.get("pipeline_issue_daily_limit", 3))),

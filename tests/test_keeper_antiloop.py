@@ -234,7 +234,7 @@ class TestOptOutLabels:
             item_calls.append(key)
             return types.SimpleNamespace(
                 in_flight_since=None, processed=False, blocked=False,
-                processed_comment_ids=set(), session_id="")
+                processed_comment_ids=set(), session_id="", comment_tasks={})
 
         cfg = Config(author_allowlist=list(allowlist), pipeline_mode=False,
                      opt_out_labels=["keeper-ignore"])

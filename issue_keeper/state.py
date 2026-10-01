@@ -29,6 +29,10 @@ class ItemState:
     # 管线 run 在途标记（2026-09-29 派发解耦）：dispatch 时写 epoch 秒，reaper
     # 收尾清回 None。非 None 期间该资源整体跳过（reaper 拥有它），避免重复派发。
     in_flight_since: float | None = None
+    # 评论层异步任务（2026-10-01 评论层后台化）：comment_id(str) →
+    # {"pid": int|None, "started_at": float, "attempts": int}。派发时写入、
+    # 收尸后清除；daemon 重启后按 pid 存活接管（防重复调起）。
+    comment_tasks: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -86,6 +90,7 @@ def load_state(path: Path) -> State:
             it.wakeup_deps = [int(x) for x in (idata.get("wakeup_deps") or [])]
             it.in_flight_since = (
                 float(idata["in_flight_since"]) if idata.get("in_flight_since") else None)
+            it.comment_tasks = dict(idata.get("comment_tasks") or {})
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
     return state
@@ -139,6 +144,7 @@ def _dump_state_dict(state: State) -> dict[str, Any]:
                     "blocked": it.blocked,
                     "wakeup_deps": it.wakeup_deps,
                     "in_flight_since": it.in_flight_since,
+                    "comment_tasks": it.comment_tasks,
                 }
                 for key, it in rs.items.items()
             }

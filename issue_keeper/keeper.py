@@ -24,7 +24,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from .config import Config, PipelineRepoConfig, RepoBinding, load_config
-from .profile import AgentReply, ProfileEntry, invoke_agent, load_profile
+from .profile import (
+    AgentReply, ProfileEntry, _build_command, _parse_reply, invoke_agent, load_profile,
+)
 from .reply import polish
 from .screener import ScreenerConfig, Verdict, screen as screen_text
 from .sources import IssueSource, Resource, make_source
@@ -381,7 +383,7 @@ def process_repo(
         for res in resources:
             handled += _process_resource(
                 src, binding, config, screener, entry, rs, res, me, timeout, visible_prefix,
-                pipeline_in_flight=_count_in_flight(state),
+                pipeline_in_flight=_count_in_flight(state), state=state,
             )
 
     return handled
@@ -399,6 +401,7 @@ def _process_resource(
     timeout: int,
     visible_prefix: str,
     pipeline_in_flight: int = 0,
+    state=None,
 ) -> int:
     """处理单个 issue/PR，返回本轮处理条目数。"""
     handled = 0
@@ -520,6 +523,14 @@ def _process_resource(
             _safe_move(src, binding, res, "review", actor=_agent_label(binding, config),
                        actor_type="agent", comment="处理完成，待 review")
 
+    # ── 1.5) 评论异步任务收尸（评论层后台化 2026-10-01）──────────────
+    # 在 blocked 检查之前：拉黑单的在途任务也要收尾发布，防 agent 白跑。
+    handled += _collect_comment_tasks(src, binding, config, entry, res, it, label,
+                                      timeout, visible_prefix)
+    # 同 issue 串行：仍有在途评论任务则本轮不派发新评论（下轮收尸后自然接续）
+    if it.comment_tasks:
+        return handled
+
     # 已被安全过滤拉黑：不再处理它的评论
     if it.blocked:
         return handled
@@ -559,29 +570,26 @@ def _process_resource(
             _safe_move(src, binding, res, "doing", actor=c.author,
                        actor_type="human", comment=f"收到新评论，重新打开")
 
+        # 全局并发上限（跨仓评论 agent；保护 GLM 配额——2026-10-01 配额爆量教训）
+        if _count_comment_tasks(state) >= max(1, config.comment_max_in_flight):
+            log.info("[%s] 评论 agent 并发已达上限 (%d)，本轮不派发新评论",
+                     label, config.comment_max_in_flight)
+            return handled
+
         log.info(
-            "[%s] 新评论 id=%s (by %s)，调用 agent (session=%s)",
+            "[%s] 新评论 id=%s (by %s)，异步派发 agent (session=%s)",
             label, c.id, c.author, it.session_id,
         )
-        try:
-            reply = invoke_agent(
-                entry, message, it.session_id or "",
-                from_user=config.agent_from_user,
-                default_timeout=timeout,
-            )
-        except Exception as e:
-            log.error("[%s] agent 处理评论 %s 失败: %s", label, c.id, e)
-            break
-        if reply.session_id:
-            it.session_id = reply.session_id
-        _publish_reply(src, binding, res, reply.text or "", config, visible_prefix)
-        it.processed_comment_ids.add(c.id)
+        base = f"{binding.repo_slug}-{res.number}"
+        pid = _spawn_comment_agent(entry, message, it, base, str(c.id),
+                                   config.agent_from_user, timeout)
+        if pid is None:
+            log.error("[%s] 评论 agent 派发失败 (comment=%s)，下轮重试", label, c.id)
+            return handled
+        it.comment_tasks[str(c.id)] = {"pid": pid, "started_at": time.time(),
+                                       "attempts": 1}
         handled += 1
-
-        # 评论回复完也推到 review（重新 review）
-        if _supports_status(src) and res.status not in ("review",):
-            _safe_move(src, binding, res, "review", actor=_agent_label(binding, config),
-                       actor_type="agent", comment="评论后重新 review")
+        # 收尸时发布回评并推 review（异步化：此处仅派发）
 
     return handled
 
@@ -1241,6 +1249,149 @@ def _sanitize_public_comment(text: str) -> str:
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{2,}", "\n", t)
     return t.strip()
+
+
+_COMMENT_PROC_DIR = Path("~/.issue-keeper/comments")
+# 活 daemon 持有的 Popen 句柄（key=(repo_slug, number)）：优先 poll() 判活，
+# daemon 重启后句柄丢失则退化为 os.kill(pid, 0)（分离进程被 launchd 收养，死即 ESRCH）。
+_COMMENT_PROCS: dict = {}
+
+
+def _comment_proc_alive(pid, popen) -> bool:
+    if popen is not None:
+        return popen.poll() is None
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+
+
+def _count_comment_tasks(state) -> int:
+    """全局在途评论任务数（跨仓；按任务记录计数——死任务由收尸清除）。"""
+    n = 0
+    for rs in state.repos.values():
+        for it in rs.items.values():
+            n += len(getattr(it, "comment_tasks", None) or {})
+    return n
+
+
+def _spawn_comment_agent(entry, message: str, it, base: str, cid: str,
+                         from_user: str, timeout: int) -> int | None:
+    """分离进程派发评论回复 agent（评论层后台化 2026-10-01）。
+
+    与 invoke_agent 同一命令构造（profile.py::_build_command），差异仅在：
+    Popen + start_new_session（不阻塞扫描循环）、stdout/stderr 落文件供收尸、
+    message 先落盘（重启接管与重试复用）。
+    """
+    import signal as _signal
+    import subprocess
+    d = _COMMENT_PROC_DIR.expanduser()
+    d.mkdir(parents=True, exist_ok=True)
+    out_f, err_f, msg_f = d / f"{base}.out", d / f"{base}.err", d / f"{base}.msg"
+    cmd = _build_command(entry, it.session_id or "",
+                         from_user=from_user, default_timeout=timeout)
+    msg_f.write_text(message, encoding="utf-8")
+    env = os.environ.copy()
+    env.update(entry.env)
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=open(out_f, "wb"),
+            stderr=open(err_f, "wb"), cwd=entry.cwd or None, env=env,
+            text=True, start_new_session=True)
+    except Exception as e:
+        log.error("[%s] 评论 agent 派发失败 (comment=%s): %s", base, cid, e)
+        return None
+    try:
+        proc.stdin.write(message)
+        proc.stdin.close()
+    except Exception as e:
+        log.error("[%s] 评论 agent stdin 写入失败 (comment=%s): %s", base, cid, e)
+        try:
+            os.killpg(proc.pid, _signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        return None
+    _COMMENT_PROCS[(base, str(cid))] = proc
+    return proc.pid
+
+
+def _collect_comment_tasks(src, binding, config, entry, res, it, label,
+                           timeout: int, visible_prefix: str) -> int:
+    """评论异步任务收尸（周期开头）：完成→消毒发布；超时→killpg；失败→重试≤1 次。
+
+    返回本轮收尸处理的条数。同 issue 串行由调用方保证（有在途任务则不派发新评论）。
+    """
+    import signal as _signal
+    base = f"{binding.repo_slug}-{res.number}"
+    if not it.comment_tasks:
+        return 0
+    handled = 0
+    for cid in list(it.comment_tasks.keys()):
+        task = it.comment_tasks.get(cid) or {}
+        pid, started = task.get("pid"), float(task.get("started_at") or 0)
+        attempts = int(task.get("attempts") or 1)
+        popen = _COMMENT_PROCS.pop((base, str(cid)), None)
+        alive = _comment_proc_alive(pid, popen)
+        timed_out = (time.time() - started) > timeout
+        if alive and not timed_out:
+            continue  # 仍在跑
+        if alive and timed_out:
+            try:
+                os.killpg(int(pid), _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            log.warning("[%s] 评论 agent 超时（%ss），进程组已清 (comment=%s)",
+                        label, timeout, cid)
+            alive = False
+            popen = None
+        if popen is not None:
+            try:
+                popen.wait(timeout=10)
+            except Exception:
+                pass
+        d = _COMMENT_PROC_DIR.expanduser()
+        out = ""
+        err = ""
+        try:
+            out = (d / f"{base}.out").read_text(encoding="utf-8", errors="replace")
+            err = (d / f"{base}.err").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+        reply = _parse_reply(out, err)
+        if reply.text and reply.text.strip():
+            if reply.session_id:
+                it.session_id = reply.session_id
+            _publish_reply(src, binding, res, reply.text, config, visible_prefix)
+            it.processed_comment_ids.add(str(cid))
+            del it.comment_tasks[cid]
+            handled += 1
+            # 评论回复完也推到 review（与原同步路径同语义）
+            if _supports_status(src) and res.status not in ("review",):
+                _safe_move(src, binding, res, "review", actor=_agent_label(binding, config),
+                           actor_type="agent", comment="评论后重新 review")
+            log.info("[%s] 评论 agent 完成 (comment=%s)，回评已发布", label, cid)
+            continue
+        # 失败：重试 ≤1 次（attempts 计数跨重试累加），到顶放弃并标记已处理
+        if attempts < 2:
+            pid2 = _spawn_comment_agent(entry, (d / f"{base}.msg").read_text(encoding="utf-8")
+                                        if (d / f"{base}.msg").exists() else "",
+                                        it, base, cid, config.agent_from_user, timeout)
+            if pid2 is not None:
+                it.comment_tasks[cid] = {"pid": pid2, "started_at": time.time(),
+                                         "attempts": attempts + 1}
+                log.warning("[%s] 评论 agent 无输出，已自动重试 (comment=%s, 第 %d 次)",
+                            label, cid, attempts + 1)
+                continue
+        it.processed_comment_ids.add(str(cid))
+        del it.comment_tasks[cid]
+        log.warning("[%s] 评论 agent 失败且重试耗尽 (comment=%s, attempts=%d)，"
+                    "标记已处理；如需重新处理请让作者再评论一次", label, cid, attempts)
+    return handled
 
 
 def _append_pipeline_record(repo_full: str, number: int, record: dict) -> None:
