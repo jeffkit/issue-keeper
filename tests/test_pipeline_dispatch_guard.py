@@ -295,6 +295,14 @@ def _write_issue_ledger(tmp_path, repo: str, number: int, record: dict) -> None:
     ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
     ledger.parent.mkdir(parents=True, exist_ok=True)
     with ledger.open("a", encoding="utf-8") as f:
+        # 2026-10-01 off-by-one 修复后：单条 engine_error = 首败 → 自动重试
+        # （不消费）。要测「升级 → 兜底回评/快照」的场景需二连失败——此处对
+        # engine_error 场景自动播一颗前次失败种子，调用方断言不必改动。
+        if record.get("status") == "engine_error":
+            f.write(json.dumps({"repo": repo, "issue": number,
+                                "ts": time.strftime("%Y-%m-%dT%H:%M:%S+0800"),
+                                "status": "engine_error",
+                                "comment_posted": False}) + "\n")
         f.write(json.dumps({"repo": repo, "issue": number,
                             "ts": time.strftime("%Y-%m-%dT%H:%M:%S+0800"),
                             **record}) + "\n")
@@ -317,8 +325,10 @@ def test_reaper_finalizes_done_run(tmp_path, monkeypatch):
 
 
 def test_reaper_falls_back_when_no_ledger(tmp_path, monkeypatch):
-    """pid 死了且没有台账（bridge 极早崩溃）→ engine_error 兜底回评。"""
+    """pid 死了且没有台账（bridge 极早崩溃）→ 二连失败升级，engine_error 兜底回评。"""
     monkeypatch.setenv("HOME", str(tmp_path))
+    _write_issue_ledger(tmp_path, "a/b", 7,
+                        {"status": "engine_error", "comment_posted": False})  # 前次失败种子
     state, it, _art = _in_flight_state(tmp_path, repo="a/b")
     posted = []
     monkeypatch.setattr("issue_keeper.keeper._gh_post_comment",

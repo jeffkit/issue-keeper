@@ -1739,7 +1739,11 @@ def _reap_pipelines(config, state, bindings) -> int:
                 log.info("[%s] pipeline retry-later（%s）——不消费，自动重派", label, err[:80])
                 continue
             if status == "engine_error" and not posted and not timed_out:
-                n_err = _consecutive_engine_errors(binding.repo, number) + 1  # 含本次
+                # 台账终态行（bridge _finish / reaper 代记）在计数**之前**已落，
+                # 尾部连续数已含本次——不能再 +1，否则首败即 2 直接升级、
+                # 重试分支永不可达（2026-10-01 实证：日志 0 次自动重试/24 次
+                # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
+                n_err = _consecutive_engine_errors(binding.repo, number)
                 if n_err < 2:
                     lock.unlink(missing_ok=True)
                     it.in_flight_since = None
