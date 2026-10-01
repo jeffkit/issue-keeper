@@ -19,10 +19,9 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
   - push_mode 支持 pr（gh pr create，PR 制仓）与 none（不出害，仅本地 commit）
 
 角色分离：
-  - glm-52         investigate / plan / implement / fix（实施方）
-  - glm53-flash    review（独立审查方，只看 diff+计划+issue 原文，不看实施者自述
-                     ——不是 self review。09-30 起由 deepseek-flash 换防：DeepSeek
-                     账户欠费 402，按拍板全部统一 GLM-5.3-flash，异构厂商性让位于可用性）
+  - glm53-flash    investigate / plan / implement / fix + review（10-01 起
+                     实施方由 glm-52 换防：jeffkit 全链 GLM-5.3-flash 拍板的
+                     遗留补齐；review 同模型但提示词独立=仍是异构复核）
   - glm-turbo      triage / document / reply（轻量段）
 
 设计要点（09-27 三方审查后定稿：DSL 严谨性 / 编排设计 / 运维安全）：
@@ -248,7 +247,7 @@ def issue_pipeline(INPUT):
         )
         return {"status": "partial", "posted": post_setup_fail.posted}
     investigate = AGENTRUN(
-        agent="glm-52",
+        agent="glm53-flash",
         repo=INPUT.worktree_dir,
         # 1800（2026-09-28 由 900 上调）：调研段要读代码 + 先立失败复现测试 +
         # 跑 cargo，而 worktree 是全新的、target/ 为空 → 冷构建常常十几分钟；
@@ -295,7 +294,7 @@ def issue_pipeline(INPUT):
 
     # ── 3. plan；人工审核仅 review_mode=human 且 risk=high（未批准 → 暂缓出害）──
     plan = AGENTRUN(
-        agent="glm-52",
+        agent="glm53-flash",
         repo=INPUT.worktree_dir,
         timeout_secs=INPUT.plan_timeout,
         prompt=(
@@ -335,7 +334,7 @@ def issue_pipeline(INPUT):
 
     # ── 4. implement：按计划实施，不 commit 不 push ──
     implement = AGENTRUN(
-        agent="glm-52",
+        agent="glm53-flash",
         repo=INPUT.worktree_dir,
         # 预算沿革：1800（#40 首次被掐）→ 2700 → 3000 → 4200（v1.0.11）。
         # 2026-09-29 四轮实测：implement 是唯一的墙——#40/#31 都在 3000s 被掐，
@@ -447,7 +446,7 @@ def issue_pipeline(INPUT):
 
     if verdict.verdict == "fix":
         fix_review = AGENTRUN(
-            agent="glm-52",
+            agent="glm53-flash",
             repo=INPUT.worktree_dir,
             # 与 implement 同级：这同样是「读 diff + 改码 + 自检」的活（600→1800→2400
             # →2700，v1.0.9）；#30 在这里被掐过一次。自检同样不要跑全量测试。
@@ -512,7 +511,7 @@ def issue_pipeline(INPUT):
     )
     if gate.passed != True:
         fix_test = AGENTRUN(
-            agent="glm-52",
+            agent="glm53-flash",
             repo=INPUT.worktree_dir,
             timeout_secs=INPUT.fix_test_timeout,
             prompt=(

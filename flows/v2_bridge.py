@@ -88,11 +88,13 @@ def main() -> None:
     gf.write_text(goal, encoding="utf-8")
 
     run_id = f"pipeline-{payload.get('issue_number')}-{time.strftime('%m%d%H%M%S')}"
-    # agent 名与 issue-pipeline flow 同款（agents.json 已验证）：实现/修复
-    # glm-52，评审 glm53-flash（独立 provider 复核）
+    # 全链 GLM-5.3-flash（jeffkit 2026-09-30 拍板，2026-10-01 午后纠正：此前的
+    # glm-52 默认是切档之前的遗留）。实现/评审同 preset（executor/maxSteps/env
+    # 全同构，~/.plaita/agents.json），per-repo 覆盖走 dispatch payload 的
+    # agent/reviewer 字段（pipeline_repos 契约）。
     cmd = [sys.executable, str(v2),
            "--goal-file", str(gf), "--repo", main_clone, "--run-id", run_id,
-           "--agent", payload.get("agent") or "glm-52",
+           "--agent", payload.get("agent") or "glm53-flash",
            "--reviewer", payload.get("reviewer") or "glm53-flash"]
     if payload.get("dry_run"):
         cmd.append("--dry-run")

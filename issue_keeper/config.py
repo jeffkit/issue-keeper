@@ -93,6 +93,12 @@ class PipelineRepoConfig:
     # 空 = 继承全局 pipeline_push_mode / pipeline_review_mode
     push_mode: str = ""                            # branch | pr | main | none
     review_mode: str = ""                          # auto | human
+    # v2 引擎 AGENTRUN 的 agent/reviewer 名（agents.json 键）。空 = 引擎默认
+    # （v2_bridge：实现/评审均 glm53-flash）。这是 dispatch payload 里
+    # agent/reviewer 字段的上游——此前只读不写，是死旋钮（2026-10-01 impl
+    # 模型切档时发现并接线）。
+    agent: str = ""
+    reviewer: str = ""
     # 注入各 agent 段提示词的仓内知识（红线/路由/文档惯例）——替代硬编码在
     # 通用 flow 里的 recursive 专属内容
     review_notes: str = ""
@@ -304,6 +310,8 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
             gate_timeout_secs=max(0, int(item.get("gate_timeout_secs", 0))),
             push_mode=push_mode,
             review_mode=review_mode,
+            agent=str(item.get("agent") or "").strip(),
+            reviewer=str(item.get("reviewer") or "").strip(),
             review_notes=str(item.get("review_notes") or ""),
             triage_notes=str(item.get("triage_notes") or ""),
             doc_notes=str(item.get("doc_notes") or ""),
