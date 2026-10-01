@@ -137,9 +137,10 @@ GitHub issue/PR 是公开输入面，任何人都能在里面塞内容诱导 age
 - **双协议支持**：
   - `provider: openai`（默认）—— OpenAI 兼容协议，支持 **DeepSeek**（推荐）/ OpenAI / Moonshot / Together 等。
   - `provider: anthropic` —— Anthropic messages API（GLM anthropic 兼容端点等）。
-- **两种后端**（`screener.backend`）：
+- **三种后端**（`screener.backend`：`classic | decision | flow`）：
   - `classic`（默认）—— 本模块内置实现，支持上述双协议；输出 `{safe, reason}`。
   - `decision` —— 复用 [plaita-nodes](../plaita-nodes) 的 **DecisionNode** 结构化决策原子：封闭决策空间 `{safe, unsafe}` + 置信度。低于 `min_confidence`（默认 0.8）按不安全处理——把 classic 提示词里「模棱两可→保守」量化为可调阈值。仅支持 `provider: openai`，需安装 plaita-nodes；判定结果带 `confidence` 字段（Verdict），可观测可审计。
+  - `flow` —— 判定配置来自 [plaita-console](../plaita) 上已发布的 `issue-screener` flow 定义（supervisor 自迭代管线管着它的版本与质量）：按 semver 最高取已发布版本，经 `X-Admin-API-Key` 鉴权拉取；按 `refresh_secs` TTL 刷新并落盘本地缓存，本地 DecisionNode 执行——判定路径不依赖 console 在线（console 不可达时用 stale 缓存，连缓存都没有则回退本地凭据）。仅支持 `provider: openai`，需安装 plaita-nodes；配置项详见 `config.example.yaml` 的 screener 段注释。
 - **凭据复用**：可以直接配 `api_key`/`base_url`/`model`（推荐 DeepSeek），也可以用 `credentials_from_profile` 复用某个 AgentProc profile 的凭据。
 - **fail-safe**：必须显式声明 `screener.enabled`。不写 `screener` 段、或 `enabled: true` 但缺凭据，程序都拒绝启动。
 - **判定不安全时**：
@@ -188,7 +189,7 @@ issue-keeper 的核心循环对来源不敏感：任何实现了 `IssueSource` �
 - 跨项目沟通天然：A 的 keeper 配置里加 B 项目作为另一个 repo binding，A 以 `proj-a-agent` 身份在 B 那边提 issue / 留评论
 - agent 之间能互相提 issue（通过 CLI 子命令）
 
-**存储**：单个 SQLite 文件（WAL 模式，支持多进程并发读写）。schema 两张表：`issues`、`comments`。issue 和 PR 同表，用 `kind` 字段区分；同一项目内 issue 和 PR 编号独立递增。
+**存储**：单个 SQLite 文件（WAL 模式，支持多进程并发读写）。schema 四张表：`issues`、`comments`、`status_history`、`projects`（后者同时存项目绑定）。issue 和 PR 同表，用 `kind` 字段区分；同一项目内 issue 和 PR 编号独立递增。
 
 **身份模型**：
 
@@ -301,11 +302,11 @@ dashboard 的「团队成员」页给 keeper 显示醒目的金色 keeper 徽章
 
 ### keeper 的 HitL 接入
 
-keeper 要真能调 `send_and_wait_reply` 联系人类，需要它跑的 claude-code 环境里注册了 `hitl` MCP 服务。keeper agent 通过 `agentproc hub run claude-code --cwd <issue-keeper 仓>` 调起，claude-code 跑 `claude -p --dangerously-skip-permissions`，会自动加载项目根的 `.mcp.json`。所以 issue-keeper 仓根放了一份 `.mcp.json`（已加进 `.gitignore`，含本机绝对路径），把 `hitl` MCP 指向本机的 hil-mcp 服务（ilink 引擎，`http://localhost:8081`，`--timeout 300` 让 `send_and_wait_reply` 最多等 5 分钟，配合 agent 10 分钟超时）。
+keeper 要真能调 `send_and_wait_reply` 联系人类，需要它跑的 claude-code 环境里注册了 `hitl` MCP 服务（这是可选的本地配置，不在仓库里维护）。keeper agent 通过 `agentproc hub run claude-code --cwd <issue-keeper 仓>` 调起，claude-code 跑 `claude -p --dangerously-skip-permissions`，会自动加载项目根的 `.mcp.json`（若存在）。在该文件里把 `hitl` MCP 指向本机的 hil-mcp 服务（ilink 引擎，`http://localhost:8081`）即可；hil-mcp 客户端 `--timeout` 默认 1200 秒，即 `send_and_wait_reply` 最多等人类回复 20 分钟。
 
 前提：hil-mcp 服务在本机 8081 已跑、ilink 已激活（微信能收消息）。若没有，参考 `hil-mcp-setup` skill 配置。换机/换路径时改 `.mcp.json` 即可。keeper 下一轮调用就是新 claude 进程，会自动加载新 `.mcp.json`，无需重启 daemon。
 
-> `.mcp.json` 里 hitl 的 `--timeout 3600`（1 小时）控制 `send_and_wait_reply` 最多等人类回复多久。配套地，`config.yaml` 的 `keeper_timeout_secs: 3900`（65 分钟）把 keeper agent 的调用超时调到比 HitL 等待更长，否则 agent 子进程会先于 HitL 超时被杀。普通项目 agent 仍用 `default_timeout_secs`（10 分钟）不变。
+> `send_and_wait_reply` 等人类回复的超时由 hitl MCP 的 `--timeout` 控制（hil-mcp 客户端默认 1200 秒 = 20 分钟；需要更长等待时在 MCP 配置里显式调大）。配套地，`config.yaml` 的 `keeper_timeout_secs`（默认 3900 秒 = 65 分钟）把 keeper agent 的调用超时保持得比 HitL 等待更长，否则 agent 子进程会先于 HitL 超时被杀。普通项目 agent 仍用 `default_timeout_secs`（10 分钟）不变。
 
 ### keeper 巡检：代人类 review / 主动分诊
 
@@ -414,7 +415,7 @@ state_file: ~/.issue-keeper/state.json
 bot_marker: "<!-- issue-keeper-bot -->"
 default_timeout_secs: 600
 agent_from_user: "issue-keeper"
-default_review_agent: ""        # 留空：人提的 issue 处理完停在 review 等人接手
+default_review_agent: "reviewer-agent"   # 默认示例；留空则人提的 issue 处理完停在 review 等人接手
 
 internal_db: ~/.issue-keeper/internal.db   # 项目绑定 + issue 共用库
 
@@ -470,10 +471,11 @@ python -m issue_keeper team list
 
 - `--cwd <binding.cwd>`：agent 工作目录。**这是动态切换项目上下文的关键**——一个 hub profile 通吃所有项目，不用每项目自建 profile
 - `--session <session_id>`：续接同一 issue/PR 的 agent 会话
-- `--from <agent_from_user>`：来源标识
 - `--stdin`：消息通过 stdin 管道传入，避免命令行长度限制（ARG_MAX）
 - `--quiet --no-stream`：抑制协议 NDJSON；关闭 streaming，确保 wire 0.4 下 stdout 取自 `{"type":"result"}`（否则 `claude-code` 等 streaming profile 在 quiet 模式下会得到空回复）
 - `--env KEY=VALUE`：`binding.env` 里每个变量都经 `--env` 透传给 agent。**agentproc 0.7.0+ 不再继承父进程全量 env**（只传 infra 集 + profile env 块的 allowlist 变量 + CLI `--env`），所以非 allowlist 的变量（如 `ANTHROPIC_BASE_URL`）必须走 `--env` 才能到 agent
+
+注意：旧版曾传的 `--from <agent_from_user>` 已不再传——agentproc 0.14 CLI 已移除该参数，agent 身份由回复正文里的 bot marker / 可见前缀承载（见「可见前缀与 agent 身份」一节）。
 
 agent 收到的消息会明确告诉它：
 
@@ -506,7 +508,7 @@ python -m issue_keeper dashboard            # 默认 127.0.0.1:7433
 ## 测试
 
 ```bash
-python -m pytest -q                         # 94 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API（含建项目、keeper 角色）/ keeper 巡检
+python -m pytest -q                         # 264 个用例：screener / config / internal / 防循环 / github 解析 / dashboard API（含建项目、keeper 角色）/ keeper 巡检
 ```
 
 ## 状态文件

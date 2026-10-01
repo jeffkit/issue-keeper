@@ -59,6 +59,10 @@ python -m issue_keeper team list
 python -m issue_keeper onboard ~/projects/foo --agent-label foo-agent --gen-intro
 
 python -m issue_keeper internal board <project>
+
+# L3 经验闭环：观测数据驱动的契约变更提案（generate/list/show/apply/reject）
+python -m issue_keeper proposals list
+
 pytest tests/
 ```
 
