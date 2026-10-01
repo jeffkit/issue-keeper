@@ -1405,11 +1405,17 @@ def _append_pipeline_record(repo_full: str, number: int, record: dict) -> None:
                             **record}) + "\n")
 
 def _consecutive_engine_errors(repo_full: str, number: int) -> int:
-    """台账里该 issue 末尾连续 engine_error 的条数（engine_error 自动重试封顶用）。"""
+    """台账里该 issue 末尾连续 engine_error 的条数（自动重试封顶用）。
+
+    仅统计 **近 12h** 内的记录（2026-10-02：连击原本跨天不衰减——disk 时代
+    的陈旧失败会让今晚的首败直接判「二连升级」吃掉自动重试，#68/#56 实证
+    连烧手工 reopen；失败间隔超过半天的，语义上已是新的一次尝试）。"""
     import json
+    import time as _time
     ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
     if not ledger.exists():
         return 0
+    cutoff = _time.time() - 12 * 3600
     rows: list[str] = []
     try:
         for line in ledger.read_text(encoding="utf-8").splitlines():
@@ -1418,6 +1424,15 @@ def _consecutive_engine_errors(repo_full: str, number: int) -> int:
             except Exception:
                 continue
             if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number):
+                # ts 形如 2026-10-01T16:42:44+0800；解析失败按窗口外处理。
+                # 时间序遍历：窗口外记录只在头部，跳过（勿 break——会丢其后新记录）
+                try:
+                    from datetime import datetime
+                    ts = datetime.fromisoformat(str(rec.get("ts", "")).replace("Z", "+00:00"))
+                    if ts.timestamp() < cutoff:
+                        continue
+                except Exception:
+                    continue
                 rows.append(str(rec.get("status") or ""))
     except OSError:
         return 0

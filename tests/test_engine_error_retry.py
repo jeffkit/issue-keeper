@@ -25,9 +25,11 @@ def ledger(tmp_path, monkeypatch):
 
 def _append(repo, issue, status):
     import os
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+0800")   # 必须新鲜：连击有 12h 窗
     with open(os.environ["HOME"] + "/.issue-keeper/pipeline/runs.jsonl", "a") as f:
         f.write(json.dumps({"repo": repo, "issue": issue, "status": status,
-                            "ts": "2026-10-01T00:00:00+0800"}) + "\n")
+                            "ts": ts}) + "\n")
 
 
 def test_首败含本次_trailing_1应重试(ledger):
@@ -55,3 +57,17 @@ def test_他issue与他仓不串账(ledger):
     _append("jeffkit/recursive-providers", 80, "engine_error")
     assert _consecutive_engine_errors("jeffkit/recursive", 80) == 1
     assert _consecutive_engine_errors("jeffkit/recursive", 82) == 0
+
+
+def test_12h窗口外的陈旧失败不进连击(ledger):
+    """连击跨天不衰减的语义修复：窗口外（>12h）记录出局，首败重新获得重试。"""
+    from datetime import datetime, timedelta
+    old_ts = (datetime.now() - timedelta(hours=20)).strftime("%Y-%m-%dT%H:%M:%S+0800")
+    new_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S+0800")
+    with open(Path.home() / ".issue-keeper" / "pipeline" / "runs.jsonl", "a") as f:
+        f.write(json.dumps({"repo": "jeffkit/recursive", "issue": 90,
+                            "ts": old_ts, "status": "engine_error"}) + "\n")
+        f.write(json.dumps({"repo": "jeffkit/recursive", "issue": 90,
+                            "ts": new_ts, "status": "engine_error"}) + "\n")
+    # 窗口内只有 1 条 → 首败重试（旧实现会把 20h 前的那条也算进去=2 升级）
+    assert _consecutive_engine_errors("jeffkit/recursive", 90) == 1
