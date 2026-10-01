@@ -18,11 +18,10 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
   - 提示词显式要求先读目标仓 AGENTS.md/CLAUDE.md——仓规契约的主人是各仓
   - push_mode 支持 pr（gh pr create，PR 制仓）与 none（不出害，仅本地 commit）
 
-角色分离：
-  - glm53-flash    investigate / plan / implement / fix + review（10-01 起
-                     实施方由 glm-52 换防：jeffkit 全链 GLM-5.3-flash 拍板的
-                     遗留补齐；review 同模型但提示词独立=仍是异构复核）
-  - glm-turbo      triage / document / reply（轻量段）
+角色分离（10-01 拍板：全链 GLM-5.3-flash，轻量段不再单独留 glm-turbo）：
+  - glm53-flash    全部段：triage / investigate / plan / implement / fix /
+                     review / document / reply——review 同模型但提示词独立、
+                     只看 diff+计划+issue 原文，异构复核语义由提示词隔离承担
 
 设计要点（09-27 三方审查后定稿：DSL 严谨性 / 编排设计 / 运维安全）：
   - 入口闸：INPUT.screener_verdict != "safe" 直接拒绝；issue 正文只传 body_file
@@ -107,7 +106,7 @@ def issue_pipeline(INPUT):
 
     # ── 1. triage：查重 + 定级（正文只经 body_file，不进 prompt）──
     triage = AGENTRUN(
-        agent="glm-turbo",
+        agent="glm53-flash",
         repo=INPUT.main_clone,
         timeout_secs=300,
         prompt=(
@@ -151,7 +150,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 A/B：blocked / invalid ──
     if parsed.verdict == "blocked":
         reply_blocked = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -171,7 +170,7 @@ def issue_pipeline(INPUT):
 
     if parsed.verdict == "invalid":
         reply_invalid = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -229,7 +228,7 @@ def issue_pipeline(INPUT):
     )
     if setup.ok == False:
         reply_setup_fail = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -273,7 +272,7 @@ def issue_pipeline(INPUT):
     # 自动改不该自动改的东西（marketplace「改行为请去 argusai 仓」）。
     if INPUT.readonly == True:
         reply_ro = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -315,7 +314,7 @@ def issue_pipeline(INPUT):
         )
         if approve.status != "replied":
             reply_hold = AGENTRUN(
-                agent="glm-turbo",
+                agent="glm53-flash",
                 repo=INPUT.main_clone,
                 timeout_secs=600,
                 prompt=(
@@ -377,7 +376,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 C：无改动 / 实施受阻 ──
     if check.has_changes != True:
         reply_nochange = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -427,7 +426,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 D：review 叫停（fail-safe：解析失败也走这里）──
     if verdict.verdict == "abort":
         reply_abort = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -530,7 +529,7 @@ def issue_pipeline(INPUT):
         if retest.passed != True:
             # 此路径发生在 deliver 之前——如实说明未推送
             reply_partial = AGENTRUN(
-                agent="glm-turbo",
+                agent="glm53-flash",
                 repo=INPUT.main_clone,
                 timeout_secs=600,
                 prompt=(
@@ -573,7 +572,7 @@ def issue_pipeline(INPUT):
     )
     if guard.ok != True:
         reply_guard = AGENTRUN(
-            agent="glm-turbo",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -593,7 +592,7 @@ def issue_pipeline(INPUT):
 
     # ── 8. document → deliver（幂等）→ merge（按 push_mode）→ 回评 → kanban ──
     document = AGENTRUN(
-        agent="glm-turbo",
+        agent="glm53-flash",
         repo=INPUT.worktree_dir,
         timeout_secs=INPUT.document_timeout,
         prompt=(
@@ -620,7 +619,7 @@ def issue_pipeline(INPUT):
         base_branch=INPUT.base_branch,
     )
     reply = AGENTRUN(
-        agent="glm-turbo",
+        agent="glm53-flash",
         repo=INPUT.main_clone,
         timeout_secs=600,
         prompt=(
