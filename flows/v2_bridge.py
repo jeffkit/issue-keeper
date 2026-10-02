@@ -1,4 +1,3 @@
-import os
 #!/usr/bin/env python3
 """v2 engine bridge——keeper 派发契约的 self-improve v2 适配层。
 
@@ -18,6 +17,7 @@ verdict 映射：
 （recursive 桥自身也有 killpg 层）并落 engine_error。
 """
 from __future__ import annotations
+import os
 
 import json
 import subprocess
