@@ -98,6 +98,12 @@ retry 重跑的是**死掉的节点**，而它可能死在副作用中途：`git
 
 ### G3. worker 生命周期全路径的子进程清场（含 worktree 并发写竞态）
 
+> **⚠️ 2026-10-02 修订**：本节的「四路径清场」验收口径已被两组后续事实改写，
+> 现行口径见 §5.6。cancel 路径经 plaita 取消语义设计稿
+> （`plaita/docs/DESIGN-cancellation-and-lease.md`，波次①②④+引擎传播已进
+> plaita main 7315c9c）拍板为**步界软中断**；SIGKILL/OOM 路径改走
+> **kill-before-start**（§5.6，已实现）。
+
 LOCAL 模式的 killpg/超时击杀在 worker 模式的归属问题，**不止 cancel 一条路径**：
 
 1. **cancel**：只在节点边界生效（09-28 遗留，已知）；
@@ -181,11 +187,61 @@ plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.
 | C. SIGKILL | **孤儿** | worker 立死，agent 进程树无人回收（`start_new_session` 脱离进程组），手工清场 |
 | D. OOM | 同 C（同构推定） | — |
 
-**P1 前置修复清单（worker/引擎侧，即 G3 的落地）**：
-1. execution 启动即写 DB（修可见性，cancel 的前提）；
-2. AGENTRUN 节点内进程组追踪 + runner 取消路径 killpg（先例：e13d296 code 沙箱同款）；
-3. `worker.stop()` 优雅等待在途消息完成或限期后 killpg 清场（SIGTERM 路径）；
-4. （可选）节点启动前 worktree 存活检测/flock，防孤儿与新 run 并发写。
+**P1 前置修复清单（worker/引擎侧，即 G3 的落地）**——状态截至 2026-10-02：
+1. execution 启动即写 DB（修可见性，cancel 的前提）——**未修**
+   （`plaita/server/flow_worker.py::start_flow` 仍是先 `run_distributed` 返回再
+   `save_execution_state`）；
+2. AGENTRUN 节点内进程组追踪 + runner 取消路径 killpg——**被拍板取代**：取消
+   语义设计稿 §3.3 + 开放问题#1 拍板「维持软中断」，LLM/AGENTRUN 类在途节点
+   有意不硬杀（防 at-least-once 重放副作用双份），取消只在步界生效；code 沙箱
+   保留 killpg 例外。agent_run 的 killpg 仍仅限超时看门狗（plaita-nodes
+   579084a）；
+3. `worker.stop()` 优雅等待在途消息完成或限期后 killpg 清场（SIGTERM 路径）——
+   **半修**：ReviewFix D3 已落（SIGTERM 只置位、任务边界自然退出、read 切 ≤1s
+   分片），无限期 drain 接受为已知行为，残留孤儿交给第 4 条兜底；
+4. （可选）节点启动前 worktree 存活检测/flock，防孤儿与新 run 并发写——
+   **已按 §5.6 kill-before-start 实现并升级为必做**（flock 方案被否，理由见 §5.6）。
+
+## 5.6 G3 落地：kill-before-start（2026-10-02 设计并实现）
+
+**决策**：放弃「死时清场」（需要存活于 worker 之外的触发器：PDEATHSIG 仅
+Linux、看门狗线程随 worker 同死），改追**接管前清场**——任何新 agent 对同一
+workspace 开工之前，先探测并清掉旧进程组。孤儿本身可多活 1-2 分钟（写的还是
+旧 attempt 的产物），时序上根除并发写。
+
+**机制（三件，全在 agentproc/plaita-nodes，已实现）**：
+
+1. **遗言锁**（agentproc `run_lock.py`）：spawn 侧 Popen 成功后把
+   `pid/command/started_at` 写入 `~/.agentproc/run-locks/<sha256(workspace)>.json`
+   （普通文件非 flock——worker 硬死时内核锁随 fd 释放，锁住已死持有者挡不住
+   孤儿；文件+pid 探测才带得出「杀谁」。集中目录不进 worktree，keeper WIP
+   快照 `git add -A` 不会收进提交）。`RunOptions.run_lock_key` opt-in，
+   in-process 与通用 runner 两个 spawn 点都接线；正常收尾清锁，早退路径
+   不清是**自愈安全**的（能早退说明子进程已死，残留锁下次探测按 stale 清理；
+   wait 之前异常的存活 pid 恰是真孤儿，被杀正是期望行为）。
+2. **preflight 清场**（`cleanup_stale_run`）：锁缺失=clean；pid 死=stale；
+   pid 活着且**双因子身份核实**通过（pgid==pid 会话领袖 且命令含记录的
+   argv0 基名，防 pid 重用误杀）→ killpg 整组、等死（僵尸也算死）后放行；
+   活着但身份无法核实（ps 不可用/杀组被拒/杀后不死）→ **不杀不放行**抛
+   `RunLockBusy`，由调用方决定（节点=AgentRunError 报错终态；reaper=告警
+   继续）。plaita-nodes `agent_run.preflight_workspace` 是编排侧入口：
+   AgentRunNode 直跑路径（`repo=`）开工前强制过门，`recursive_stream_turn`
+   同款；沙箱路径不走此门（VM 边界 + WorkspaceLease 各管一摊）。
+3. **keeper reaper 接线**：`_snapshot_worktree_wip` 快照前先
+   `_preflight_orphans`（fail-open）——否则快照会拍进孤儿正在写的半成品。
+
+**验收口径（改写后的四路径）**：
+
+| 路径 | 现行口径 | 状态 |
+|---|---|---|
+| cancel | 步界软中断 + code 沙箱即时 killpg（取消语义设计稿 §3.3，拍板落档） | plaita main 已落（波次①②③④） |
+| SIGTERM | 优雅 drain：任务边界自然退出、read ≤1s 分片（ReviewFix D3）；无限期 drain 接受，靠第 4 行兜底 | plaita main 已落 |
+| SIGKILL/OOM | **接管前清场**：新 agent 开工时遗言锁里的旧组已不存在，无并发写窗口 | 本节机制已实现，待 P3 演练 |
+| 并发写竞态 | 同上（kill-before-start 时序根除）；per-attempt worktree 隔离留作 config 兜底档，默认不采（丢「就地续做」L1 语义） | 同上 |
+
+**残余风险（如实记档）**：preflight 只拦走 agent_run/recursive_stream_turn
+门口的写入者，有人在 worktree 里手跑 recursive 不经此门——靠遗言锁可见性
+（`~/.agentproc/run-locks/` 可扫）+ 运营纪律兜底，不设计防。
 
 ## 6. 风险与缓解
 

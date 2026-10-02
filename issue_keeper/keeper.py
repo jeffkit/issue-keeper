@@ -1155,6 +1155,29 @@ def _channel_reply_posted(repo: str, number: int, since_ts: float,
     return False
 
 
+def _preflight_orphans(worktree_dir: Path) -> None:
+    """WIP 快照前清场（G3 kill-before-start）：杀掉 worker 硬死遗存的孤儿 agent。
+
+    worker 被 SIGKILL/OOM 后 agent CLI（start_new_session 脱离进程组）可能仍在
+    写 worktree——直接快照会拍进半写内容。经 plaita-nodes 的 preflight（agentproc
+    遗言锁定位、双因子核实后 killpg）。fail-open：任何导入/执行失败只告警，
+    快照照常——快照本身是尽力而为的保全，并发写硬门在 agent_run 开工 preflight。
+    """
+    try:
+        try:
+            from plaita_nodes.agent_run import preflight_workspace as _pf
+        except ImportError:
+            import sys as _sys
+            _sys.path.insert(0, "/Users/kong/projects/infra4agent/plaita-nodes/src")
+            from plaita_nodes.agent_run import preflight_workspace as _pf
+        info = _pf(str(worktree_dir))
+        if info.get("action") == "killed":
+            log.warning("worktree %s 孤儿 agent 已清场（pid=%s）",
+                        worktree_dir, info.get("pid"))
+    except Exception as e:  # noqa: BLE001 —— 见 docstring，fail-open
+        log.warning("worktree %s 孤儿清场跳过：%s", worktree_dir, str(e)[:160])
+
+
 def _snapshot_worktree_wip(worktree_dir: Path, label: str) -> str:
     """引擎异常终止后，把 worktree 里的未提交改动快照成本地 wip 提交。
 
@@ -1167,6 +1190,7 @@ def _snapshot_worktree_wip(worktree_dir: Path, label: str) -> str:
     import subprocess as _sp
     if not worktree_dir.is_dir():
         return ""
+    _preflight_orphans(worktree_dir)
     def _git(args: list[str], t: int = 60) -> subprocess.CompletedProcess:
         return _sp.run(["git", "-C", str(worktree_dir), *args],
                        capture_output=True, text=True, timeout=t)
