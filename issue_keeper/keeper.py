@@ -1743,6 +1743,36 @@ def _reap_console_execution(config, binding, it, key, label: str,
     log.info("[%s] console execution 终态落账：status=%s（execution=%s）",
              label, row["status"], crec.get("execution_id"))
     return row
+def _engine_env_with_run_deadline(config, pc, start_ts: float, label: str) -> dict:
+    """构造 dispatch engine_env：engine=v2 注入 RECURSIVE_RUN_DEADLINE（2026-10-02 评审遗留 #3）。
+
+    recursive v3 宿主读该 env（epoch 秒，`dl = float(deadline)`）做 run 级预算
+    墙，到点优雅退出：verdict/台账落盘且带 node_retry_exhausted——reaper 见标记
+    跳过自动重派。不注入则宿主走进程内默认 8h，与 keeper 侧护栏脱节：默认
+    pipeline_timeout_secs=5400s 下 reaper 先 SIGKILL 整组，宿主没机会
+    checkpoint/回评（v2_bridge 的 V2_TIMEOUT_SECS=28800 更是永不到点）。
+
+    注入值 = start_ts + pipeline_timeout_secs - run_deadline_margin_secs；
+    start_ts 与 reaper 基线（it.in_flight_since）取同一时钟读数——宿主到点
+    恰在 killpg 时刻前 margin 秒。用户在 engine_env 显式配了该键则不覆盖
+    （显式优先）。仅 engine=v2 注入（pipeline 引擎的 issue-pipeline flow 没有
+    该 env 的读者）；margin ≥ 预算即无优雅窗口，视为配置矛盾，跳过注入并
+    告警（护栏退回 killpg），绝不注入一个必然秒触发的假 deadline。
+    """
+    env = dict(pc.engine_env)
+    if pc.engine != "v2":
+        return env
+    if env.get("RECURSIVE_RUN_DEADLINE"):
+        return env  # 显式优先
+    margin = max(0, int(getattr(config, "run_deadline_margin_secs", 300)))
+    window = int(config.pipeline_timeout_secs) - margin
+    if window <= 0:
+        log.warning("[%s] run_deadline_margin_secs(%d) ≥ pipeline_timeout_secs(%d)："
+                    "无优雅收尾窗口，跳过 RECURSIVE_RUN_DEADLINE 注入（护栏退回 killpg）",
+                    label, margin, config.pipeline_timeout_secs)
+        return env
+    env["RECURSIVE_RUN_DEADLINE"] = str(int(start_ts + window))
+    return env
 
 
 def _dispatch_pipeline(config, binding, res, it, label: str,
@@ -1814,6 +1844,11 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
     timeouts = dict(_PIPELINE_SEGMENT_TIMEOUTS)
     timeouts.update({k: int(v) for k, v in pc.timeout_overrides.items()})
 
+    # 时钟统一（RECURSIVE_RUN_DEADLINE 注入）：下面这个读数既是 deadline 注入的
+    # 基点，也是 reaper 的超时基线（it.in_flight_since）——保证宿主预算墙恰好
+    # 落在 killpg 时刻前 run_deadline_margin_secs 秒（见 helper docstring）。
+    now = time.time()
+
     payload = {
         "repo_full": binding.repo,
         "issue_number": res.number,
@@ -1838,7 +1873,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         "push_mode": pc.resolved_push_mode(config.pipeline_push_mode),
         "agent": pc.agent,
         "reviewer": pc.reviewer,
-        "engine_env": pc.engine_env,
+        "engine_env": _engine_env_with_run_deadline(config, pc, now, label),
         "investigate_timeout": timeouts["investigate"],
         "plan_timeout": timeouts["plan"],
         "implement_timeout": timeouts["implement"],
@@ -1882,7 +1917,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         except OSError as e:
             log.warning("[%s] 写 pipeline 锁失败（%s，并发保护失效）: %s", label, lk.name, e)
 
-    it.in_flight_since = time.time()
+    it.in_flight_since = now
 
     # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
     # 2026-09-29 与另一会话在同一 issue 上撞车的教训。

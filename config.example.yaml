@@ -96,6 +96,18 @@ pipeline:
   # 可见节点级 trace；Langfuse 另需进程 env LANGFUSE_PUBLIC_KEY（trace id = 执行 id）。
   # observability_redis: redis://localhost:6379/0
 
+# ─── 管线 run 预算墙（与 recursive v3 宿主对齐）────────────────────────
+# pipeline_timeout_secs：bridge 子进程整跑超时（秒），到点 reaper 对整个进程组
+# killpg（agent 子树一并清）——keeper 侧的最终护栏。
+# 对 engine=v2 的仓，keeper 派发时会把 run 级预算墙注入宿主 env：
+#   RECURSIVE_RUN_DEADLINE = 派发时刻 + pipeline_timeout_secs - run_deadline_margin_secs
+# recursive v3 宿主（RECURSIVE_HOST_V3=1）到点先优雅退出：checkpoint/verdict
+# 落盘、台账带 node_retry_exhausted（reaper 不再自动重派白烧一轮）；killpg 只
+# 兜底。margin 即留给宿主收尾的窗口（0 = 不留窗口，护栏退回纯 killpg）。
+# per-repo engine_env 里显式配了 RECURSIVE_RUN_DEADLINE 则以显式值为准。
+pipeline_timeout_secs: 5400
+run_deadline_margin_secs: 300
+
 # ─── per-repo 管线契约（pipeline_repos，v0.3 2026-09-30）──────────────
 # 每个仓自带：基线分支 / 依赖安装 / 质量门（单命令或多门清单）/ 交付策略 /
 # 审核模式 / 仓规注入（红线·路由·文档惯例）/ 段预算覆盖。

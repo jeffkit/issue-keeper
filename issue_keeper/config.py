@@ -218,6 +218,13 @@ class Config:
     # error 执行 resume-retry 次数上限（G1：续原 execution 从断点步进，免整跑
     # 重做）。超限落 engine_error 台账行走既有重派/升级语义。
     console_retry_max: int = 1
+    # run 级 deadline 注入的提前量（秒）：派发 engine=v2 的 run 时，keeper 把
+    # RECURSIVE_RUN_DEADLINE = 派发时刻 + pipeline_timeout_secs - 本值 注入
+    # engine_env，让 recursive v3 宿主在 reaper SIGKILL 前先到点优雅退出
+    # （checkpoint/verdict 落盘、台账带 node_retry_exhausted，reaper 不再自动
+    # 重派白烧一轮）。engine_env 里显式配了该键则不覆盖。0 = 不留收尾窗口
+    # （护栏退回纯 killpg）。
+    run_deadline_margin_secs: int = 300
     pipeline_push_mode: str = "branch"     # branch | main（main 需自行接受直推风险）
     pipeline_review_mode: str = "auto"     # auto | human（human 且 risk=high 才 HITL）
     # repo_full → 质量门命令（如 "cargo test --workspace"）；缺省/空 = 跳过门禁并注明
@@ -591,6 +598,7 @@ def load_config(path: str | os.PathLike) -> Config:
             raw.get("pipeline_bridge")
             or "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py"),
         pipeline_timeout_secs=max(300, int(raw.get("pipeline_timeout_secs", 5400))),
+        run_deadline_margin_secs=max(0, int(raw.get("run_deadline_margin_secs", 300))),
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
