@@ -1433,14 +1433,20 @@ def _consecutive_engine_errors(repo_full: str, number: int) -> int:
 
     仅统计 **近 12h** 内的记录（2026-10-02：连击原本跨天不衰减——disk 时代
     的陈旧失败会让今晚的首败直接判「二连升级」吃掉自动重试，#68/#56 实证
-    连烧手工 reopen；失败间隔超过半天的，语义上已是新的一次尝试）。"""
+    连烧手工 reopen；失败间隔超过半天的，语义上已是新的一次尝试）。
+
+    `node_retry_exhausted` 行**打断**连击（2026-10-02，DESIGN §5 D6）：该标记
+    是宿主烧满节点重试后的终局判定，属「完整一轮战役的终态」而非瞬态崩溃；
+    本计数封顶的是**崩溃重试**，把终局行混入会让一次耗尽升级吃掉其后新派发
+    首败的重试额度。耗尽路径本身永远不走本计数（reaper 见标记直接升级），
+    故打断零成本。"""
     import json
     import time as _time
     ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
     if not ledger.exists():
         return 0
     cutoff = _time.time() - 12 * 3600
-    rows: list[str] = []
+    rows: list[tuple[str, bool]] = []
     try:
         for line in ledger.read_text(encoding="utf-8").splitlines():
             try:
@@ -1457,15 +1463,15 @@ def _consecutive_engine_errors(repo_full: str, number: int) -> int:
                         continue
                 except Exception:
                     continue
-                rows.append(str(rec.get("status") or ""))
+                rows.append((str(rec.get("status") or ""),
+                             bool(rec.get("node_retry_exhausted"))))
     except OSError:
         return 0
     n = 0
-    for s in reversed(rows):
-        if s == "engine_error":
-            n += 1
-        else:
+    for s, exhausted in reversed(rows):
+        if s != "engine_error" or exhausted:
             break
+        n += 1
     return n
 
 
@@ -1749,6 +1755,9 @@ def _reap_pipelines(config, state, bindings) -> int:
             status = rec.get("status") or "engine_error"
             posted = bool(rec.get("comment_posted"))
             err = str(rec.get("error") or "")
+            # 宿主终局标记（v2 台账 extra 透传，DESIGN-local-distributed-host §5）：
+            # 节点重试耗尽 / run 预算墙——宿主内已烧满重试，keeper 不再自动重派。
+            node_exhausted = bool(rec.get("node_retry_exhausted"))
             number = int(key.split(":")[-1])
             kind = "pr" if key.startswith("pr:") else "issue"
             if holder is None and not rec:
@@ -1779,18 +1788,26 @@ def _reap_pipelines(config, state, bindings) -> int:
                 log.info("[%s] pipeline retry-later（%s）——不消费，自动重派", label, err[:80])
                 continue
             if status == "engine_error" and not posted and not timed_out:
-                # 台账终态行（bridge _finish / reaper 代记）在计数**之前**已落，
-                # 尾部连续数已含本次——不能再 +1，否则首败即 2 直接升级、
-                # 重试分支永不可达（2026-10-01 实证：日志 0 次自动重试/24 次
-                # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
-                n_err = _consecutive_engine_errors(binding.repo, number)
-                if n_err < 2:
-                    lock.unlink(missing_ok=True)
-                    it.in_flight_since = None
-                    finalized += 1
-                    log.info("[%s] engine_error 自动重试（连续第 %d 次）：%s", label, n_err, err[:80])
-                    continue
-                log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
+                # 宿主终局标记优先（DESIGN §5 D6）：node_retry_exhausted 表示宿主
+                # 已在节点级烧满重试/预算墙才判 engine_error——keeper 再自动重派
+                # 一轮（implement 1-2h）纯浪费，跳过连击计数直接走下方升级。
+                # 普通崩溃（无标记）才吃自动重试额度。
+                if node_exhausted:
+                    log.warning("[%s] node_retry_exhausted（宿主已耗尽节点重试），"
+                                "跳过自动重派直接升级：%s", label, err[:80])
+                else:
+                    # 台账终态行（bridge _finish / reaper 代记）在计数**之前**已落，
+                    # 尾部连续数已含本次——不能再 +1，否则首败即 2 直接升级、
+                    # 重试分支永不可达（2026-10-01 实证：日志 0 次自动重试/24 次
+                    # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
+                    n_err = _consecutive_engine_errors(binding.repo, number)
+                    if n_err < 2:
+                        lock.unlink(missing_ok=True)
+                        it.in_flight_since = None
+                        finalized += 1
+                        log.info("[%s] engine_error 自动重试（连续第 %d 次）：%s", label, n_err, err[:80])
+                        continue
+                    log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
 
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
@@ -1828,7 +1845,11 @@ def _reap_pipelines(config, state, bindings) -> int:
                 gate_ctx += f"cmd={cmd or '未知'}；worktree={wt_path or '未知'}（{exists}）"
             if not posted:
                 if status == "engine_error":
-                    reason = "管线引擎异常终止（未发出回评）"
+                    if node_exhausted:
+                        # 升级留痕：让人工一眼看出为何没自动重派（宿主已判终局）
+                        reason = "宿主已耗尽节点内重试（node_retry_exhausted），keeper 不自动重派"
+                    else:
+                        reason = "管线引擎异常终止（未发出回评）"
                 else:
                     reason = f"管线终态，但未确认发出回评"
                 reason += f"（status={status}）"

@@ -137,9 +137,16 @@ def main() -> None:
                  "error": str(verdict.get("why") or verdict.get("gate") or "failed")[-500:]},
                 False, started, payload, t0, {"run_id": run_id})
     else:
+        # 台账 extra 透传 node_retry_exhausted（DESIGN-local-distributed-host §5）：
+        # 宿主已判定节点重试耗尽/预算墙——keeper reaper 见标记跳过自动重派直接
+        # 升级。不透传的话 reaper 只见 status=engine_error，会把耗尽 run 再白烧
+        # 一轮（implement 1-2h）才升级。
+        extra = {"run_id": run_id}
+        if verdict.get("node_retry_exhausted"):
+            extra["node_retry_exhausted"] = True
         _finish({"status": "engine_error",
                  "error": str(verdict.get("why") or "unknown")[-500:]},
-                False, started, payload, t0, {"run_id": run_id})
+                False, started, payload, t0, extra)
 
 
 if __name__ == "__main__":
