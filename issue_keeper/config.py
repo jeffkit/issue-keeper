@@ -103,6 +103,9 @@ class PipelineRepoConfig:
     # RECURSIVE_NODE_RETRIES、RECURSIVE_RUN_DEADLINE）。经 dispatch payload
     # 透传给 v2_bridge 子进程（照 agent/reviewer 字段先例）。
     engine_env: dict = field(default_factory=dict)
+    # engine=v2-console 时派发到 console 的 flow id（已发布的 self-improve v2
+    # flow）。空 = "self-improve-v2"。
+    console_flow_id: str = ""
     # 注入各 agent 段提示词的仓内知识（红线/路由/文档惯例）——替代硬编码在
     # 通用 flow 里的 recursive 专属内容
     review_notes: str = ""
@@ -207,6 +210,14 @@ class Config:
         "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py")
     # 桥子进程整跑超时（秒）：到点 killpg 整个进程组（agent 子树一并清）
     pipeline_timeout_secs: int = 5400
+    # ── engine=v2-console（G5/G6，2026-10-02）────────────────────────
+    # zombie 判定阈（秒）：running 执行的 last_update_time 年龄超过它 → 判死
+    # （cancel + 台账 engine_error 行走重派）。last_update_time 只在步界持久化
+    # 时刷新——长 impl 节点（≤70min）期间正常老化，阈值须高于最长节点预算。
+    console_zombie_secs: int = 7200
+    # error 执行 resume-retry 次数上限（G1：续原 execution 从断点步进，免整跑
+    # 重做）。超限落 engine_error 台账行走既有重派/升级语义。
+    console_retry_max: int = 1
     pipeline_push_mode: str = "branch"     # branch | main（main 需自行接受直推风险）
     pipeline_review_mode: str = "auto"     # auto | human（human 且 risk=high 才 HITL）
     # repo_full → 质量门命令（如 "cargo test --workspace"）；缺省/空 = 跳过门禁并注明
@@ -275,8 +286,8 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
         if mode not in ("full", "readonly"):
             raise ValueError(f"pipeline_repos[{repo}].mode 只能是 full|readonly，得到 {mode!r}")
         engine = str(item.get("engine") or "pipeline").strip()
-        if engine not in ("pipeline", "v2"):
-            raise ValueError(f"pipeline_repos[{repo}].engine 只能是 pipeline|v2，得到 {engine!r}")
+        if engine not in ("pipeline", "v2", "v2-console"):
+            raise ValueError(f"pipeline_repos[{repo}].engine 只能是 pipeline|v2|v2-console，得到 {engine!r}")
         push_mode = str(item.get("push_mode") or "").strip()
         if push_mode and push_mode not in ("branch", "pr", "main", "none"):
             raise ValueError(
@@ -317,6 +328,7 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
             agent=str(item.get("agent") or "").strip(),
             reviewer=str(item.get("reviewer") or "").strip(),
             engine_env={str(k): str(v) for k, v in (item.get("engine_env") or {}).items()},
+            console_flow_id=str(item.get("console_flow_id") or "").strip(),
             review_notes=str(item.get("review_notes") or ""),
             triage_notes=str(item.get("triage_notes") or ""),
             doc_notes=str(item.get("doc_notes") or ""),

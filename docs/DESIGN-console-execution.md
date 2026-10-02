@@ -188,9 +188,10 @@ plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.
 | D. OOM | 同 C（同构推定） | — |
 
 **P1 前置修复清单（worker/引擎侧，即 G3 的落地）**——状态截至 2026-10-02：
-1. execution 启动即写 DB（修可见性，cancel 的前提）——**未修**
-   （`plaita/server/flow_worker.py::start_flow` 仍是先 `run_distributed` 返回再
-   `save_execution_state`）；
+1. execution 启动即写 DB（修可见性，cancel 的前提）——**✅ 已修（plaita 43828aa）**：
+   start_flow 先落 running 行再执行；execution_id 由 BFF start 提交时铸造、随
+   队列消息透传（调用方即刻可轮询/取消），worker 认账并以种子喂引擎
+   （`context.clean(execution_id=)`），行 id 与 result.execution_id 天然一致；
 2. AGENTRUN 节点内进程组追踪 + runner 取消路径 killpg——**被拍板取代**：取消
    语义设计稿 §3.3 + 开放问题#1 拍板「维持软中断」，LLM/AGENTRUN 类在途节点
    有意不硬杀（防 at-least-once 重放副作用双份），取消只在步界生效；code 沙箱
@@ -201,6 +202,43 @@ plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.
    分片），无限期 drain 接受为已知行为，残留孤儿交给第 4 条兜底；
 4. （可选）节点启动前 worktree 存活检测/flock，防孤儿与新 run 并发写——
    **已按 §5.6 kill-before-start 实现并升级为必做**（flock 方案被否，理由见 §5.6）。
+
+## 5.7 P1 引擎件 + P2 keeper 件落地（2026-10-02 深夜）
+
+**P1（plaita 43828aa，全套 4341 绿）**：
+- **G1**：`ResumeType.RETRY`；DistributedStrategy 把 retry 路由到 continue 步进
+  （失败节点在 checkpoint 无条目 → 从 last_node_id 后继步进 = 恰重跑失败节点、
+  已完成不重放——验收主用例钉住）；retry 无 saved_context 拒收；挂起中
+  EventNode 拒 retry 绕行；worker 终态短路放行 error+retry，放行即翻 running
+  落盘，再崩归位 error 仍可再 retry；
+- **可见性**：见 §5.5 清单①。
+
+**P2（issue-keeper 本提交，全套 308 绿）**：
+- `issue_keeper/console_exec.py`：executions API 客户端（urllib）+
+  `verdict_from_execution` / `map_verdict`（D5 台账写入迁移——与
+  flows/v2_bridge.py::_finish 同表）/ `zombie`（D6：last_update_time 年龄，
+  阈值须高于最长节点预算，默认 7200s）；
+- `engine: v2-console` 档（G6）：`_dispatch_pipeline` 分叉到
+  `_dispatch_console_execution`（POST /api/executions + v2-goal.md +
+  dispatch.json 收尾上下文 + **console-exec.json 在途锚**——daemon 重启不丢）；
+  回滚 = 配置一行 `v2-console → v2`；
+- reaper console 分支：轮询 → 终态映射落账 → **共享收尾全复用**（读回校验 /
+  engine_error 自动重派与连击升级 / 兜底回评 / WIP 快照 / 看板，零改动）；
+  决策表：error → resume-retry ×1（G1 续原 execution）→ 仍 error → engine_error
+  行走既有重派/升级；running 心跳超阈 → zombie cancel + engine_error 行；
+  非 engine_error 的收尾回评由 keeper 出（console flow 无回评节点契约）；
+- 在途判定：`_pipeline_in_flight` 认 console-exec.json（哨兵锁「console」仅
+  占位，killpg 路径被 console 分支拦截）。
+
+**剩余部署步骤（代码之外的运维活，P3 演练的前置）**：
+1. 发布 self-improve v2 flow 到 console（INPUT 契约：goal/repo/run_id/agent/
+   reviewer——与 `_dispatch_console_execution` 的 params 对齐）；
+2. plaita worker 换血到本提交（新代码：可见性 + retry）；keeper daemon 重启
+   （console 分支在 daemon 进程内）——均待维护窗口（中途重启丢在途 state）；
+3. P3 演练（kill -9 worker / 磁盘打满 / LLM 端点断，口径=§5.6 表）；
+4. G1b 边界：出害口节点排除依赖失败节点名上报（当前 error 载荷拿不到），
+   以 git_publish/github_comment 的节点级幂等（dedup marker / ls-remote 查重）
+   兜底，failure log 见出害口节点名时值守人工复核。
 
 ## 5.6 G3 落地：kill-before-start（2026-10-02 设计并实现）
 

@@ -1060,7 +1060,13 @@ def _lock_holder(lock: Path) -> int | None:
 
 
 def _pipeline_in_flight(artifact_dir: Path) -> int | None:
-    """同一 issue 是否已有 run 在跑。"""
+    """同一 issue 是否已有 run 在跑。
+
+    bridge = run.lock 里的 pid；v2-console = console-exec.json 在途记录
+    （无本地 pid，返回哨兵 -1——仅作真值判定，不参与 killpg）。
+    """
+    if (artifact_dir / CONSOLE_EXEC_RECORD).exists():
+        return -1
     return _lock_holder(artifact_dir / PIPELINE_LOCK_NAME)
 
 
@@ -1569,6 +1575,176 @@ def _dep_settled(config, repo_full: str, num: int) -> bool:
     return bool(it and it.get("processed"))
 
 
+# ── engine=v2-console（G5/G6，2026-10-02）────────────────────────────
+# 在途锚与哨兵：console 模式没有本地 bridge 进程，run.lock 里没有 pid 可写。
+# console-exec.json = 在途记录（daemon 重启不丢，reaper 据此轮询）；锁文件写
+# 哨兵串（非数字，_lock_holder 视为无 pid 但不删——在途判定走记录文件）。
+CONSOLE_EXEC_RECORD = "console-exec.json"
+CONSOLE_LOCK_SENTINEL = "console"
+
+
+def _console_exec_record(artifact_dir: Path) -> dict | None:
+    """读 console 在途记录；缺失/损坏 → None（= 非 console 在途）。"""
+    try:
+        rec = json.loads((artifact_dir / CONSOLE_EXEC_RECORD).read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) and rec.get("execution_id") else None
+    except (OSError, ValueError):
+        return None
+
+
+def _dispatch_console_execution(config, binding, res, it, label: str,
+                                pc: PipelineRepoConfig, artifact_dir: Path,
+                                body_file: Path) -> dict:
+    """engine=v2-console：派发到 plaita-console（POST /api/executions），立即返回。
+
+    台账由 reaper 收尾时落（D5 台账写入迁移）；本函数留三样：v2-goal.md（goal
+    正文，与 v2_bridge 同构）、console-exec.json（在途锚）、dispatch.json（收尾
+    上下文：worktree 路径等，供共享收尾复用）。
+    """
+    import time as _time
+
+    from . import console_exec as _ce
+
+    try:
+        client = _ce.client_from_config(config)
+    except _ce.ConsoleExecError as e:
+        log.error("[%s] console 派发不可用：%s", label, e)
+        return {"status": "engine_error", "comment_posted": False}
+
+    flow_id = pc.console_flow_id or "self-improve-v2"
+    goal = f"#{res.number} {res.title or ''}\n\n{(res.body or '')[:16000]}".strip()
+    (artifact_dir / "v2-goal.md").write_text(goal, encoding="utf-8")
+    run_id = f"pipeline-{res.number}-{_time.strftime('%m%d%H%M%S')}"
+    params = {
+        "goal": goal,
+        "repo": binding.cwd,
+        "run_id": run_id,
+        "agent": pc.agent or "glm53-flash",
+        "reviewer": pc.reviewer or "glm53-flash",
+    }
+    try:
+        execution_id = client.start_execution(flow_id, params)
+    except _ce.ConsoleExecError as e:
+        log.error("[%s] console 派发失败（flow=%s）：%s", label, flow_id, e)
+        return {"status": "engine_error", "comment_posted": False}
+
+    record = {
+        "execution_id": execution_id, "flow_id": flow_id, "run_id": run_id,
+        "engine": "v2-console", "retry_count": 0,
+        "dispatched_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    (artifact_dir / CONSOLE_EXEC_RECORD).write_text(
+        json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    (artifact_dir / "dispatch.json").write_text(json.dumps({
+        "repo_full": binding.repo, "issue_number": res.number,
+        "engine": "v2-console", "execution_id": execution_id, "flow_id": flow_id,
+        "main_clone": binding.cwd,
+        "worktree_dir": f"{binding.cwd}/.worktrees/issue-{res.number}",
+        "base_branch": pc.base_branch,
+    }, ensure_ascii=False), encoding="utf-8")
+    for lk in (artifact_dir / PIPELINE_LOCK_NAME, artifact_dir.parent / GLOBAL_LOCK_NAME):
+        try:
+            lk.write_text(CONSOLE_LOCK_SENTINEL, encoding="utf-8")
+        except OSError as e:
+            log.warning("[%s] 写 console 锁哨兵失败: %s", label, e)
+    it.in_flight_since = _time.time()
+    log.info("[%s] 已提交 console execution %s（flow=%s，run=%s）",
+             label, execution_id, flow_id, run_id)
+    return {"status": "dispatched", "comment_posted": True}
+
+
+def _reap_console_execution(config, binding, it, key, label: str,
+                            artifact_dir: Path, crec: dict, now: float) -> dict | None:
+    """v2-console 在途轮询（G5/G6）。返回 None=仍在途；否则返回已落账的台账行，
+    交回 _reap_pipelines 走共享收尾（读回校验/engine_error 重派/升级/兜底回评）。
+
+    决策表（设计稿 §G5）：error → resume-retry ×1（断点步进，免整跑重做）；
+    running + last_update_time 年龄超阈 → zombie（cancel + engine_error 行）；
+    其余终态 → verdict 映射落账。非 engine_error 的收尾回评由本函数出
+    （console flow 无回评节点契约），避免共享兜底「未确认发出回评」文案。
+    """
+    import time as _time
+
+    from . import console_exec as _ce
+
+    try:
+        client = _ce.client_from_config(config)
+        detail = client.get_execution(str(crec["execution_id"]))
+    except _ce.ConsoleExecUnavailable as e:
+        log.warning("[%s] console 不可达，本轮跳过：%s", label, e)
+        return None
+    except _ce.ConsoleExecNotFound:
+        detail = {"status": "error",
+                  "error": {"message": "execution 404（console 侧被清理/TTL 过期?）"}}
+    except _ce.ConsoleExecError as e:
+        log.warning("[%s] console 查询失败，本轮跳过：%s", label, e)
+        return None
+
+    status = str(detail.get("status") or "")
+    number = int(key.split(":")[-1])
+    kind = "pr" if key.startswith("pr:") else "issue"
+
+    if status == "running":
+        if not _ce.zombie(detail, config.console_zombie_secs, now=now):
+            return None
+        try:
+            client.cancel(str(crec["execution_id"]))
+        except _ce.ConsoleExecError as e:
+            log.warning("[%s] zombie cancel 失败（仍按 zombie 收尾）：%s", label, e)
+        log.error("[%s] console execution 疑似 zombie（>%ss 无 checkpoint 刷新），cancel",
+                  label, config.console_zombie_secs)
+        row = _ce.map_verdict({"verdict": "engine_error",
+                               "why": f"zombie：>{config.console_zombie_secs}s 无步界持久化"})
+    elif status == "error":
+        if int(crec.get("retry_count") or 0) < config.console_retry_max:
+            try:
+                client.resume(str(crec["execution_id"]), "retry")
+            except _ce.ConsoleExecError as e:
+                log.warning("[%s] resume-retry 失败（转 engine_error 行重派）：%s", label, e)
+                row = _ce.map_verdict({"verdict": "engine_error",
+                                       "why": f"resume-retry 失败：{e}"})
+            else:
+                crec["retry_count"] = int(crec.get("retry_count") or 0) + 1
+                (artifact_dir / CONSOLE_EXEC_RECORD).write_text(
+                    json.dumps(crec, ensure_ascii=False), encoding="utf-8")
+                log.info("[%s] engine error → resume-retry（第 %d 次，断点步进）",
+                         label, crec["retry_count"])
+                return None
+        else:
+            row = _ce.map_verdict(_ce.verdict_from_execution(detail))
+    else:
+        row = _ce.map_verdict(_ce.verdict_from_execution(detail))
+
+    # 非 engine_error：keeper 出真实收尾回评（回评礼仪不变），并记入台账行
+    if row["status"] != "engine_error" and not bool(row.get("comment_posted")):
+        parts = [f"管线收尾（console 执行）：status={row['status']}"]
+        if row.get("note"):
+            parts.append(str(row["note"]))
+        if row.get("stage"):
+            parts.append(f"stage={row['stage']}")
+        if row.get("error"):
+            parts.append(str(row["error"])[-280:])
+        try:
+            _gh_post_comment(kind, binding.repo, number,
+                             f"{config.bot_marker}\n[issue-pipeline] "
+                             f"{_sanitize_public_comment('；'.join(parts))}。")
+            row["comment_posted"] = True
+        except Exception as e:
+            log.error("[%s] console 收尾回评失败: %s", label, e)
+
+    _append_pipeline_record(binding.repo, number, {
+        **row, "flow_source": "v2-console",
+        "execution_id": crec.get("execution_id"),
+    })
+    # 终态已落账：清在途锚与锁（共享收尾按无锁/终态处理）
+    (artifact_dir / CONSOLE_EXEC_RECORD).unlink(missing_ok=True)
+    (artifact_dir / PIPELINE_LOCK_NAME).unlink(missing_ok=True)
+    (artifact_dir.parent / GLOBAL_LOCK_NAME).unlink(missing_ok=True)
+    log.info("[%s] console execution 终态落账：status=%s（execution=%s）",
+             label, row["status"], crec.get("execution_id"))
+    return row
+
+
 def _dispatch_pipeline(config, binding, res, it, label: str,
                        pc: PipelineRepoConfig | None = None) -> dict:
     """后台派发一次管线 run（bridge），立即返回；完成由 _reap_pipelines 收尾。
@@ -1592,7 +1768,12 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         # engine=v2：接单切 self-improve v2 引擎（同目录 v2_bridge 适配同一
         # 派发契约——dispatch.json / 台账 ledger / RESULT 行）。
         bridge = bridge.parent / "v2_bridge.py"
-    if not bridge.exists():
+    if pc.engine == "v2-console":
+        # engine=v2-console（G5/G6）：不经 bridge——派发到 plaita-console
+        # （POST /api/executions），reaper 轮询收尾。单独入口，共享下方
+        # deps 闸 / 在途去重 / body_file 产物。
+        pass  # bridge 检查对 console 无意义，放行到 body_file 后的分叉
+    elif not bridge.exists():
         log.error("[%s] pipeline bridge 不存在: %s", label, bridge)
         return {"status": "engine_error", "comment_posted": False}
 
@@ -1620,6 +1801,10 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
 
     body_file = artifact_dir / "00-issue.md"
     body_file.write_text((res.body or "")[:16000], encoding="utf-8")
+
+    if pc.engine == "v2-console":
+        return _dispatch_console_execution(config, binding, res, it, label, pc,
+                                           artifact_dir, body_file)
 
     # per-repo 契约（v0.3）：基线/安装/门/交付/注入全部来自 pipeline_repos 配置，
     # 全局 pipeline_push_mode / pipeline_review_mode 仅作缺省。
@@ -1738,36 +1923,52 @@ def _reap_pipelines(config, state, bindings) -> int:
             slug = binding.repo.split("/")[-1]
             artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{key}").expanduser()
             lock = artifact_dir / PIPELINE_LOCK_NAME
-            holder = _lock_holder(lock)
-            timed_out = (now - since) > config.pipeline_timeout_secs
-            if holder is not None and not timed_out:
-                continue  # 还在跑
-            if holder is not None and timed_out:
-                try:
-                    _os.killpg(_os.getpgid(holder), _signal.SIGKILL)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-                lock.unlink(missing_ok=True)
-                log.error("[%s] pipeline 超时（%ss），进程组已清",
-                          label, config.pipeline_timeout_secs)
 
-            rec = _latest_pipeline_record(binding.repo, int(key), since) or {}
-            status = rec.get("status") or "engine_error"
-            posted = bool(rec.get("comment_posted"))
-            err = str(rec.get("error") or "")
-            # 宿主终局标记（v2 台账 extra 透传，DESIGN-local-distributed-host §5）：
-            # 节点重试耗尽 / run 预算墙——宿主内已烧满重试，keeper 不再自动重派。
-            node_exhausted = bool(rec.get("node_retry_exhausted"))
+            console_rec = _console_exec_record(artifact_dir)
+            if console_rec is not None:
+                # engine=v2-console 在途：轮询 execution，终态则落账后走共享收尾
+                row = _reap_console_execution(config, binding, it, key, label,
+                                              artifact_dir, console_rec, now)
+                if row is None:
+                    continue  # 仍在途（本轮无终态/console 不可达）
+                rec = row
+                status = str(rec.get("status") or "engine_error")
+                posted = bool(rec.get("comment_posted"))
+                err = str(rec.get("error") or "")
+                node_exhausted = False
+                holder = None          # console 无本地 pid
+                timed_out = False      # 超时语义由 zombie 判定承担
+            else:
+                holder = _lock_holder(lock)
+                timed_out = (now - since) > config.pipeline_timeout_secs
+                if holder is not None and not timed_out:
+                    continue  # 还在跑
+                if holder is not None and timed_out:
+                    try:
+                        _os.killpg(_os.getpgid(holder), _signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                    lock.unlink(missing_ok=True)
+                    log.error("[%s] pipeline 超时（%ss），进程组已清",
+                              label, config.pipeline_timeout_secs)
+
+                rec = _latest_pipeline_record(binding.repo, int(key), since) or {}
+                status = rec.get("status") or "engine_error"
+                posted = bool(rec.get("comment_posted"))
+                err = str(rec.get("error") or "")
+                # 宿主终局标记（v2 台账 extra 透传，DESIGN-local-distributed-host §5）：
+                # 节点重试耗尽 / run 预算墙——宿主内已烧满重试，keeper 不再自动重派。
+                node_exhausted = bool(rec.get("node_retry_exhausted"))
+                if holder is None and not rec:
+                    status, err = "engine_error", "bridge 进程已退出且未写台账"
+                    # 代记台账行：连续 engine_error 计数跨尝试可用（否则永不封顶）
+                    _append_pipeline_record(binding.repo, int(key.split(":")[-1]),
+                                            {"status": "engine_error", "error": err,
+                                             "comment_posted": False})
+                if timed_out and not err:
+                    err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
             number = int(key.split(":")[-1])
             kind = "pr" if key.startswith("pr:") else "issue"
-            if holder is None and not rec:
-                status, err = "engine_error", "bridge 进程已退出且未写台账"
-                # 代记台账行：连续 engine_error 计数跨尝试可用（否则永不封顶）
-                _append_pipeline_record(binding.repo, number,
-                                        {"status": "engine_error", "error": err,
-                                         "comment_posted": False})
-            if timed_out and not err:
-                err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
 
             # ── 跨渠道读回校验（recursive#2）：台账说没回评，先去目标渠道核实——
             # bridge 在「评论已发出」与「台账落盘」之间崩溃、或旧版台账键漏记
