@@ -99,6 +99,10 @@ class PipelineRepoConfig:
     # 模型切档时发现并接线）。
     agent: str = ""
     reviewer: str = ""
+    # v2 引擎宿主的额外 env（如 RECURSIVE_HOST_V3=1 灰度开关、
+    # RECURSIVE_NODE_RETRIES、RECURSIVE_RUN_DEADLINE）。经 dispatch payload
+    # 透传给 v2_bridge 子进程（照 agent/reviewer 字段先例）。
+    engine_env: dict = field(default_factory=dict)
     # 注入各 agent 段提示词的仓内知识（红线/路由/文档惯例）——替代硬编码在
     # 通用 flow 里的 recursive 专属内容
     review_notes: str = ""
@@ -312,6 +316,7 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
             review_mode=review_mode,
             agent=str(item.get("agent") or "").strip(),
             reviewer=str(item.get("reviewer") or "").strip(),
+            engine_env={str(k): str(v) for k, v in (item.get("engine_env") or {}).items()},
             review_notes=str(item.get("review_notes") or ""),
             triage_notes=str(item.get("triage_notes") or ""),
             doc_notes=str(item.get("doc_notes") or ""),

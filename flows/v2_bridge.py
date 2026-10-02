@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """v2 engine bridge——keeper 派发契约的 self-improve v2 适配层。
 
@@ -99,10 +100,12 @@ def main() -> None:
     if payload.get("dry_run"):
         cmd.append("--dry-run")
 
+    extra_env = payload.get("engine_env") or {}
     log_path = artifact / "v2-run.log"
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=V2_TIMEOUT_SECS)
+                           timeout=V2_TIMEOUT_SECS,
+                           env={**os.environ, **extra_env})
         log_path.write_text(
             (r.stdout or "")[-8000:] + "\n--- stderr ---\n" + (r.stderr or "")[-4000:])
         verdict = _read_verdict(main_clone, run_id)
