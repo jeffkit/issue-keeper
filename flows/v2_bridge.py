@@ -13,8 +13,12 @@ verdict 映射：
   failed-preserved → status=failed,    error=why（worktree/现场已保全）
   engine_error     → status=engine_error, error=why
 
-超时：V2_TIMEOUT_SECS（默认 8h，对齐 pipeline_timeout_secs）；到点杀进程树
-（recursive 桥自身也有 killpg 层）并落 engine_error。
+超时：实际预算墙由 keeper 注入的 RECURSIVE_RUN_DEADLINE 决定（派发时刻 +
+pipeline_timeout_secs - run_deadline_margin_secs，2026-10-03 起，宿主到点
+优雅收尾：checkpoint/verdict 落盘且台账带 node_retry_exhausted）；V2_TIMEOUT_SECS
+（默认 8h）仅是 keeper 未注入时的兜底，与 pipeline_timeout_secs（默认 5400s）
+并不对齐——不注入时 keeper 侧 reaper 先到点 killpg。到点杀进程树（recursive
+桥自身也有 killpg 层）并落 engine_error。
 """
 from __future__ import annotations
 import os
