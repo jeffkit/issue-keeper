@@ -54,6 +54,47 @@ def test_engine_error_without_posted_defaults_false():
     assert out["comment_posted"] is False
 
 
+# ── v2_bridge 成功分支 comment_posted 透传（2026-10-04 双评论噪音回归）────
+def _load_v2_bridge():
+    saved = list(sys.path)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "v2_bridge_mod", HERE.parent / "flows" / "v2_bridge.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        sys.path[:] = saved
+
+
+try:
+    v2b = _load_v2_bridge()
+except Exception:  # 仓外依赖 plaita 不在时跳过
+    pytest.skip("v2_bridge 依赖仓外 plaita，跳过", allow_module_level=True)
+
+
+def test_success_result_propagates_comment_posted():
+    """committed/skip-commit 载荷必须透传 comment_posted（2026-10-04 修复）。
+
+    此前本层硬编码载荷丢键 → 台账 comment_posted 恒 false → reaper 在
+    「已合入 main」之后又补一条「请人工查看」兜底，同一 issue 吃两条评论
+    （#104/#106 实证，okguitar 可见）。"""
+    out = v2b._success_result({"verdict": "committed", "via": "git-publish",
+                               "comment_posted": True}, "committed")
+    assert out["status"] == "done" and out["pushed"] is True
+    assert bridge.normalize_result(out)["comment_posted"] is True
+
+    out2 = v2b._success_result({"verdict": "skip-commit", "comment_posted": True},
+                               "skip-commit")
+    assert out2["pushed"] is False and out2["merged"] is False
+    assert bridge.normalize_result(out2)["comment_posted"] is True
+    assert out2["note"] == "no changes"
+
+    # 旧 run 形态（verdict 无键）→ normalize 收敛 False，不谎报已回评
+    out3 = v2b._success_result({"verdict": "committed"}, "committed")
+    assert bridge.normalize_result(out3)["comment_posted"] is False
+
+
 # ── code 节点沙箱预算（#41 deliver / #45 merge 假失败的回归）──────────
 # flow 的 deliver/merge 要跑 git ls-remote/commit/push，plaita 的 subprocess
 # 沙箱默认只给 10s，包装层被墙钟杀掉但 push 已经落地 → 假失败。

@@ -41,6 +41,25 @@ pb.ensure_tool_path()
 V2_TIMEOUT_SECS = 28800
 
 
+def _success_result(verdict: dict, v: str) -> dict:
+    """committed/skip-commit 终态 verdict → _finish 载荷。
+
+    **comment_posted 透传是承重的**（2026-10-04 修复）：recursive 侧 bridge 在
+    终态后已发真实完成回评并置 verdict["comment_posted"]=True——此前本层两个
+    分支硬编码载荷把这个键丢了，_finish 写台账恒 false/None → reaper 在
+    「已合入 main」之后再补一条「请人工查看」兜底，同一个 issue 吃两条评论
+    （一条成功、一条像错误；#104/#106 实证）。normalize_result 会在 _finish
+    里把缺键收敛为 False，故这里显式透传。"""
+    return {
+        "status": "done",
+        "pushed": v == "committed",
+        "merged": v == "committed",
+        "note": (verdict.get("via") or "") if v == "committed"
+                else (verdict.get("why") or "no changes"),
+        "comment_posted": verdict.get("comment_posted"),
+    }
+
+
 def _read_verdict(main_clone: str, run_id: str) -> dict:
     state = Path(main_clone) / ".flowcast" / "runs" / run_id / "state.json"
     try:
@@ -120,14 +139,9 @@ def main() -> None:
                    "why": f"v2 run timeout after {V2_TIMEOUT_SECS}s"}
 
     v = verdict.get("verdict")
-    if v == "committed":
-        _finish({"status": "done", "pushed": True, "merged": True,
-                 "note": verdict.get("via") or ""}, True, started, payload, t0,
+    if v in ("committed", "skip-commit"):
+        _finish(_success_result(verdict, v), True, started, payload, t0,
                 {"run_id": run_id})
-    elif v == "skip-commit":
-        _finish({"status": "done", "pushed": False, "merged": False,
-                 "note": verdict.get("why") or "no changes"}, True,
-                started, payload, t0, {"run_id": run_id})
     elif v == "retry-later":
         # 环境性失败（磁盘守卫等）：keeper 不消费、自动重派（daily-limit 兜底）
         _finish({"status": "retry-later", "pushed": False, "merged": False,
