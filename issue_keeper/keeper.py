@@ -439,10 +439,11 @@ def _process_resource(
     if getattr(it, "in_flight_since", None):
         return handled
 
-    # failed 自动重试的退避闸（#8）：reaper 判重试时写了 retry_after，到点前不派发。
+    # 自动重试的退避闸（#8 failed / #6 retry-later）：reaper 判重试时写了
+    # retry_after，到点前不派发。
     ra = getattr(it, "retry_after", None)
     if ra and time.time() < ra:
-        log.info("[%s] %s failed 自动重试退避中（%.0fs 后重派）", label, kind, ra - time.time())
+        log.info("[%s] %s 自动重试退避中（%.0fs 后重派）", label, kind, ra - time.time())
         return handled
 
     # ── review 状态自动 review ─────────────────────────────────────
@@ -928,6 +929,7 @@ def _clear_terminal_state(it: ItemState) -> None:
     it.blocked = False
     it.wakeup_deps = []
     it.retry_after = None      # #8：人工 reopen 立即重派，不被上轮退避挡住
+    it.retry_later_streak = 0  # #6：人工干预即重算连击，退避从 7min 起
 
 
 def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
@@ -1045,6 +1047,16 @@ def _author_over_limit(config, author: str | None) -> bool:
 PIPELINE_LOCK_NAME = "run.lock"
 GLOBAL_LOCK_NAME = ".pipeline.lock"
 ALREADY_RUNNING = "already_running"
+
+
+def _retry_later_backoff(config, streak: int) -> float:
+    """retry-later 空转的指数退避：7min(=poll) → 1h → 6h 封顶（#6）。"""
+    base = max(1, int(getattr(config, "poll_interval_secs", 300) or 300))
+    if streak <= 1:
+        return float(base)
+    if streak == 2:
+        return float(max(base, 3600))
+    return float(max(base, 21600))   # max() 保单调：poll 被调到 >1h 时档位不倒退
 
 
 def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
@@ -2039,10 +2051,14 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
 
     it.in_flight_since = now
     it.retry_after = None      # #8：本次重派已消费退避，清掉免得残留
+    # 注意：这里**不**清 retry_later_streak（#6）——它是「本轮是空转重派」的判据，
+    # 清了每轮都从 7min 重来，认领评论抑制也失效。
 
     # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
     # 2026-09-29 与另一会话在同一 issue 上撞车的教训。
-    if config.pipeline_claim_comment:
+    # #6：retry-later 空转重派（streak > 0）不补发——连续空转期间公屏恒 ≤1 条；
+    # 首派（streak=0）仍发，marker 防循环第一层不动。
+    if config.pipeline_claim_comment and int(getattr(it, "retry_later_streak", 0) or 0) == 0:
         try:
             _gh_post_comment(
                 res.kind, binding.repo, res.number,
@@ -2136,13 +2152,19 @@ def _reap_pipelines(config, state, bindings) -> int:
 
             # ── retry-later / engine_error 自动重试（2026-10-01）──────────
             # 环境性失败（磁盘守卫）与引擎级崩溃不消费首响：清在途标记与锁，
-            # 下一轮自动重派。engine_error 连续 2 次才升级人工（防系统性崩溃
+            # 退避到期后由 `_process_resource` 的 retry_after 闸放行重派
+            # （keeper 是「先收尸再扫仓」，不写截止就是同轮立刻再派）。
+            # engine_error 连续 2 次才升级人工（防系统性崩溃
             # 刷跑）；daily-limit 在派发路径兜底总量。兜底评论仅在升级时发。
             if status == "retry-later":
                 lock.unlink(missing_ok=True)
                 it.in_flight_since = None
+                it.retry_later_streak = int(getattr(it, "retry_later_streak", 0) or 0) + 1
+                delay = _retry_later_backoff(config, it.retry_later_streak)
+                it.retry_after = now + delay   # 复用既有退避闸（#6）
                 finalized += 1
-                log.info("[%s] pipeline retry-later（%s）——不消费，自动重派", label, err[:80])
+                log.info("[%s] pipeline retry-later（%s）——不消费，第 %d 次，%.0fs 后重派",
+                         label, err[:80], it.retry_later_streak, delay)
                 continue
             # ── 失败类（failed/guarded/partial）自动重试与连击升级（#8）──────
             # failed 是内容性失败的真实终态（worktree 已保全），此前直接落进
@@ -2265,6 +2287,7 @@ def _reap_pipelines(config, state, bindings) -> int:
             it.processed = True
             it.in_flight_since = None
             it.retry_after = None      # #8：收尾即销掉陈旧退避，不留幽灵字段
+            it.retry_later_streak = 0  # #6：终态收尾即清零，下次故障重新 7min 起算
             finalized += 1
             if status == "blocked" and not key.startswith("pr:"):
                 body = ""
