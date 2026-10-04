@@ -1184,6 +1184,25 @@ def _retry_later_backoff(config, streak: int) -> float:
     return float(max(base, 21600))   # max() 保单调：poll 被调到 >1h 时档位不倒退
 
 
+def _arm_auto_redispatch(it, config, now: float, *, lock: Path,
+                         backoff: bool = False) -> float:
+    """自动重派武装（retry-later / failed 类 / engine_error 三支共用同一语义）：
+
+    清锁 + 清在途锚 + `retry_later_streak += 1`（=「连续自动重派次数」，既是
+    retry-later 指数档位的基数，也是「本轮为自动重派」的判据 → 重派轮不补发
+    认领评论）+ 写 `retry_after` 冷却（backoff=True 按 #6 指数档位，否则固定
+    一轮 poll_interval_secs）。不写截止就是同轮立刻再派（run_once 先收尸再扫仓）。
+    终态收尾与人工 reopen 清零 streak。
+    """
+    lock.unlink(missing_ok=True)
+    it.in_flight_since = None
+    it.retry_later_streak = int(getattr(it, "retry_later_streak", 0) or 0) + 1
+    delay = (_retry_later_backoff(config, it.retry_later_streak) if backoff
+             else float(max(1, int(config.poll_interval_secs))))
+    it.retry_after = now + delay
+    return delay
+
+
 def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
     """同 issue 每日管线 run 次数上限（读 runs.jsonl 台账；台账缺失视为未超限）。
 
@@ -2176,14 +2195,16 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
 
     it.in_flight_since = now
     it.retry_after = None      # #8：本次重派已消费退避，清掉免得残留
-    # 注意：这里**不**清 retry_later_streak（#6）——它是「本轮是空转重派」的判据，
+    # 注意：这里**不**清 retry_later_streak（#6）——它是「本轮是自动重派」的判据，
     # 清了每轮都从 7min 重来，认领评论抑制也失效。
 
     # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
     # 2026-09-29 与另一会话在同一 issue 上撞车的教训。
-    # #6：retry-later 空转重派（streak > 0）不补发——连续空转期间公屏恒 ≤1 条；
-    # 首派（streak=0）仍发，marker 防循环第一层不动。
-    if config.pipeline_claim_comment and int(getattr(it, "retry_later_streak", 0) or 0) == 0:
+    # #6/#12：本轮为自动重派（retry-later / failed / engine_error 三支共用
+    # `retry_later_streak` 作「连续自动重派次数」）就不补发——同一 chain 续跑期间
+    # 公屏认领评论恒 ≤1 条；真首派（streak == 0）仍恰发一条，bot_marker 不动。
+    auto_redispatch = int(getattr(it, "retry_later_streak", 0) or 0) > 0
+    if config.pipeline_claim_comment and not auto_redispatch:
         try:
             _gh_post_comment(
                 res.kind, binding.repo, res.number,
@@ -2282,11 +2303,7 @@ def _reap_pipelines(config, state, bindings) -> int:
             # engine_error 连续 2 次才升级人工（防系统性崩溃
             # 刷跑）；daily-limit 在派发路径兜底总量。兜底评论仅在升级时发。
             if status == "retry-later":
-                lock.unlink(missing_ok=True)
-                it.in_flight_since = None
-                it.retry_later_streak = int(getattr(it, "retry_later_streak", 0) or 0) + 1
-                delay = _retry_later_backoff(config, it.retry_later_streak)
-                it.retry_after = now + delay   # 复用既有退避闸（#6）
+                delay = _arm_auto_redispatch(it, config, now, lock=lock, backoff=True)
                 finalized += 1
                 log.info("[%s] pipeline retry-later（%s）——不消费，第 %d 次，%.0fs 后重派",
                          label, err[:80], it.retry_later_streak, delay)
@@ -2301,9 +2318,7 @@ def _reap_pipelines(config, state, bindings) -> int:
                 n_fail = _consecutive_failures(binding.repo, number)
                 budget = max(0, int(getattr(config, "failed_auto_retry", 1)))
                 if status in _RETRY_STATUSES and n_fail <= budget:
-                    lock.unlink(missing_ok=True)
-                    it.in_flight_since = None
-                    it.retry_after = now + max(1, int(config.poll_interval_secs))
+                    _arm_auto_redispatch(it, config, now, lock=lock)
                     finalized += 1
                     log.warning("[%s] failed 自动重试（连续第 %d 次，退避 %ds）：%s",
                                 label, n_fail, int(config.poll_interval_secs), err[:80])
@@ -2340,10 +2355,10 @@ def _reap_pipelines(config, state, bindings) -> int:
                     # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
                     n_err = _consecutive_engine_errors(binding.repo, number)
                     if n_err < 2:
-                        lock.unlink(missing_ok=True)
-                        it.in_flight_since = None
+                        delay = _arm_auto_redispatch(it, config, now, lock=lock)
                         finalized += 1
-                        log.info("[%s] engine_error 自动重试（连续第 %d 次）：%s", label, n_err, err[:80])
+                        log.info("[%s] engine_error 自动重试（连续第 %d 次，退避 %ds）：%s",
+                                 label, n_err, int(delay), err[:80])
                         continue
                     log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
 

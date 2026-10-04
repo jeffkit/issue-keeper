@@ -93,6 +93,8 @@ def test_无标记_首败仍自动重试_原语义不动(reap_env):
     assert not it.processed
     assert it.in_flight_since is None, "清在途 = 下一轮自动重派"
     assert not (art / "run.lock").exists()
+    assert it.retry_after and it.retry_after > time.time(), (
+        "首败重试必须带一轮冷却（#12），否则同轮即重派")
 
 
 def test_耗尽升级后_新派发首败仍享重试额度(reap_env):

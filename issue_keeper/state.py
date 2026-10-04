@@ -33,8 +33,9 @@ class ItemState:
     # now + poll_interval_secs，_process_resource 在到点前不派发；派发成功/
     # 收尾/`reopen` 三处清回 None。
     retry_after: float | None = None
-    # retry-later 连击数（#6）：空转重派的指数退避基数；终态收尾/`reopen` 清零，
-    # 派发成功不清零（空转重派靠它判「本轮是空转」→ 不补发认领评论）。
+    # 连续自动重派次数（retry-later / failed / engine_error 三支共用）：既是
+    # retry-later 指数退避基数，也是「本轮为自动重派」判据（重派轮不补发认领
+    # 评论）；终态收尾/`reopen` 清零，派发成功不清零。
     retry_later_streak: int = 0
     # screener 未判定连击数（#5）：模型没判出来（服务故障/低置信）时 +1，退避重试；
     # 到上限升级人工。成功通过/终态收尾/`reopen` 清零。
