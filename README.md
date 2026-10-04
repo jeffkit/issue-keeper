@@ -139,14 +139,19 @@ GitHub issue/PR 是公开输入面，任何人都能在里面塞内容诱导 age
   - `provider: anthropic` —— Anthropic messages API（GLM anthropic 兼容端点等）。
 - **三种后端**（`screener.backend`：`classic | decision | flow`）：
   - `classic`（默认）—— 本模块内置实现，支持上述双协议；输出 `{safe, reason}`。
-  - `decision` —— 复用 [plaita-nodes](../plaita-nodes) 的 **DecisionNode** 结构化决策原子：封闭决策空间 `{safe, unsafe}` + 置信度。低于 `min_confidence`（默认 0.8）按不安全处理——把 classic 提示词里「模棱两可→保守」量化为可调阈值。仅支持 `provider: openai`，需安装 plaita-nodes；判定结果带 `confidence` 字段（Verdict），可观测可审计。
-  - `flow` —— 判定配置来自 [plaita-console](../plaita) 上已发布的 `issue-screener` flow 定义（supervisor 自迭代管线管着它的版本与质量）：按 semver 最高取已发布版本，经 `X-Admin-API-Key` 鉴权拉取；按 `refresh_secs` TTL 刷新并落盘本地缓存，本地 DecisionNode 执行——判定路径不依赖 console 在线（console 不可达时用 stale 缓存，连缓存都没有则回退本地凭据）。仅支持 `provider: openai`，需安装 plaita-nodes；配置项详见 `config.example.yaml` 的 screener 段注释。
+  - `decision` —— 复用 [plaita-nodes](../plaita-nodes) 的 **DecisionNode** 结构化决策原子：封闭决策空间 `{safe, unsafe}` + 置信度。低于 `min_confidence`（默认 0.8）只标记 `low_confidence`，交 keeper 转人工/重试——**不写 blocked、不发指控评论**（把 classic 提示词里「模棱两可→保守」量化为可调阈值）。仅支持 `provider: openai`，需安装 plaita-nodes；判定结果带 `confidence` 字段（Verdict），可观测可审计。
+  - `flow` —— 判定配置来自 [plaita-console](../plaita) 上已发布的 `issue-screener` flow 定义（supervisor 自迭代管线管着它的版本与质量）：按 semver 最高取已发布版本，经 `X-Admin-API-Key` 鉴权拉取；按 `refresh_secs` TTL 刷新并落盘本地缓存，本地 DecisionNode 执行——判定路径不依赖 console 在线（console 不可达时用 stale 缓存，连缓存都没有则回退本地凭据）。定义里 `choices` 为空、`on_low_confidence` 非白名单值（`passthrough|default|error`）、占位符残留（非 `$ENV.X` / `$INPUT.*`）都判「定义不可用」→ 走服务故障重试，不会让整轮扫描中断。仅支持 `provider: openai`，需安装 plaita-nodes；配置项详见 `config.example.yaml` 的 screener 段注释。
+- **判定三态**（issue #5）：screener 出口区分三种结局，keeper 分别处置（`Verdict.error` / `Verdict.low_confidence`）：
+  - 模型判 unsafe（带置信度）→ 拦截（`blocked`）+ 指控通告；
+  - 低置信（低于 `min_confidence`，含被定义 `default_choice` 换成 safe 的情形）→ **不拦截**、不消费，退避自动重试 / 转人工确认；
+  - screener 自身故障（HTTP / 网络 / 解析 / 定义非法）→ **不拦截**、不消费，N 次重试后升级人工（评论 + `needs-human` 标签）。
 - **凭据复用**：可以直接配 `api_key`/`base_url`/`model`（推荐 DeepSeek），也可以用 `credentials_from_profile` 复用某个 AgentProc profile 的凭据。
 - **可信作者**（`screener.trusted_authors`，可选）：名单内作者（GitHub 登录名，大小写不敏感）的 issue 正文与评论**完全跳过判定**——不调用模型、不产生拦截评论，也免去排队期间每轮的重复筛。默认空名单=一切照常。适用场景：核心贡献者批量提交时，判定层对同一内容反复产生「边缘误拦」（实测 0.9-0.95 置信震荡）。**名单等于「视为无注入风险」**，填写前请自行评估信任面；机制与名单分离，代码不含任何内置名单。
 - **fail-safe**：必须显式声明 `screener.enabled`。不写 `screener` 段、或 `enabled: true` 但缺凭据，程序都拒绝启动。
 - **判定不安全时**：
   - `on_unsafe: skip`（默认）——静默跳过 + WARNING 日志，不在 GitHub 发任何东西。
   - `on_unsafe: comment` ——跳过 + 在对应 issue/PR 上发一条「已被安全过滤跳过」的提示评论（措辞中性，不含原文）。
+    服务故障与低置信两类通告走独立文案（「安全过滤服务故障，待重试」/「置信度不足，已转人工确认」），措辞不含任何指控——它们不是内容问题。
 
 ## 可插拔的 issue 来源（IssueSource）
 
@@ -540,7 +545,9 @@ python -m pytest -q                         # 264 个用例：screener / config 
 ```
 
 - 资源 key 规范：issue 为纯数字（如 `"42"`），PR 为 `"pr:5"`，二者会话隔离。
-- `blocked: true` 表示该资源被安全过滤拦截，后续不再自动处理。
+- `blocked: true` 只在**模型判定内容 unsafe（注入/越权）**时置位，该资源不再自动处理。
+  低置信与 screener 服务故障不置 `blocked`：它们写 `retry_after`（退避重试，连击记在
+  `screener_retry_streak`）到一定次数后升级人工加 `needs-human` 标签（#5）。
 - 想重新处理某个资源：删除该条目（或整个文件）即可。
 - 旧版 state.json（字段名为 `issues` 而非 `items`）会被自动迁移。
 

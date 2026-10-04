@@ -9,8 +9,9 @@
 - 三种后端（screener.backend）：
     * classic  —— 本模块内置实现。支持 openai 兼容与 anthropic 两种协议。
     * decision —— 复用 plaita-nodes 的 DecisionNode（结构化决策：封闭决策空间
-      {safe, unsafe} + 置信度门控）。低置信按不安全处理（fail-safe 与 classic
-      的「模棱两可→保守」等价，且量化为阈值）。仅支持 openai 兼容端点。
+      {safe, unsafe} + 置信度门控）。低于 min_confidence 的判定标记
+      `Verdict.low_confidence` 交 keeper 分流（转人工/重试），不计入「服务故障」。
+      仅支持 openai 兼容端点。
     * flow     —— 判定配置来自 plaita-console 里一条已发布的 flow 定义
       （supervisor 自迭代管线的产物）：按 TTL 拉取最新已发布版本（semver 最高者）
       并落盘缓存；本地仍用 DecisionNode 执行，判定路径不依赖 console 在线。
@@ -18,6 +19,10 @@
       凭据（建议照常配置）。定义中的 $ENV.X 从本进程环境展开。
 - 凭据来源：可从 bridge profile YAML 抠出，也可在 config 直接写。
 
+判定出口三态（issue #5）：模型判 unsafe（`safe=False, error=False`，带置信度）／
+低置信（`low_confidence` 为实测置信度，仅低于阈值时非 None）／screener 自身故障
+（`error=True`，无置信度）。三者都保持「不通过」的 fail-safe 方向，但分流策略由
+keeper 决定——把猜测或故障当成「模型判注入」会把它们永久拉黑。
 classic 判定输出：严格 JSON {safe: bool, reason: str}，由 _extract_json 解析。
 解析失败按不安全处理（fail-safe）。
 """
@@ -101,6 +106,13 @@ class Verdict:
     reason: str = ""
     raw: str = ""  # screener 原始返回，便于排错
     confidence: float = 0.0  # decision 后端：判定置信度（classic 无此数据，恒 0）
+    # screener 自身故障（HTTP/网络/解析/定义非法/依赖缺失），不是模型判定。
+    error: bool = False
+    # 模型判了但低于 min_confidence：存**实测置信度**，未低置信时 None。
+    # keeper 的分流判据必须是「本字段非 None」——线上定义
+    # on_low_confidence=default + default_choice=safe 会把低置信 unsafe 换成 safe，
+    # 只看 `safe` 已无法表达「不确定」。
+    low_confidence: float | None = None
 
 
 def _expand_env(value: Any) -> str:
@@ -304,37 +316,47 @@ _DECISION_CHOICES = {
 def _screen_decision(text: str, cfg: ScreenerConfig, *, source_label: str) -> Verdict:
     """decision 后端：复用 plaita-nodes DecisionNode 做结构化判定。
 
-    fail-safe 语义与 classic 对齐：低置信（低于 min_confidence，on_low_confidence=
-    error 抛错）与任何异常都按不安全处理——对应 classic 提示词里「模棱两可→保守」。
+    「模型判 unsafe（带置信度）」与「screener 自身故障（error=True，无置信度）」
+    严格分开：低置信不再转成异常（原 on_low_confidence="error" 会把「不确定」
+    伪装成「服务故障」），改由 `low_confidence` 带出交 keeper 分流。
     """
     if _DecisionNode is None:
         log.error(
             "screener backend=decision 需要 plaita-nodes（pip install -e ../plaita-nodes）[%s]",
             source_label)
-        return Verdict(safe=False, reason="decision 后端缺少 plaita-nodes")
+        return Verdict(safe=False, reason="decision 后端缺少 plaita-nodes", error=True)
 
-    node = _DecisionNode(
-        id="screener",
-        question=_DECISION_QUESTION,
-        choices=_DECISION_CHOICES,
-        input=_truncate(text, cfg.max_chars),
-        provider="llm",
-        api_base=cfg.base_url,
-        api_key=cfg.api_key,
-        model=cfg.model,
-        extra_body=cfg.extra_body,
-        timeout_secs=30,
-        min_confidence=cfg.min_confidence,
-        on_low_confidence="error",
-    )
     try:
+        node = _DecisionNode(
+            id="screener",
+            question=_DECISION_QUESTION,
+            choices=_DECISION_CHOICES,
+            input=_truncate(text, cfg.max_chars),
+            provider="llm",
+            api_base=cfg.base_url,
+            api_key=cfg.api_key,
+            model=cfg.model,
+            extra_body=cfg.extra_body,
+            timeout_secs=30,
+            min_confidence=cfg.min_confidence,
+            # 定义里的 `error` 是旧策略（低置信当故障）；低置信语义现由
+            # Verdict.low_confidence 承担，本地一律 passthrough，策略归 keeper。
+            on_low_confidence="passthrough",
+        )
         out = node.execute(_PassThroughExecution())
-    except Exception as exc:  # noqa: BLE001 —— fail-safe：低置信/网络/解析异常一律不安全
-        log.error("screener(decision) 判定失败，按不安全处理 [%s]: %s", source_label, exc)
-        return Verdict(safe=False, reason=f"decision 后端: {exc}")
+    except Exception as exc:  # noqa: BLE001 —— 网络/解析/构造异常都属 screener 自身故障
+        log.error("screener(decision) 判定失败（按服务故障处理）[%s]: %s", source_label, exc)
+        return Verdict(safe=False, reason=f"decision 后端: {exc}", error=True)
 
-    safe = out["choice"] == "safe"
-    confidence = float(out["confidence"])
+    confidence = float(out.get("confidence") or 0.0)
+    low = out.get("low_confidence")
+    low = bool(low) if low is not None else confidence < float(cfg.min_confidence)
+    if low:
+        return Verdict(safe=False, raw=str(out.get("raw") or ""), confidence=confidence,
+                       low_confidence=confidence,
+                       reason=f"判定置信度 {confidence:.2f} 低于阈值 "
+                              f"{cfg.min_confidence:.2f}，转入人工确认")
+    safe = out.get("choice") == "safe"
     reason = "" if safe else f"判定为注入风险（置信度 {confidence:.2f}）"
     log.debug("[%s] screener(decision): choice=%s confidence=%.2f",
               source_label, out["choice"], confidence)
@@ -346,6 +368,9 @@ def _screen_decision(text: str, cfg: ScreenerConfig, *, source_label: str) -> Ve
 # ---------------------------------------------------------------------------
 
 _FLOW_ENV_RE = re.compile(r"^\$ENV\.(\w+)$")
+_FLOW_INPUT_RE = re.compile(r"^\$INPUT(\.\w+)*$")
+_FLOW_PLACEHOLDER_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_.]*")
+_FLOW_ALLOWED_ON_LOW_CONFIDENCE = frozenset({"passthrough", "default", "error"})
 
 
 def _semver_key(version: str):
@@ -417,13 +442,35 @@ def _fetch_published_definition(cfg: ScreenerConfig) -> tuple[str, str]:
     return str(current["version"]), definition
 
 
+def _flow_field_placeholder_ok(raw: Any) -> bool:
+    """定义字段的原始字符串里不得残留未知占位符。
+
+    只有 `$ENV.<NAME>` 与 `$INPUT[.字段]` 会被 `_resolve_flow_field` 解析；其余
+    `$xxx`（如模板残留的 `$your_answer`）会原样进问句被 LLM 回显（→「未返回 JSON
+    决策对象」）或在端点字段静默变 None。校验只看原始字符串，不看解析结果。"""
+    if not isinstance(raw, str):
+        return True
+    for m in _FLOW_PLACEHOLDER_RE.finditer(raw):
+        token = m.group(0)
+        if _FLOW_ENV_RE.match(token) or _FLOW_INPUT_RE.match(token):
+            continue
+        log.error("screener(flow) 定义字段含未知占位符 %s: %r", token, raw[:200])
+        return False
+    return True
+
+
 def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> dict[str, Any] | None:
-    """从定义里取出 decision 节点配置并解析表达式；找不到 decision 节点返回 None。
+    """从定义里取出 decision 节点配置并解析表达式；定义缺失/非法返回 None。
 
     ⚠️ 字段白名单式提取——定义里新增的、对判定行为有影响的字段必须在这里显式
     透传，否则「发布成功但行为不变」：2026-10-04 实证定义 1.0.5 的
     default_choice/timeout_secs 就被本函数静默丢弃（on_low_confidence=default
-    缺 default_choice → 本地 DecisionNode 校验失败 → fail-safe 全拦）。"""
+    缺 default_choice → 本地 DecisionNode 校验失败 → fail-safe 全拦）。
+
+    同时拒绝「确定坏」的定义（choices 空、on_low_confidence 非白名单、占位符
+    残留）：一律 log.error + 返回 None，交给 `_screen_flow` 走「定义不可用」
+    （error 家族，重试即可）。绝不抛异常——`_DecisionNode` 的 pydantic 校验
+    异常会逃出 `screen()` 并让整轮扫描中止（2026-10-04 潜在停摆）。"""
     try:
         data = json.loads(definition)
     except ValueError:
@@ -432,6 +479,21 @@ def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> di
     for node in data.get("nodes", []):
         if node.get("type") != "decision":
             continue
+        choices = node.get("choices")
+        if not isinstance(choices, (dict, list)) or not choices:
+            log.error("screener(flow) 定义非法：choices 必须是非空映射/列表（got %r）", choices)
+            return None
+        on_low = node.get("on_low_confidence", "passthrough")
+        if on_low not in _FLOW_ALLOWED_ON_LOW_CONFIDENCE:
+            log.error("screener(flow) 定义非法：on_low_confidence=%r 不在 %s",
+                      on_low, sorted(_FLOW_ALLOWED_ON_LOW_CONFIDENCE))
+            return None
+        if on_low == "default" and node.get("default_choice") is None:
+            log.error("screener(flow) 定义非法：on_low_confidence=default 缺 default_choice")
+            return None
+        for field in ("question", "api_base", "api_key", "model"):
+            if not _flow_field_placeholder_ok(node.get(field)):
+                return None
         min_conf = node.get("min_confidence", cfg.min_confidence)
         try:
             min_conf = float(min_conf)
@@ -449,7 +511,7 @@ def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> di
             "model": _resolve_flow_field(node.get("model"), text),
             "extra_body": node.get("extra_body"),
             "min_confidence": min_conf,
-            "on_low_confidence": node.get("on_low_confidence", "error"),
+            "on_low_confidence": on_low,
             "default_choice": node.get("default_choice"),
             "timeout_secs": timeout,
         }
@@ -484,49 +546,71 @@ def _screen_flow(text: str, cfg: ScreenerConfig, *, source_label: str) -> Verdic
     if definition:
         dcfg = _flow_decision_config(definition, text, cfg)
         if dcfg is not None:
-            node = _DecisionNode(
-                id="screener",
-                input=_truncate(text, cfg.max_chars),
-                provider="llm",
-                **dcfg,   # timeout_secs/default_choice 随定义透传（见 _flow_decision_config）
-            )
+            min_conf = float(dcfg["min_confidence"])
+            node_kwargs = dict(dcfg)
+            if node_kwargs.get("on_low_confidence") == "error":
+                # 定义里的 `error` 是旧策略（低置信当故障抛错）；低置信语义现由
+                # Verdict.low_confidence 承担，本地一律 passthrough，策略归 keeper。
+                node_kwargs["on_low_confidence"] = "passthrough"
             try:
+                node = _DecisionNode(
+                    id="screener",
+                    input=_truncate(text, cfg.max_chars),
+                    provider="llm",
+                    **node_kwargs,  # timeout_secs/default_choice 随定义透传（见上）
+                )
                 out = node.execute(_PassThroughExecution())
-            except Exception as exc:  # noqa: BLE001 —— fail-safe：低置信/网络/解析异常一律不安全
-                log.error("screener(flow) 判定失败，按不安全处理 %s@%s [%s]: %s",
+            except Exception as exc:  # noqa: BLE001 —— 构造/网络/解析异常都属自身故障
+                log.error("screener(flow) 判定失败（按服务故障处理）%s@%s [%s]: %s",
                           cfg.console_flow_id, version, source_label, exc)
-                return Verdict(safe=False, reason=f"flow 后端: {exc}")
-            safe = out["choice"] == "safe"
-            confidence = float(out["confidence"])
+                return Verdict(safe=False, reason=f"flow 后端: {exc}", error=True)
+            confidence = float(out.get("confidence") or 0.0)
+            low = out.get("low_confidence")
+            low = bool(low) if low is not None else confidence < min_conf
+            if low:
+                log.debug("[%s] screener(flow): %s@%s 低置信 choice=%s confidence=%.2f",
+                          source_label, cfg.console_flow_id, version,
+                          out.get("choice"), confidence)
+                return Verdict(safe=False, raw=str(out.get("raw") or ""),
+                               confidence=confidence, low_confidence=confidence,
+                               reason=f"判定置信度 {confidence:.2f} 低于阈值 "
+                                      f"{min_conf:.2f}，转入人工确认")
+            safe = out.get("choice") == "safe"
             log.debug("[%s] screener(flow): %s@%s choice=%s confidence=%.2f",
                       source_label, cfg.console_flow_id, version,
-                      out["choice"], confidence)
+                      out.get("choice"), confidence)
             reason = "" if safe else f"判定为注入风险（置信度 {confidence:.2f}）"
             return Verdict(safe=safe, reason=reason, raw=out["raw"], confidence=confidence)
-        log.error("screener(flow) 定义中没有 decision 节点，回退本地凭据 [%s]", source_label)
+        # 定义存在但不可用（无 decision 节点 / 定义非法）：这是「定义问题」，
+        # 不能静默回退本地凭据——那会把定义问题伪装成判定问题。
+        log.error("screener(flow) 判定定义不可用 %s@%s [%s]，按服务故障处理",
+                  cfg.console_flow_id, version, source_label)
+        return Verdict(safe=False, error=True,
+                       reason=f"flow 后端: 判定定义不可用（{cfg.console_flow_id}@{version}）")
 
-    # 兜底：用本地 classic/decision 凭据继续判定（配置了才可用）
+    # 兜底：完全没有定义（无缓存且拉取失败）时用本地 classic/decision 凭据继续判定
     if cfg.api_key and cfg.base_url and cfg.model:
         fallback_backend = "decision" if _DecisionNode is not None else "classic"
         local = ScreenerConfig(**{**cfg.__dict__,
                                   "backend": fallback_backend,
                                   "console_url": None, "console_api_key": None})
         return screen(text, local, source_label=f"{source_label}|flow-fallback")
-    return Verdict(safe=False, reason="flow 后端不可用且无本地回退凭据")
+    return Verdict(safe=False, reason="flow 后端不可用且无本地回退凭据", error=True)
 
 
 def screen(text: str, cfg: ScreenerConfig, *, source_label: str = "") -> Verdict:
     """对一段文本做安全判定。
 
     text 是发给主 agent 之前的完整消息（已经组装好标题/作者/正文/链接）。
-    任何失败（HTTP 错误、解析失败、超时）都按不安全处理（fail-safe）。
+    任何失败（HTTP 错误、解析失败、超时）都按不安全处理（fail-safe）并标
+    `error=True`——它们是 screener 自身故障，不是模型判定。
     """
     if cfg.backend == "flow":
         return _screen_flow(text, cfg, source_label=source_label)
 
     if not cfg.api_key or not cfg.base_url or not cfg.model:
         log.error("screener 配置不完整（缺 api_key/base_url/model），按不安全处理 [%s]", source_label)
-        return Verdict(safe=False, reason="screener 未配置完整凭据")
+        return Verdict(safe=False, reason="screener 未配置完整凭据", error=True)
 
     if cfg.backend == "decision":
         return _screen_decision(text, cfg, source_label=source_label)
@@ -541,18 +625,18 @@ def screen(text: str, cfg: ScreenerConfig, *, source_label: str = "") -> Verdict
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8", errors="replace")[:500]
         log.error("screener HTTP 错误 [%s]: %s %s", source_label, e.code, err)
-        return Verdict(safe=False, reason=f"screener HTTP {e.code}", raw=err)
+        return Verdict(safe=False, reason=f"screener HTTP {e.code}", raw=err, error=True)
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         log.error("screener 网络错误 [%s]: %s", source_label, e)
-        return Verdict(safe=False, reason=f"screener 网络错误: {e}")
+        return Verdict(safe=False, reason=f"screener 网络错误: {e}", error=True)
     except (json.JSONDecodeError, KeyError, IndexError) as e:
         log.error("screener 响应解析错误 [%s]: %s", source_label, e)
-        return Verdict(safe=False, reason=f"screener 响应解析失败: {e}")
+        return Verdict(safe=False, reason=f"screener 响应解析失败: {e}", error=True)
 
     parsed = _extract_json(text_out)
     if parsed is None:
         log.warning("screener 返回无法解析为 JSON [%s]: %r", source_label, text_out[:300])
-        return Verdict(safe=False, reason="screener 输出非 JSON", raw=text_out)
+        return Verdict(safe=False, reason="screener 输出非 JSON", raw=text_out, error=True)
 
     safe = bool(parsed.get("safe"))
     reason = str(parsed.get("reason") or "").strip()

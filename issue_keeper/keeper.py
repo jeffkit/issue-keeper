@@ -40,13 +40,30 @@ _UNSAFE_COMMENT_BODY = (
     "判定详情：{reason}维护者可人工查看；确认误拦可清状态重新入队。"
 )
 
+# 「screener 没判出来」的两种公开文案（#5）——措辞刻意不含指控：低置信是猜测、
+# 服务故障与内容无关，都不能说成「疑似注入」。
+_SCREENER_ERROR_COMMENT_BODY = (
+    "⚠️ 安全过滤服务故障，待重试：issue-keeper 的前置安全过滤本轮未能完成判定"
+    "（与内容无关）。本轮跳过自动处理，稍后自动重试，连续失败会升级人工。"
+    "故障详情：{reason}"
+)
+
+_SCREENER_UNCERTAIN_COMMENT_BODY = (
+    "⏳ 本条内容的安全判定置信度不足（{confidence}），已转人工确认，本轮跳过自动处理。"
+    "维护者确认无误后可清状态重新入队。"
+)
+
+
+def _scrub_reason(reason: str) -> str:
+    """判定原因会发到公开 issue 上：压成一行、截断，避免内部长报错刷屏。"""
+    text = " ".join(str(reason or "").split())
+    return text[:200] + ("…" if len(text) > 200 else "")
+
 
 def _public_reason(reason: str) -> str:
-    """拦截原因会发到公开 issue 上：压成一行、截断，避免内部长报错刷屏。"""
-    text = " ".join(str(reason or "").split())
-    if not text:
-        return "疑似指令注入或越权诱导（screener 未给出原因）"
-    return text[:200] + ("…" if len(text) > 200 else "")
+    """unsafe 通告用的原因：空值兜底为「疑似注入」提示（故障文案不走这里）。"""
+    return _scrub_reason(reason) or "疑似指令注入或越权诱导（screener 未给出原因）"
+
 
 # 给 agent 的系统提示，告诉它角色和能力。不提 stdout / 协议细节。
 _AGENT_PREAMBLE = (
@@ -195,17 +212,47 @@ def _publish_reply(
     log.info("[%s] 已发表 agent 评论（礼仪化 %d → %d 字符）", label, len(raw_text), len(text))
 
 
+def _post_notice(
+    source: IssueSource, binding: RepoBinding, res: Resource,
+    bot_marker: str, visible_prefix: str, body: str,
+) -> None:
+    """发一条系统通告：统一拼防循环头（marker + 可见前缀）。
+
+    三种通告（unsafe / 服务故障 / 低置信）共用——缺任一层都会被自己再筛一遍，
+    形成「自己回自己的评论」循环（AGENTS.md 禁止项③）。"""
+    source.post_comment(binding.repo, res, f"{bot_marker}\n{visible_prefix}\n{body}")
+
+
 def _post_unsafe_notice(
     source: IssueSource, binding: RepoBinding, res: Resource,
     bot_marker: str, visible_prefix: str, reason: str = "",
 ) -> None:
-    body = (
-        f"{bot_marker}\n{visible_prefix}\n"
-        f"{_UNSAFE_COMMENT_BODY.format(reason=_public_reason(reason))}"
-    )
-    source.post_comment(binding.repo, res, body)
+    body = _UNSAFE_COMMENT_BODY.format(reason=_public_reason(reason))
+    _post_notice(source, binding, res, bot_marker, visible_prefix, body)
     log.info("[%s %s#%d] 已发表安全过滤提示评论（reason=%s）",
              binding.repo, res.kind, res.number, _public_reason(reason))
+
+
+def _post_screener_error_notice(
+    source: IssueSource, binding: RepoBinding, res: Resource,
+    bot_marker: str, visible_prefix: str, reason: str = "",
+) -> None:
+    """服务故障通告：明示「安全过滤服务故障，待重试」，不回显置信度。"""
+    body = _SCREENER_ERROR_COMMENT_BODY.format(reason=_scrub_reason(reason) or "未记录")
+    _post_notice(source, binding, res, bot_marker, visible_prefix, body)
+    log.info("[%s %s#%d] 已发表 screener 服务故障通告（reason=%s）",
+             binding.repo, res.kind, res.number, _scrub_reason(reason) or "未记录")
+
+
+def _post_screener_uncertain_notice(
+    source: IssueSource, binding: RepoBinding, res: Resource,
+    bot_marker: str, visible_prefix: str, confidence: float = 0.0,
+) -> None:
+    """低置信通告：只带实测置信度，不带 verdict.reason（可能含「注入风险」字样）。"""
+    body = _SCREENER_UNCERTAIN_COMMENT_BODY.format(confidence=f"{confidence:.2f}")
+    _post_notice(source, binding, res, bot_marker, visible_prefix, body)
+    log.info("[%s %s#%d] 已发表 screener 低置信通告（confidence=%.2f）",
+             binding.repo, res.kind, res.number, confidence)
 
 
 def _ensure_profile(binding: RepoBinding, cache: dict[str, ProfileEntry]) -> ProfileEntry:
@@ -218,16 +265,74 @@ def _ensure_profile(binding: RepoBinding, cache: dict[str, ProfileEntry]) -> Pro
 def _screen_or_block(
     message: str, cfg: ScreenerConfig, source_label: str
 ) -> Verdict:
-    """返回 Verdict；.safe 为 True 表示通过安全过滤，可以投递给 agent。"""
+    """返回 Verdict；.safe 为 True 表示通过安全过滤，可以投递给 agent。
+
+    注意：`.safe` 不区分「模型判 unsafe」与「低置信/服务故障」——分流看
+    `_screener_disposition`。"""
     verdict = screen_text(message, cfg, source_label=source_label)
-    if verdict.safe:
+    if verdict.safe and verdict.low_confidence is None:
         log.debug("[%s] screener 通过: %s", source_label, verdict.reason)
         return verdict
     log.warning(
-        "[%s] screener 拦截: reason=%s raw=%r",
-        source_label, verdict.reason, verdict.raw[:200],
+        "[%s] screener 未通过（error=%s low_confidence=%s）: reason=%s raw=%r",
+        source_label, verdict.error, verdict.low_confidence, verdict.reason,
+        verdict.raw[:200],
     )
     return verdict
+
+
+_SCREENER_RETRY_LIMIT = 3  # 未判定的重试上限：到顶升级人工（不写 blocked）
+
+
+def _screener_disposition(verdict: Verdict, screener: ScreenerConfig) -> str:
+    """screener 结果的四分流：error / uncertain / pass / block。
+
+    铁律：低置信只看 `verdict.low_confidence`，不能只看 `safe`——线上定义
+    `on_low_confidence=default + default_choice=safe` 会把低置信的 unsafe 换成
+    safe 后返回，`safe` 已无法表达「不确定」。"""
+    if verdict.error:
+        return "error"
+    if verdict.low_confidence is not None:
+        return "uncertain"
+    if verdict.safe:
+        return "pass"
+    return "block"
+
+
+def _hold_for_screener(
+    src: IssueSource, binding: RepoBinding, config: Config, res: Resource,
+    screener: ScreenerConfig, it: ItemState, verdict: Verdict, *,
+    visible_prefix: str, label: str,
+) -> None:
+    """「没判出来」的公共处置（低置信 / 服务故障）：不拉黑、不消费，退避重试。
+
+    与 blocked 的区别（#5）：这两类不是「内容有问题」，只是「没判出来」——
+    写 blocked 会把猜测与故障永久拉黑（10-03/10-04 实证 44 条拦截里 22 条是
+    自身故障），因此只推 retry_after 让下轮重试；连击到上限再升级人工。"""
+    it.screener_retry_streak = int(getattr(it, "screener_retry_streak", 0) or 0) + 1
+    streak = it.screener_retry_streak
+    it.retry_after = time.time() + _retry_later_backoff(config, streak)
+    disp = _screener_disposition(verdict, screener)
+    log.warning("[%s] screener 未判定（%s，第 %d 次，%.0fs 后重试）: %s",
+                label, disp, streak, it.retry_after - time.time(), verdict.reason)
+    if streak == 1 and screener.on_unsafe == "comment":
+        if disp == "error":
+            _post_screener_error_notice(src, binding, res, config.bot_marker,
+                                        visible_prefix, reason=verdict.reason)
+        else:
+            _post_screener_uncertain_notice(src, binding, res, config.bot_marker,
+                                            visible_prefix,
+                                            confidence=verdict.low_confidence or 0.0)
+        return
+    if streak >= _SCREENER_RETRY_LIMIT:
+        why = "服务故障" if disp == "error" else "置信度不足"
+        body = (f"⚠️ 安全过滤连续 {streak} 次未能判定本条内容（{why}），"
+                f"已升级人工处理（标签 {config.pipeline_needs_human_label}）。"
+                f"详情：{_scrub_reason(verdict.reason) or '未记录'}")
+        _post_notice(src, binding, res, config.bot_marker, visible_prefix, body)
+        _gh_add_label(res.kind, binding.repo, res.number,
+                      config.pipeline_needs_human_label)
+        log.warning("[%s] screener 连续 %d 次未判定（%s），升级人工", label, streak, disp)
 
 
 def _author_trusted_by_screener(config, author: str | None) -> bool:
@@ -488,11 +593,21 @@ def _process_resource(
                 log.debug("[%s] 作者 %s 在 screener 可信名单，跳过安全过滤", label, res.author)
             elif screener.enabled:
                 verdict = _screen_or_block(message, screener, source)
-                if not verdict.safe:
+                disp = _screener_disposition(verdict, screener)
+                if disp == "pass":
+                    it.screener_retry_streak = 0
+                elif disp == "block":
+                    # 只有「模型判 unsafe」才是内容问题：拉黑 + 指控通告
                     it.blocked = True
+                    it.screener_retry_streak = 0
                     if screener.on_unsafe == "comment":
                         _post_unsafe_notice(src, binding, res, config.bot_marker,
                                             visible_prefix, reason=verdict.reason)
+                    return 0
+                else:
+                    # 低置信 / 服务故障：不拉黑、不消费首响，退避重试 + 连击升级
+                    _hold_for_screener(src, binding, config, res, screener, it, verdict,
+                                       visible_prefix=visible_prefix, label=label)
                     return 0
 
             # 调 agent 前推到 doing
@@ -583,11 +698,20 @@ def _process_resource(
             log.debug("[%s] 评论作者 %s 在 screener 可信名单，跳过安全过滤", label, c.author)
         elif screener.enabled:
             verdict = _screen_or_block(message, screener, source)
-            if not verdict.safe:
+            disp = _screener_disposition(verdict, screener)
+            if disp == "pass":
+                it.screener_retry_streak = 0
+            elif disp == "block":
                 it.processed_comment_ids.add(c.id)
+                it.screener_retry_streak = 0
                 if screener.on_unsafe == "comment":
                     _post_unsafe_notice(src, binding, res, config.bot_marker,
                                         visible_prefix, reason=verdict.reason)
+                continue
+            else:
+                # 低置信 / 服务故障：不消费评论 id（消费掉就再也不会重判了）
+                _hold_for_screener(src, binding, config, res, screener, it, verdict,
+                                   visible_prefix=visible_prefix, label=label)
                 continue
 
         # 如果 issue 在 done/closed 状态收到新评论，推回 doing 重新处理
@@ -930,6 +1054,7 @@ def _clear_terminal_state(it: ItemState) -> None:
     it.wakeup_deps = []
     it.retry_after = None      # #8：人工 reopen 立即重派，不被上轮退避挡住
     it.retry_later_streak = 0  # #6：人工干预即重算连击，退避从 7min 起
+    it.screener_retry_streak = 0  # #5：同理，screener 连击从 0 重算
 
 
 def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:

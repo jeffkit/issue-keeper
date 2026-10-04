@@ -21,7 +21,7 @@ class ItemState:
     processed: bool = False  # 资源本体（首次创建）是否已处理
     session_id: str | None = None  # agent 返回的会话 uuid，用于续接
     processed_comment_ids: set[str] = field(default_factory=set)
-    blocked: bool = False  # 安全过滤命中，后续不再自动处理
+    blocked: bool = False  # 仅**模型判 unsafe** 时置位（服务故障/低置信走 retry_after）
     # 依赖唤醒监视（仅 issue）：pipeline 终态 blocked 时记录正文引用的依赖编号。
     # 每轮检查——依赖全部闭合（关闭/修复已进 origin/main）→ 清 processed 唤醒重跑。
     # 空列表 = 未在监视。
@@ -36,6 +36,9 @@ class ItemState:
     # retry-later 连击数（#6）：空转重派的指数退避基数；终态收尾/`reopen` 清零，
     # 派发成功不清零（空转重派靠它判「本轮是空转」→ 不补发认领评论）。
     retry_later_streak: int = 0
+    # screener 未判定连击数（#5）：模型没判出来（服务故障/低置信）时 +1，退避重试；
+    # 到上限升级人工。成功通过/终态收尾/`reopen` 清零。
+    screener_retry_streak: int = 0
     # 评论层异步任务（2026-10-01 评论层后台化）：comment_id(str) →
     # {"pid": int|None, "started_at": float, "attempts": int}。派发时写入、
     # 收尸后清除；daemon 重启后按 pid 存活接管（防重复调起）。
@@ -100,6 +103,7 @@ def load_state(path: Path) -> State:
             it.retry_after = (
                 float(idata["retry_after"]) if idata.get("retry_after") else None)
             it.retry_later_streak = int(idata.get("retry_later_streak") or 0)
+            it.screener_retry_streak = int(idata.get("screener_retry_streak") or 0)
             it.comment_tasks = dict(idata.get("comment_tasks") or {})
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
@@ -156,6 +160,7 @@ def _dump_state_dict(state: State) -> dict[str, Any]:
                     "in_flight_since": it.in_flight_since,
                     "retry_after": it.retry_after,
                     "retry_later_streak": it.retry_later_streak,
+                    "screener_retry_streak": it.screener_retry_streak,
                     "comment_tasks": it.comment_tasks,
                 }
                 for key, it in rs.items.items()
@@ -183,7 +188,7 @@ def save_state_item(
 
 _ITEM_FIELDS = ("processed", "session_id", "processed_comment_ids", "blocked",
                 "wakeup_deps", "in_flight_since", "retry_after", "retry_later_streak",
-                "comment_tasks")
+                "screener_retry_streak", "comment_tasks")
 
 
 def save_state_merged(path: Path, state: State, base: State) -> None:

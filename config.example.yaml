@@ -177,14 +177,19 @@ pipeline_repos:
 #
 # backend: classic     —— 内置实现（支持 openai / anthropic 两种协议）。默认。
 # backend: decision    —— 复用 plaita-nodes 的 DecisionNode：封闭决策空间
-#                         {safe, unsafe} + 置信度门控；低于 min_confidence 按
-#                         不安全处理（fail-safe，与 classic「模棱两可→保守」等价）。
+#                         {safe, unsafe} + 置信度门控；低于 min_confidence 只
+#                         标记 low_confidence，交 keeper 转人工/重试（不写
+#                         blocked、不发指控评论）。
 # backend: flow        —— 判定配置来自 plaita-console 上一条已发布的 flow
 #                         定义（supervisor 自迭代管线管着它的版本与质量）。
 #                         按 refresh_secs TTL 拉取并落盘缓存，本地 DecisionNode
 #                         执行——判定路径不依赖 console 在线；console 不可达时
 #                         用 stale 缓存，连缓存都没有则回退下方本地凭据。
 #                         定义里的 $ENV.X 从 daemon 进程环境展开。
+#                         定义校验：choices 必须非空；on_low_confidence 只接受
+#                         passthrough / default（需同时给 default_choice）/ error；
+#                         question/api_base/api_key/model 里只允许 $ENV.X 与
+#                         $INPUT[.字段] 占位符（其余 $xxx 判定义非法 → 服务故障重试）。
 #
 # flow 后端示例：
 # console:
@@ -210,7 +215,8 @@ screener:
   # 填名单即免除该层。填写前请自行评估信任面（该名单等于把这些人视为无注入风险）。
   # trusted_authors: [alice, bob]
   # backend: decision
-  # min_confidence: 0.8  # 仅 decision 后端生效
+  # min_confidence: 0.8  # 仅 decision 后端生效：低于此值只标记 low_confidence
+  #                      # （keeper 转人工/重试，不写 blocked）
 
 # ─── 项目绑定在哪里？──────────────────────────────────────────────────
 # 项目绑定（repo/agent_label/cwd/profile/source/monitor_prs/env/github_token/intro）
