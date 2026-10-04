@@ -2027,7 +2027,7 @@ def _reap_pipelines(config, state, bindings) -> int:
                     log.error("[%s] pipeline 超时（%ss），进程组已清",
                               label, config.pipeline_timeout_secs)
 
-                rec = _latest_pipeline_record(binding.repo, int(key), since) or {}
+                rec = _latest_pipeline_record(binding.repo, int(key.split(":")[-1]), since) or {}
                 status = rec.get("status") or "engine_error"
                 posted = bool(rec.get("comment_posted"))
                 err = str(rec.get("error") or "")

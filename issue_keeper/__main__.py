@@ -67,13 +67,16 @@ def _run_keeper(args) -> int:
         import time
         handled = run_once(config)
         if getattr(args, "wait", False):
-            from .state import load_state
+            import copy
+            from .state import load_state, save_state_merged
             from .keeper import _reap_pipelines  # noqa: PLC0415
             state = load_state(config.state_path)
-            while _count_in_flight_module(state):
+            while _count_in_flight(state):
                 time.sleep(30)
                 state = load_state(config.state_path)
-                _reap_pipelines(config, state)
+                base = copy.deepcopy(state)  # 轮内 diff 基线，与 run_once 同式
+                _reap_pipelines(config, state, config.repos)
+                save_state_merged(config.state_path, state, base)
         print(f"完成，本轮处理 {handled} 条。")
         return 0
 
