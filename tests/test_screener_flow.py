@@ -261,19 +261,19 @@ def test_flow_decision_config_passes_default_choice_and_timeout():
 
 def test_screener_trusted_authors_loader_and_bypass():
     """可信作者名单：loader 解析 + keeper 侧旁路判定（jeffkit 2026-10-04 拍板
-    「okguitar 完全可信」——其提交内容完全跳过 screener，免边缘误拦与重复筛）。"""
+    可信作者内容完全跳过 screener，免边缘误拦与重复筛；机制与名单分离，名单在部署配置）。"""
     from issue_keeper.keeper import _author_trusted_by_screener
     raw = {"enabled": True, "backend": "flow", "provider": "openai",
            "api_key": "k", "base_url": "https://x", "model": "m",
-           "trusted_authors": ["OKGuitar", " alice "],
+           "trusted_authors": ["Trusted-Dev", " alice "],
            "console": {"url": "http://127.0.0.1:8123", "api_key": "ck"}}
     cfg = _load_screener(raw)
-    assert cfg.trusted_authors == ("okguitar", "alice")
+    assert cfg.trusted_authors == ("trusted-dev", "alice")
 
     class _TopCfg:  # 顶层 Config 的最小替身（helper 走 config.screener）
         screener = cfg
-    assert _author_trusted_by_screener(_TopCfg, "okguitar") is True
-    assert _author_trusted_by_screener(_TopCfg, "OkGuItAr") is True
+    assert _author_trusted_by_screener(_TopCfg, "trusted-dev") is True
+    assert _author_trusted_by_screener(_TopCfg, "TRUSTED-DEV") is True
     assert _author_trusted_by_screener(_TopCfg, "alice") is True
     assert _author_trusted_by_screener(_TopCfg, "bob") is False
     assert _author_trusted_by_screener(_TopCfg, None) is False
@@ -285,9 +285,9 @@ def test_screener_trusted_authors_loader_and_bypass():
 
     class _TopCfg2:
         screener = cfg2
-    assert _author_trusted_by_screener(_TopCfg2, "okguitar") is False
+    assert _author_trusted_by_screener(_TopCfg2, "trusted-dev") is False
     # 类型错误防空名单静默失效
     bad = dict(raw)
-    bad["trusted_authors"] = "okguitar"
+    bad["trusted_authors"] = "trusted-dev"
     with pytest.raises(ValueError, match="trusted_authors"):
         _load_screener(bad)

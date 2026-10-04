@@ -142,6 +142,7 @@ GitHub issue/PR 是公开输入面，任何人都能在里面塞内容诱导 age
   - `decision` —— 复用 [plaita-nodes](../plaita-nodes) 的 **DecisionNode** 结构化决策原子：封闭决策空间 `{safe, unsafe}` + 置信度。低于 `min_confidence`（默认 0.8）按不安全处理——把 classic 提示词里「模棱两可→保守」量化为可调阈值。仅支持 `provider: openai`，需安装 plaita-nodes；判定结果带 `confidence` 字段（Verdict），可观测可审计。
   - `flow` —— 判定配置来自 [plaita-console](../plaita) 上已发布的 `issue-screener` flow 定义（supervisor 自迭代管线管着它的版本与质量）：按 semver 最高取已发布版本，经 `X-Admin-API-Key` 鉴权拉取；按 `refresh_secs` TTL 刷新并落盘本地缓存，本地 DecisionNode 执行——判定路径不依赖 console 在线（console 不可达时用 stale 缓存，连缓存都没有则回退本地凭据）。仅支持 `provider: openai`，需安装 plaita-nodes；配置项详见 `config.example.yaml` 的 screener 段注释。
 - **凭据复用**：可以直接配 `api_key`/`base_url`/`model`（推荐 DeepSeek），也可以用 `credentials_from_profile` 复用某个 AgentProc profile 的凭据。
+- **可信作者**（`screener.trusted_authors`，可选）：名单内作者（GitHub 登录名，大小写不敏感）的 issue 正文与评论**完全跳过判定**——不调用模型、不产生拦截评论，也免去排队期间每轮的重复筛。默认空名单=一切照常。适用场景：核心贡献者批量提交时，判定层对同一内容反复产生「边缘误拦」（实测 0.9-0.95 置信震荡）。**名单等于「视为无注入风险」**，填写前请自行评估信任面；机制与名单分离，代码不含任何内置名单。
 - **fail-safe**：必须显式声明 `screener.enabled`。不写 `screener` 段、或 `enabled: true` 但缺凭据，程序都拒绝启动。
 - **判定不安全时**：
   - `on_unsafe: skip`（默认）——静默跳过 + WARNING 日志，不在 GitHub 发任何东西。

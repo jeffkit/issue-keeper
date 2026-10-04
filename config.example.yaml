@@ -204,6 +204,11 @@ screener:
   model: deepseek-chat
   on_unsafe: skip        # skip（默认）/ comment
   max_chars: 8000
+  # 可信作者（GitHub 登录名，大小写不敏感）：其提交的 issue 正文/评论**完全跳过**
+  # screener**（不调判定模型、不发拦截评论）。默认空名单=一切照常。
+  # 适用场景：核心贡献者批量提交时，判定层对同一内容反复产生「边缘误拦」——
+  # 填名单即免除该层。填写前请自行评估信任面（该名单等于把这些人视为无注入风险）。
+  # trusted_authors: [alice, bob]
   # backend: decision
   # min_confidence: 0.8  # 仅 decision 后端生效
 

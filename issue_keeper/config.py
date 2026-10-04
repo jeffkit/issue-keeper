@@ -420,7 +420,7 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
 
     trusted_raw = raw.get("trusted_authors") or []
     if not isinstance(trusted_raw, (list, tuple)):
-        raise ValueError("screener.trusted_authors 需要是列表（GitHub 登录名，如 [okguitar]）")
+        raise ValueError("screener.trusted_authors 需要是列表（GitHub 登录名，如 [alice, bob]）")
     trusted_authors = tuple(str(a).strip().lower() for a in trusted_raw if str(a).strip())
 
     cfg = ScreenerConfig(
