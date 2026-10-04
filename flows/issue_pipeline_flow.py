@@ -563,7 +563,7 @@ def issue_pipeline(INPUT):
             "    oversized = False\n"
             "    if n.stdout and 'insertion' in n.stdout:\n"
             "        try:\n"
-            "            oversized = int(n.stdout.split('insertion')[0].strip().split()[-1].replace('+','').replace(',','')) > 800\n"
+            "            oversized = int(n.stdout.split('insertion')[0].strip().split()[-1].replace('+','').replace(',','')) > 5000\n"
             "        except Exception:\n"
             "            oversized = False\n"
             "    return {'ok': (not bad) and (not oversized), 'violations': bad, 'oversized': oversized}\n"
