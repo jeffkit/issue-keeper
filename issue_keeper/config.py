@@ -411,6 +411,11 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
     if extra_body is not None and not isinstance(extra_body, dict):
         raise ValueError("screener.extra_body 需要是映射（如 {reasoning_effort: low}）")
 
+    trusted_raw = raw.get("trusted_authors") or []
+    if not isinstance(trusted_raw, (list, tuple)):
+        raise ValueError("screener.trusted_authors 需要是列表（GitHub 登录名，如 [okguitar]）")
+    trusted_authors = tuple(str(a).strip().lower() for a in trusted_raw if str(a).strip())
+
     cfg = ScreenerConfig(
         enabled=enabled,
         provider=provider,
@@ -427,6 +432,7 @@ def _load_screener(raw: dict[str, Any]) -> ScreenerConfig:
         console_flow_id=(console.get("flow_id") or "issue-screener").strip(),
         console_refresh_secs=int(console.get("refresh_secs", 300)),
         console_cache_path=_expand_env(console.get("cache_path") or "").strip() or None,
+        trusted_authors=trusted_authors,
     )
 
     if cfg.enabled:

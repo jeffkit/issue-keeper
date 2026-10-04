@@ -89,6 +89,10 @@ class ScreenerConfig:
     console_flow_id: str = "issue-screener"
     console_refresh_secs: int = 300  # 已发布定义的拉取 TTL；TTL 内只用本地缓存
     console_cache_path: str | None = None  # 默认 ~/.issue-keeper/screener-flow.json
+    # 可信作者（GitHub 登录名，大小写不敏感）：其提交的内容**完全跳过** screener
+    # （jeffkit 2026-10-04 拍板：okguitar 完全可信）。命中的内容不调用判定模型，
+    # 也不产生任何拦截/提示评论——边缘误拦（0.95 边界）与重复筛的 token 一并消失。
+    trusted_authors: tuple[str, ...] = ()
 
 
 @dataclass

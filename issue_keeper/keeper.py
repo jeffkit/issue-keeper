@@ -229,6 +229,19 @@ def _screen_or_block(
     return verdict
 
 
+def _author_trusted_by_screener(config, author: str | None) -> bool:
+    """内容作者在 screener 可信名单（screener.trusted_authors）时完全跳过安全过滤。
+
+    jeffkit 2026-10-04 拍板：okguitar 完全可信——其 issue 正文/评论不再过判定
+    模型（省调用、免「边缘 0.95 误拦」与排队单每轮重复筛的累积拦截）。名单外
+    作者行为不变。"""
+    if not author:
+        return False
+    trusted = getattr(config.screener, "trusted_authors", ()) or ()
+    wanted = {str(a).strip().lower() for a in trusted if str(a).strip()}
+    return author.strip().lower() in wanted
+
+
 def _extract_issue_refs(text: str) -> list[int]:
     """正文里的 #N 引用（同仓裸数字）。去重保序，供依赖排序/唤醒监视用。"""
     import re
@@ -463,7 +476,9 @@ def _process_resource(
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
 
-            if screener.enabled:
+            if screener.enabled and _author_trusted_by_screener(config, res.author):
+                log.debug("[%s] 作者 %s 在 screener 可信名单，跳过安全过滤", label, res.author)
+            elif screener.enabled:
                 verdict = _screen_or_block(message, screener, source)
                 if not verdict.safe:
                     it.blocked = True
@@ -556,7 +571,9 @@ def _process_resource(
         message = _compose_comment_message(binding, res, c, src, _agent_label(binding, config), config)
         source = f"{label} comment {c.id}"
 
-        if screener.enabled:
+        if screener.enabled and _author_trusted_by_screener(config, c.author):
+            log.debug("[%s] 评论作者 %s 在 screener 可信名单，跳过安全过滤", label, c.author)
+        elif screener.enabled:
             verdict = _screen_or_block(message, screener, source)
             if not verdict.safe:
                 it.processed_comment_ids.add(c.id)
@@ -834,8 +851,9 @@ def keeper_patrol(
             keeper_binding, config, target_binding, res, comments, keeper_label,
         )
         source = f"[patrol] {label}"
-        if config.screener.enabled and not _screen_or_block(
-                message, config.screener, source).safe:
+        if (config.screener.enabled
+                and not _author_trusted_by_screener(config, res.author)
+                and not _screen_or_block(message, config.screener, source).safe):
             log.warning("[patrol] [%s] 被安全过滤跳过", label)
             # 仍推进快照，避免下轮反复筛
             state.mark_patrolled(key, res.updated_at, None)
