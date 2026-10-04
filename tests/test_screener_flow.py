@@ -230,3 +230,30 @@ def test_config_requires_console_settings_for_flow_backend():
     assert cfg.backend == "flow"
     assert cfg.console_url == "http://127.0.0.1:8123"
     assert cfg.console_api_key  # ${VAR} 已展开
+
+
+def test_flow_decision_config_passes_default_choice_and_timeout():
+    """定义字段白名单必须透传 default_choice/timeout_secs（2026-10-04 实证）。
+
+    不透传时：定义 1.0.5 的 on_low_confidence=default 缺 default_choice →
+    本地 DecisionNode 校验失败 → fail-safe 全拦（14:51 #97 误拦实证）；
+    定义里的 timeout_secs 放宽（90s 抗网关抖动）同样静默无效。"""
+    from issue_keeper.screener import _flow_decision_config
+    cfg = ScreenerConfig(enabled=True, provider="openai", api_key=None, base_url=None,
+                         model=None, on_unsafe="skip", max_chars=8000)
+    d = json.loads(json.dumps(DEF_110))
+    node = d["nodes"][1]
+    node["min_confidence"] = 0.9
+    node["on_low_confidence"] = "default"
+    node["default_choice"] = "safe"
+    node["timeout_secs"] = 90
+    out = _flow_decision_config(json.dumps(d), "text", cfg)
+    assert out is not None
+    assert out["on_low_confidence"] == "default"
+    assert out["default_choice"] == "safe"
+    assert out["timeout_secs"] == 90
+    assert out["min_confidence"] == 0.9
+    # 缺省回落：timeout=30（旧行为逐字保留）、default_choice=None
+    out2 = _flow_decision_config(json.dumps(DEF_110), "text", cfg)
+    assert out2["timeout_secs"] == 30
+    assert out2["default_choice"] is None

@@ -414,7 +414,12 @@ def _fetch_published_definition(cfg: ScreenerConfig) -> tuple[str, str]:
 
 
 def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> dict[str, Any] | None:
-    """从定义里取出 decision 节点配置并解析表达式；找不到 decision 节点返回 None。"""
+    """从定义里取出 decision 节点配置并解析表达式；找不到 decision 节点返回 None。
+
+    ⚠️ 字段白名单式提取——定义里新增的、对判定行为有影响的字段必须在这里显式
+    透传，否则「发布成功但行为不变」：2026-10-04 实证定义 1.0.5 的
+    default_choice/timeout_secs 就被本函数静默丢弃（on_low_confidence=default
+    缺 default_choice → 本地 DecisionNode 校验失败 → fail-safe 全拦）。"""
     try:
         data = json.loads(definition)
     except ValueError:
@@ -428,6 +433,10 @@ def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> di
             min_conf = float(min_conf)
         except (TypeError, ValueError):
             min_conf = cfg.min_confidence
+        try:
+            timeout = int(node.get("timeout_secs") or 30)
+        except (TypeError, ValueError):
+            timeout = 30
         return {
             "question": _resolve_flow_field(node.get("question"), text),
             "choices": node.get("choices") or {},
@@ -437,6 +446,8 @@ def _flow_decision_config(definition: str, text: str, cfg: ScreenerConfig) -> di
             "extra_body": node.get("extra_body"),
             "min_confidence": min_conf,
             "on_low_confidence": node.get("on_low_confidence", "error"),
+            "default_choice": node.get("default_choice"),
+            "timeout_secs": timeout,
         }
     return None
 
@@ -473,8 +484,7 @@ def _screen_flow(text: str, cfg: ScreenerConfig, *, source_label: str) -> Verdic
                 id="screener",
                 input=_truncate(text, cfg.max_chars),
                 provider="llm",
-                timeout_secs=30,
-                **dcfg,
+                **dcfg,   # timeout_secs/default_choice 随定义透传（见 _flow_decision_config）
             )
             try:
                 out = node.execute(_PassThroughExecution())
