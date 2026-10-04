@@ -254,6 +254,10 @@ class Config:
     # 同时刻在跑的管线 run 上限（跨仓；worktree 天然隔离不同 issue）。
     # 2026-09-29 派发解耦后 keeper 不再被长 run 阻塞，这个池子才有意义。
     pipeline_max_in_flight: int = 2
+    # 派发优先级仓（仓库全名，如 ["owner/repo"]）：名单内的仓在每轮扫描序里排最前，
+    # 槽位释放时先被派发——治理「排末位的仓被前序仓的失败-重试循环长期饿死」
+    # （2026-10-05 实证：recursive 批次被饿 8h）。空默认=纯扫描序，行为不变。
+    pipeline_priority_repos: tuple[str, ...] = ()
     # 派发时在 issue 上发一条「已认领」评论：多会话/多人并行的机器可读信号
     # （2026-09-29 与另一会话在同一 issue 撞车的教训）。
     pipeline_claim_comment: bool = True
@@ -540,6 +544,19 @@ def _load_pipeline(raw: dict) -> PipelineConfig:
     )
 
 
+def _order_repos(repos: list["RepoBinding"], priority: tuple[str, ...]) -> list["RepoBinding"]:
+    """按派发优先级重排仓库：priority 名单内的仓排最前，组内保持原序（稳定）。
+
+    keeper 每轮按本序扫描并在同轮内先到先得地占 pipeline_max_in_flight 槽位；
+    把要优先消化的仓放前面，即可在每次槽位释放时先被派发。空名单 = 原序返回
+    （纯扫描序，行为不变）。"""
+    prio = {str(p).strip() for p in priority if str(p).strip()}
+    if not prio:
+        return repos
+    return ([b for b in repos if b.repo in prio]
+            + [b for b in repos if b.repo not in prio])
+
+
 def load_config(path: str | os.PathLike) -> Config:
     p = Path(path).expanduser()
     if not p.exists():
@@ -594,6 +611,12 @@ def load_config(path: str | os.PathLike) -> Config:
     if not isinstance(allowlist_raw, list):
         raise ValueError("author_allowlist 必须是列表")
 
+    priority_raw = raw.get("pipeline_priority_repos") or []
+    if not isinstance(priority_raw, (list, tuple)):
+        raise ValueError("pipeline_priority_repos 需要是列表（仓库全名，如 [owner/repo]）")
+    pipeline_priority_repos = tuple(str(x).strip() for x in priority_raw if str(x).strip())
+    repos = _order_repos(repos, pipeline_priority_repos)
+
     cfg = Config(
         poll_interval_secs=int(raw.get("poll_interval_secs", 300)),
         state_file=_expand_path(state_file),
@@ -615,6 +638,7 @@ def load_config(path: str | os.PathLike) -> Config:
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
+        pipeline_priority_repos=pipeline_priority_repos,
         comment_max_in_flight=max(1, int(raw.get("comment_max_in_flight", 3))),
         # 2026-09-30 修复：与 max_in_flight 同款死旋钮——yaml 无人读取，恒为
         # 默认 2，#67/#70（各 2 run）被误判日上限锁死（runtime yaml 实配 10）。

@@ -845,3 +845,21 @@ def test_reopen_posts_status_comment(tmp_path):
         "select body from comments where project='a/b'").fetchall()
     assert any("issue-keeper-bot" in body and "重新入队" in body
                for (body,) in rows)
+
+
+# ── 派发优先级仓（跨仓饥饿治理，2026-10-05）────────────────────────
+def test_order_repos_priority_first_and_stable():
+    """priority 名单内的仓排最前，组内稳定保序；空名单原序返回。"""
+    from issue_keeper.config import _order_repos, RepoBinding
+    def rb(name):
+        return RepoBinding(repo=name, profile="claude-code")
+    repos = [rb("a/1"), rb("jeffkit/recursive"), rb("b/2"), rb("c/3")]
+    out = _order_repos(repos, ("jeffkit/recursive",))
+    assert [b.repo for b in out] == ["jeffkit/recursive", "a/1", "b/2", "c/3"]
+    # 多名单：仍按原序在组内稳定
+    out2 = _order_repos(repos, ("c/3", "jeffkit/recursive"))
+    assert [b.repo for b in out2] == ["jeffkit/recursive", "c/3", "a/1", "b/2"]
+    # 空名单 = 原序（行为不变）
+    assert _order_repos(repos, ()) == repos
+    # 名单里的仓不存在也不报错
+    assert [b.repo for b in _order_repos(repos, ("nope/x",))] == [b.repo for b in repos]

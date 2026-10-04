@@ -77,6 +77,10 @@ author_daily_limit_exempt: [okguitar]
 # engine_error 等）被反复重派：单轮 run 半小时起步，0 = 不限。到顶只推迟
 # 不消费——次日自动重试，人工处置后也可 `reopen` 立即重派。
 pipeline_issue_daily_limit: 2
+# 派发优先级仓：名单内的仓在每轮扫描序里排最前——槽位释放时先被派发，
+# 治理「排末位的仓被前序仓的失败-重试循环长期饿死」（2026-10-05：recursive
+# 批次被饿 8h 实证）。空/不写 = 纯扫描序（默认行为不变）。
+# pipeline_priority_repos: [owner/repo]
 # 失败类（status=failed）自动重派额度（#8）：首败自动重试一轮（台账 +1 run 记录，
 # 退避一个 poll 周期），耗尽后近 12h 连续 ≥2 次失败才升级人工（评论 + 标签）。
 # 0 = 不自动重试。失败类 run 不计入上面两道日限（配额与 reopen 解耦）。
