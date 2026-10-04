@@ -257,6 +257,13 @@ class Config:
     # 派发时在 issue 上发一条「已认领」评论：多会话/多人并行的机器可读信号
     # （2026-09-29 与另一会话在同一 issue 撞车的教训）。
     pipeline_claim_comment: bool = True
+    # 失败类（status=failed）自动重派额度（#8）：首败自动重试一轮（台账 +1 run
+    # 记录，退避一个 poll 周期），耗尽后近 12h 连续 ≥2 次失败才升级人工。
+    # 0 = 不重试（单次 failed 直接终态收尾；连击 ≥2 仍升级人工）。
+    failed_auto_retry: int = 1
+    # 升级人工时给 issue 打的标签（#8）：需先在仓库内存在（本工具不自动建标签）；
+    # internal 看板源无 label 接口，退化为仅评论。勿写进 opt_out_labels。
+    pipeline_needs_human_label: str = "needs-human"
     # 混合形态（定义归 console + 观测进 console，执行留本地 bridge）
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     # 回评礼仪化：agent 原始输出发布前消毒 + LLM 改写为 issue 礼仪评论。
@@ -614,6 +621,10 @@ def load_config(path: str | os.PathLike) -> Config:
         pipeline_issue_daily_limit=max(1, int(raw.get("pipeline_issue_daily_limit", 3))),
         pipeline_push_mode=(raw.get("pipeline_push_mode") or "branch").strip(),
         pipeline_review_mode=(raw.get("pipeline_review_mode") or "auto").strip(),
+        # #8：0 有意义（= 不自动重试），不能套 max(1, ...)
+        failed_auto_retry=max(0, int(raw.get("failed_auto_retry", 1))),
+        pipeline_needs_human_label=(
+            (raw.get("pipeline_needs_human_label") or "needs-human").strip() or "needs-human"),
         pipeline_test_commands={str(k): str(v) for k, v in pipeline_test_raw.items()},
         pipeline_repos=pipeline_repos,
         author_allowlist=[str(a).strip() for a in allowlist_raw if str(a).strip()],

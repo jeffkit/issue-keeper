@@ -439,6 +439,12 @@ def _process_resource(
     if getattr(it, "in_flight_since", None):
         return handled
 
+    # failed 自动重试的退避闸（#8）：reaper 判重试时写了 retry_after，到点前不派发。
+    ra = getattr(it, "retry_after", None)
+    if ra and time.time() < ra:
+        log.info("[%s] %s failed 自动重试退避中（%.0fs 后重派）", label, kind, ra - time.time())
+        return handled
+
     # ── review 状态自动 review ─────────────────────────────────────
     # issue 在 review 状态时，判断当前 keeper 是否应自动 review 通过
     if res.status == "review":
@@ -466,13 +472,13 @@ def _process_resource(
             # 故意不置 processed：日限会随日期重置、豁免名单也可能事后追加，
             # 一旦置了 processed 就只剩「新评论」能唤醒——#19/#23/#41-#44 就是
             # 这样被静默丢掉的（2026-09-28）。这里只推迟，不消费首次响应。
-            log.info("[%s] %s 作者 %s 今日触发次数已达上限，本轮跳过（未标记已处理，次日重试）",
-                     label, kind, res.author)
+            log.warning("[%s] %s 作者 %s 今日触发次数已达上限，本轮跳过（未标记已处理，次日重试）",
+                        label, kind, res.author)
         elif config.pipeline_mode and _issue_over_pipeline_limit(config, binding.repo, res.number):
             # 同 issue 管线日上限（#40 空转事故）：终态 issue 被拉回队列时不再
             # 无限重派整轮 run（半小时起步）。同样只推迟、不消费首次响应。
-            log.info("[%s] 本 issue 今日管线 run 已达上限（%d），本轮跳过（未标记已处理）",
-                     label, config.pipeline_issue_daily_limit)
+            log.warning("[%s] 本 issue 今日管线 run 已达上限（%d），本轮跳过（未标记已处理）",
+                        label, config.pipeline_issue_daily_limit)
         else:
             message = _compose_new_message(binding, res, src, _agent_label(binding, config), config)
             source = f"{label} body"
@@ -921,6 +927,7 @@ def _clear_terminal_state(it: ItemState) -> None:
     it.processed = False
     it.blocked = False
     it.wakeup_deps = []
+    it.retry_after = None      # #8：人工 reopen 立即重派，不被上轮退避挡住
 
 
 def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
@@ -981,6 +988,16 @@ def _author_allowed(config, author: str | None) -> bool:
     return author.lower() in allowed
 
 
+# 不计入日限的终态（#8）：环境闸的「没跑、等重试」与内容性失败——它们各自
+# 有自己的预算（failed_auto_retry + 连击升级即终态），配额语义上不是一次有效 run。
+_NON_QUOTA_STATUSES = ("retry-later", "failed", "guarded", "partial")
+
+
+def _counts_against_daily_limit(rec: dict) -> bool:
+    """该台账行是否消耗 issue/作者日限额度。"""
+    return rec.get("status") not in _NON_QUOTA_STATUSES
+
+
 def _author_over_limit(config, author: str | None) -> bool:
     """同作者每日触发次数限制（读 pipeline runs.jsonl 台账；台账缺失视为未超限）。
     豁免名单（author_daily_limit_exempt）内的作者不受限（大小写不敏感）。"""
@@ -1004,6 +1021,8 @@ def _author_over_limit(config, author: str | None) -> bool:
                 continue
             if (rec.get("author") or "").lower() == author.lower() \
                     and str(rec.get("ts", "")).startswith(today):
+                if not _counts_against_daily_limit(rec):
+                    continue                                     # #8 失败类不占额度
                 n += 1
     except Exception:
         return False
@@ -1057,8 +1076,8 @@ def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
                 continue
             if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number) \
                     and str(rec.get("ts", "")).startswith(today):
-                if rec.get("status") == "retry-later":
-                    continue                                     # 环境闸快速失败不占额度
+                if not _counts_against_daily_limit(rec):
+                    continue   # 环境闸快速失败/内容性失败不占额度（#8 解耦 reopen 配额）
                 n += 1
     except Exception:
         return False
@@ -1135,6 +1154,21 @@ def _gh_post_comment(kind: str, repo: str, number: int, body: str) -> None:
     r = _sp.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode != 0:
         raise RuntimeError(f"gh comment 失败: {(r.stderr or r.stdout or '')[-200:]}")
+
+
+def _gh_add_label(kind: str, repo: str, number: int, label: str) -> None:
+    """升级留痕：给 issue/PR 打标签。fail-open——标签不存在或无权限不阻塞收尾
+    （本工具不自动建标签；internal 看板源无 label 接口，调用方照常降级为仅评论）。"""
+    import subprocess as _sp
+    sub = "pr" if kind == "pr" else "issue"
+    try:
+        r = _sp.run(["gh", sub, "edit", str(number), "--repo", repo,
+                     "--add-label", label], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            log.warning("[gh] 打标签失败（%s#%s label=%s）: %s", repo, number, label,
+                        (r.stderr or r.stdout or "")[-200:])
+    except Exception as e:
+        log.warning("[gh] 打标签异常（%s#%s label=%s）: %s", repo, number, label, e)
 
 
 @lru_cache(maxsize=1)
@@ -1512,7 +1546,53 @@ def _consecutive_engine_errors(repo_full: str, number: int) -> int:
         return 0
     n = 0
     for s, exhausted in reversed(rows):
+        if s in _FAILURE_STATUSES:
+            continue                     # #8：内容性失败不清零崩溃连击
         if s != "engine_error" or exhausted:
+            break
+        n += 1
+    return n
+
+
+# 内容性失败（#8）：共享「近 12h 连击 ≥2 → 升级人工」的语义
+_FAILURE_STATUSES = ("failed", "guarded", "partial")
+# 只有 failed 吃 failed_auto_retry 的自动重派额度（guarded/partial 单次即终态）
+_RETRY_STATUSES = ("failed",)
+
+
+def _consecutive_failures(repo_full: str, number: int) -> int:
+    """台账里该 issue 末尾连续失败类（failed/guarded/partial）的条数，12h 窗内。
+
+    与 `_consecutive_engine_errors` 同款 off-by-one 契约：台账终态行在计数
+    **之前**已落盘，尾部连续数已含本次，决策处不得再 +1（首败 1 → 自动重试，
+    二连 2 → 升级）。"""
+    import json
+    import time as _time
+    ledger = Path("~/.issue-keeper/pipeline/runs.jsonl").expanduser()
+    if not ledger.exists():
+        return 0
+    cutoff = _time.time() - 12 * 3600
+    rows: list[str] = []
+    try:
+        for line in ledger.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number):
+                try:
+                    from datetime import datetime
+                    ts = datetime.fromisoformat(str(rec.get("ts", "")).replace("Z", "+00:00"))
+                    if ts.timestamp() < cutoff:
+                        continue     # 窗口外记录只在头部，跳过（勿 break）
+                except Exception:
+                    continue
+                rows.append(str(rec.get("status") or ""))
+    except OSError:
+        return 0
+    n = 0
+    for s in reversed(rows):
+        if s not in _FAILURE_STATUSES:
             break
         n += 1
     return n
@@ -1958,6 +2038,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
             log.warning("[%s] 写 pipeline 锁失败（%s，并发保护失效）: %s", label, lk.name, e)
 
     it.in_flight_since = now
+    it.retry_after = None      # #8：本次重派已消费退避，清掉免得残留
 
     # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
     # 2026-09-29 与另一会话在同一 issue 上撞车的教训。
@@ -2063,6 +2144,40 @@ def _reap_pipelines(config, state, bindings) -> int:
                 finalized += 1
                 log.info("[%s] pipeline retry-later（%s）——不消费，自动重派", label, err[:80])
                 continue
+            # ── 失败类（failed/guarded/partial）自动重试与连击升级（#8）──────
+            # failed 是内容性失败的真实终态（worktree 已保全），此前直接落进
+            # 无条件收尾 processed=True → 只能人工 reopen。现在：首败自动重派
+            # 一轮（带一个 poll 周期的退避——run 本身 1-4h，按行龄退避等于没退避），
+            # 额度耗尽后近 12h 连击 ≥2 即升级人工（评论 + 标签）。
+            # guarded/partial 单次仍是终态（自身回评），只有连击才升级。
+            if status in _FAILURE_STATUSES:
+                n_fail = _consecutive_failures(binding.repo, number)
+                budget = max(0, int(getattr(config, "failed_auto_retry", 1)))
+                if status in _RETRY_STATUSES and n_fail <= budget:
+                    lock.unlink(missing_ok=True)
+                    it.in_flight_since = None
+                    it.retry_after = now + max(1, int(config.poll_interval_secs))
+                    finalized += 1
+                    log.warning("[%s] failed 自动重试（连续第 %d 次，退避 %ds）：%s",
+                                label, n_fail, int(config.poll_interval_secs), err[:80])
+                    continue
+                if n_fail >= 2 and n_fail > budget:
+                    # 升级评论无条件发（console 路径可能已有终态回评，语义不同：
+                    # 一条终态说明、一条升级求助）；marker 必带（防循环第一层）。
+                    body = (f"{config.bot_marker}\n[issue-pipeline] 本 issue 近 12 小时内连续 "
+                            f"{n_fail} 次失败（status={status}），已超过自动重试额度"
+                            f"（failed_auto_retry={budget}），升级人工处理"
+                            f"（标签 {config.pipeline_needs_human_label}）。"
+                            f"最近一次原因：{_sanitize_public_comment(err or '未记录')[:280]}")
+                    try:
+                        _gh_post_comment(kind, binding.repo, number, body)
+                    except Exception as e:
+                        log.error("[%s] 升级评论发送失败: %s", label, e)
+                    _gh_add_label(kind, binding.repo, number,
+                                  config.pipeline_needs_human_label)
+                    posted = True     # 挡住下方兜底回评：升级评论恰一条
+                    log.warning("[%s] failed/guarded/partial 连续 %d 次，升级人工", label, n_fail)
+                # 单次 guarded/partial（含 budget=0 的单次 failed）→ 落回通用收尾
             if status == "engine_error" and not posted and not timed_out:
                 # 宿主终局标记优先（DESIGN §5 D6）：node_retry_exhausted 表示宿主
                 # 已在节点级烧满重试/预算墙才判 engine_error——keeper 再自动重派
@@ -2149,6 +2264,7 @@ def _reap_pipelines(config, state, bindings) -> int:
                     log.error("[%s] 兜底回评失败: %s", label, e)
             it.processed = True
             it.in_flight_since = None
+            it.retry_after = None      # #8：收尾即销掉陈旧退避，不留幽灵字段
             finalized += 1
             if status == "blocked" and not key.startswith("pr:"):
                 body = ""

@@ -173,6 +173,24 @@ class TestConfigLoading:
         with pytest.raises(ValueError, match="poll_interval_secs"):
             load_config(cfg)
 
+    def test_failed_auto_retry_zero_is_honored(self, tmp_path):
+        """#8：0 有意义（= 不自动重试），不得被 max(1, ...) 抬起。"""
+        cfg = _write(tmp_path,
+                     _base(tmp_path, "failed_auto_retry: 0\n" + _valid_screener()))
+        assert load_config(cfg).failed_auto_retry == 0
+
+    def test_failed_retry_and_needs_human_defaults(self, tmp_path):
+        cfg = _write(tmp_path, _base(tmp_path, _valid_screener()))
+        c = load_config(cfg)
+        assert c.failed_auto_retry == 1
+        assert c.pipeline_needs_human_label == "needs-human"
+
+    def test_needs_human_label_override(self, tmp_path):
+        cfg = _write(tmp_path, _base(
+            tmp_path,
+            'pipeline_needs_human_label: "等人处理"\n' + _valid_screener()))
+        assert load_config(cfg).pipeline_needs_human_label == "等人处理"
+
 
 class TestPipelineRepos:
     """v0.3 per-repo 管线契约解析。"""

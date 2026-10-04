@@ -29,6 +29,10 @@ class ItemState:
     # 管线 run 在途标记（2026-09-29 派发解耦）：dispatch 时写 epoch 秒，reaper
     # 收尾清回 None。非 None 期间该资源整体跳过（reaper 拥有它），避免重复派发。
     in_flight_since: float | None = None
+    # failed 自动重试的退避截止（epoch 秒，#8）：reaper 判首败重试时写
+    # now + poll_interval_secs，_process_resource 在到点前不派发；派发成功/
+    # 收尾/`reopen` 三处清回 None。
+    retry_after: float | None = None
     # 评论层异步任务（2026-10-01 评论层后台化）：comment_id(str) →
     # {"pid": int|None, "started_at": float, "attempts": int}。派发时写入、
     # 收尸后清除；daemon 重启后按 pid 存活接管（防重复调起）。
@@ -90,6 +94,8 @@ def load_state(path: Path) -> State:
             it.wakeup_deps = [int(x) for x in (idata.get("wakeup_deps") or [])]
             it.in_flight_since = (
                 float(idata["in_flight_since"]) if idata.get("in_flight_since") else None)
+            it.retry_after = (
+                float(idata["retry_after"]) if idata.get("retry_after") else None)
             it.comment_tasks = dict(idata.get("comment_tasks") or {})
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
@@ -144,6 +150,7 @@ def _dump_state_dict(state: State) -> dict[str, Any]:
                     "blocked": it.blocked,
                     "wakeup_deps": it.wakeup_deps,
                     "in_flight_since": it.in_flight_since,
+                    "retry_after": it.retry_after,
                     "comment_tasks": it.comment_tasks,
                 }
                 for key, it in rs.items.items()
@@ -170,7 +177,7 @@ def save_state_item(
 
 
 _ITEM_FIELDS = ("processed", "session_id", "processed_comment_ids", "blocked",
-                "wakeup_deps", "in_flight_since", "comment_tasks")
+                "wakeup_deps", "in_flight_since", "retry_after", "comment_tasks")
 
 
 def save_state_merged(path: Path, state: State, base: State) -> None:

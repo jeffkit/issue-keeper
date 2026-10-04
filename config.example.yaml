@@ -77,6 +77,13 @@ author_daily_limit_exempt: [okguitar]
 # engine_error 等）被反复重派：单轮 run 半小时起步，0 = 不限。到顶只推迟
 # 不消费——次日自动重试，人工处置后也可 `reopen` 立即重派。
 pipeline_issue_daily_limit: 2
+# 失败类（status=failed）自动重派额度（#8）：首败自动重试一轮（台账 +1 run 记录，
+# 退避一个 poll 周期），耗尽后近 12h 连续 ≥2 次失败才升级人工（评论 + 标签）。
+# 0 = 不自动重试。失败类 run 不计入上面两道日限（配额与 reopen 解耦）。
+failed_auto_retry: 1
+# 升级人工时打的标签（#8）：需先在仓库内存在（本工具不自动创建标签）；
+# 不要写进 opt_out_labels，否则该 issue 会被 keeper 整体跳过。
+pipeline_needs_human_label: needs-human
 
 # ─── issue-pipeline 混合形态（pipeline）────────────────────────────────
 # 定义与观测归 plaita-console，执行留本地 bridge（flows/pipeline_bridge.py，
