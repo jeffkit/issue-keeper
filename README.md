@@ -485,6 +485,18 @@ agent 收到的消息会明确告诉它：
 
 agent 的工具调用完全由 agent CLI 自己决定（如 deepseek CLI 有 bash 能力），issue-keeper 不参与解析或转发。
 
+### 管线仓的 CI 修复通道（label `ci-fix`）
+
+issue-pipeline flow 的 diff 护栏默认禁改 `.github/**`，CI 类 issue（目标文件就是
+`.github/workflows/*`）因此走不到 deliver。显式通道：给 issue 加标签 `ci-fix`
+（`gh issue edit <N> -R <repo> --add-label ci-fix`，需 **triage+ 权限**，外部 reporter
+无法自助声明；标签是附加的，issue 仍需带该仓路由标签才会被扫到）——guard 随即放行
+`.github/workflows/**`。负向边界：**只放行 workflows，不放行整套 `.github`**，
+`.github/dependabot.yml` / `CODEOWNERS` / `actions/**`、`.worktrees/**`、仓外路径、
+超大 diff 仍拦；未声明的 issue 行为不变。该通道不读 config（标签即唯一开关），
+声明方式与适用范围详见 `config.example.yaml` 的 `pipeline_repos` 前言与
+`flows/README.md`「CI 修复通道」。
+
 ## 运行
 
 ```bash

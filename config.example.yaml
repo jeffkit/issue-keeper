@@ -121,6 +121,12 @@ run_deadline_margin_secs: 300
 # 资格规则：未登记且无门的仓**不进管线**（回退 legacy 单 agent 路径）——
 # 空门跑 `true` 恒过的假绿已废止；readonly 仓不需要门。
 # 全局 pipeline_push_mode / pipeline_review_mode 只作缺省，per-repo 可覆盖。
+#
+# CI 修复通道（#11）：本通道**不读 config**，唯一开关是 issue 上的标签 `ci-fix`
+# （`gh issue edit <N> -R <repo> --add-label ci-fix`，需 triage+ 权限；标签是附加的，
+# issue 仍需带路由标签才会被扫到）——声明后 guard 放行 `.github/workflows/**`。
+# 负向边界：仅 workflows，**不放行整套 `.github`**（dependabot/CODEOWNERS/actions 仍拦），
+# `.worktrees/**`、仓外路径、超大 diff 判据一字未动。详见 flows/README.md。
 pipeline_repos:
   # Rust 仓 + 多门（含条件门：触及 recursive-tui 才跑 mutants，预算对齐其
   # AGENTS.md 失败模式 #8 的 40-60min 实测）。门清单也可放仓内

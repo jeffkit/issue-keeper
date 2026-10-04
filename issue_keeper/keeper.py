@@ -1689,6 +1689,17 @@ def _parse_depends_on(body: str) -> list[int]:
     return sorted({int(m) for m in _DEP_RE.findall(body or "")})
 
 
+CI_FIX_LABEL = "ci-fix"
+
+
+def _declares_ci_fix(labels) -> bool:
+    """issue 显式声明 CI 修复通道（label `ci-fix`，大小写/空白不敏感）。
+
+    放行面只有 .github/workflows/**；其余 .github/** 仍由 flow 的 guard 拦下。
+    """
+    return any(str(lb).strip().lower() == CI_FIX_LABEL for lb in (labels or []))
+
+
 def _dep_settled(config, repo_full: str, num: int) -> bool:
     """依赖 #N 是否已终态：state 里该 item 存在且 processed=True（管线已收尾）。
 
@@ -1998,6 +2009,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         "setup_command": pc.setup_command,
         "setup_timeout_secs": pc.setup_timeout_secs,
         "readonly": pc.mode == "readonly",
+        "ci_fix": _declares_ci_fix(res.labels),
         "review_notes": pc.review_notes,
         "triage_notes": pc.triage_notes,
         "doc_notes": pc.doc_notes,

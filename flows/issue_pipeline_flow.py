@@ -12,6 +12,9 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
     recursive 的条件 mutants 门因此进门）；**无门不进管线**（keeper 侧门控），
     空门跑 `true` 恒过的假绿已根治
   - INPUT.readonly：只调查不开工（数据/分发/镜像仓），investigate 后早退
+  - INPUT.ci_fix：issue 带 `ci-fix` 标签（triage+ 权限才能加）→ guard 放行
+    .github/workflows/**，其余 .github/** 与仓外路径仍拦（#11）。三段提示词
+    口径统一由 ci_note 赋值节点承载，不再各处硬编码
   - INPUT.review_notes/triage_notes/doc_notes：仓内红线/路由/文档惯例注入提示词，
     取代曾硬编码在此的 recursive 专属红线（三处事实源漂移的根因）
   - 各 agent 段预算 INPUT.*_timeout（默认值 = 旧全局值，per-repo 可覆盖）
@@ -28,7 +31,7 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
   - 人工审核仅 review_mode=human 且 risk=high；HITL 未批准（含超时）→ 暂缓出害口
   - 独立 review 解析失败 = abort（fail-safe）；triage 解析失败 → blocked 人工复核
   - 质量门命令 = INPUT.test_command（per-repo 绑定；无门仓 keeper 不派发本 flow）
-  - deliver 前 diff 护栏（.github/**、超大 diff → 待人工）
+  - deliver 前 diff 护栏（声明 ci-fix 时放行 .github/workflows/**；其余 .github/**、超大 diff → 待人工）
   - 全部公开评论出害前消毒（本机路径/密钥模式 → [REDACTED]）+ <!-- issue-pipeline --> 去重
   - partial/hold 出害口如实说明「改动在本地 worktree，未推送」
   - worktree 基线显式取 origin/<base_branch>（fetch 后切分支——pull --ff-only 在本地 main 领先时
@@ -291,6 +294,12 @@ def issue_pipeline(INPUT):
         )
         return {"status": "readonly", "posted": post_ro.posted}
 
+    # ── 3.0 CI 修复通道（#11）：只有显式声明 ci-fix 的 issue 才放开 workflows。
+    #     单一事实源：plan/implement/review 三段共享本节点措辞（消灭三处口径漂移）。
+    #     INPUT.ci_fix 缺省（旧调用方/未传）→ None → falsy → 走禁改分支（fail-safe）。──
+    ci_note = ("本 issue 已声明 ci-fix：允许改动 .github/workflows/**（其余 .github/** 与仓库外路径仍禁）"
+               if INPUT.ci_fix else "禁止包含/改动 .github/** 与任何仓库外路径")
+
     # ── 3. plan；人工审核仅 review_mode=human 且 risk=high（未批准 → 暂缓出害）──
     plan = AGENTRUN(
         agent="deepseek-flash",
@@ -300,7 +309,7 @@ def issue_pipeline(INPUT):
             "你是实现规划员。读 {% $INPUT.artifact_dir %}/01-investigation.md，写 {% $INPUT.artifact_dir %}/02-plan.md："
             "1) 改哪些文件各改什么；2) 实施顺序；3) 验证命令（定向 + 是否需要 {% $INPUT.test_command %}）；"
             "4) 风险与回滚；5) 验收覆盖（{% $NODE.parsed.acceptance_str %}）。"
-            "计划涉及文件禁止包含 .github/** 与任何仓库外路径。"
+            "计划涉及文件范围：{% $NODE.ci_note %}。"
             "最后一行必须是：COMMIT_MESSAGE: <conventional 消息，含 (#{% $INPUT.issue_number %})>。"
             "只做计划不改代码。完成后只回复一行：DONE <计划要点>"
         ),
@@ -350,8 +359,8 @@ def issue_pipeline(INPUT):
             "本工作树可能保留着上一轮（超时中断）的实现或提交。已有部分**就地修正**，"
             "不要从零重写、更不要 revert 掉可用改动；只在确有必要时才重做某处，并在"
             "02-plan.md「## 实施记录」里写一句为什么。"
-            "约束：只改计划内文件（计划有误可在允许范围内调整并追加到实施记录）；"
-            "禁止改动 .github/**；自验用**定向**测试（按本仓惯例，如 "
+            "约束：只改计划内文件（计划有误可在允许范围内调整并追加到实施记录；{% $NODE.ci_note %}）；"
+            "自验用**定向**测试（按本仓惯例，如 "
             "`cargo test -p <crate> --test <target>` / `pnpm --filter <pkg> test` / `pytest <path>`），"
             "**不要跑全量质量门**（管线有独立质量门会跑：{% $INPUT.test_command %}）；"
             "不要 git commit / git push。"
@@ -409,7 +418,7 @@ def issue_pipeline(INPUT):
             "**先读本仓 AGENTS.md / CLAUDE.md（若存在）**，按仓内质量门与禁止事项审查。"
             "本仓红线（per-repo 配置，最高优先级）：{% $INPUT.review_notes %}\n"
             "检查：计划符合度、边界条件、测试覆盖对齐验收（{% $NODE.parsed.acceptance_str %}）、"
-            "红线触发、是否夹带计划外改动（尤其 .github/** 与计划外新增文件）。\n"
+            "红线触发、是否夹带计划外改动（{% $NODE.ci_note %}）。\n"
             "**不要重复跑全量质量门**：门紧接着会跑 {% $INPUT.test_command %}，"
             "你重复跑一遍既慢又和门重复。要验证行为就用相关用例"
             "（按本仓惯例选定向测试），单条命令预算 ≤5 分钟。\n"
@@ -548,6 +557,8 @@ def issue_pipeline(INPUT):
             return {"status": "partial", "posted": post_partial.posted}
 
     # ── 7. diff 护栏：敏感路径/超大 diff → 停机待人工，不进 deliver ──
+    # 声明 ci-fix 时放行前缀 `.github/workflows/`（带尾斜杠：同名文件与 .github/ 下
+    # 其余路径仍拦）；名单取 diff ∪ untracked（`git diff --name-only HEAD` 看不见新增）。
     guard = CODE.python(
         sandbox_backend="subprocess",
         code=(
@@ -556,8 +567,17 @@ def issue_pipeline(INPUT):
             "    r = subprocess.run(['git', 'diff', '--name-only', 'HEAD'], cwd=input['worktree_dir'],"
             " capture_output=True, text=True, timeout=60)\n"
             "    files = [f for f in r.stdout.splitlines() if f.strip()]\n"
-            "    bad = [f for f in files if f.startswith('.github/') or f.startswith('.worktrees/')"
-            " or '..' in f or f.startswith('/')]\n"
+            "    u = subprocess.run(['git', 'status', '--porcelain', '-uall'], cwd=input['worktree_dir'],"
+            " capture_output=True, text=True, timeout=60)\n"
+            "    files = sorted(set(files) | {l[3:] for l in u.stdout.splitlines() if l.startswith('?? ')})\n"
+            "    allow_wf = bool(input.get('ci_fix'))\n"
+            "    bad = []\n"
+            "    for f in files:\n"
+            "        if allow_wf and f.startswith('.github/workflows/'):\n"
+            "            continue\n"
+            "        if (f.startswith('.github/') or f.startswith('.worktrees/')"
+            " or '..' in f or f.startswith('/')):\n"
+            "            bad.append(f)\n"
             "    n = subprocess.run(['git', 'diff', '--shortstat', 'HEAD'], cwd=input['worktree_dir'],"
             " capture_output=True, text=True, timeout=60)\n"
             "    oversized = False\n"
@@ -568,7 +588,7 @@ def issue_pipeline(INPUT):
             "            oversized = False\n"
             "    return {'ok': (not bad) and (not oversized), 'violations': bad, 'oversized': oversized}\n"
         ),
-        input={"worktree_dir": INPUT.worktree_dir},
+        input={"worktree_dir": INPUT.worktree_dir, "ci_fix": INPUT.ci_fix},
     )
     if guard.ok != True:
         reply_guard = AGENTRUN(

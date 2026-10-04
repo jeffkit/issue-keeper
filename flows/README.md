@@ -110,7 +110,7 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
                └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
                   └─ plan(agent 10min) → 02-plan.md（含 COMMIT_MESSAGE）
                      └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
-                        └─ implement(agent 30min, 禁 .github/**, 不 commit/push)
+                        └─ implement(agent 30min, 未声明 ci-fix 时禁 .github/**, 不 commit/push)
                            └─ 无改动 → 回评 → END
                               └─ review(agent=glm53-flash 独立审查, 解析失败=abort)
                                  ├─ abort → 回评 → END
@@ -119,7 +119,7 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
                                     gate(INPUT.test_command, 20min)  ← per-repo 配置，非写死
                                     ├─ fail → fix_test(15min) → retest
                                     │           └─ 仍 fail → 回评「在本地 worktree 未推送」→ END
-                                    └─ pass → diff护栏(.github/**、>800行 → 待人工)
+                                    └─ pass → diff护栏(未声明 ci-fix 时 .github/** 全禁；声明后仅放行 .github/workflows/**；>5000行 → 待人工)
                                        └─ document → deliver(幂等 commit/push)
                                           └─ push_mode=main → fetch + ff 合并 origin/<branch> → push main
                                              └─ reply(消毒+去重+管线核验尾行) → kanban → END
@@ -253,6 +253,7 @@ recursive 侧 agent 实测报来的两个可修点（+一条跨渠道校验建�
   "setup_command": "pnpm install --frozen-lockfile", // v0.3：worktree 建立后跑一次
   "setup_timeout_secs": 1800,
   "readonly": false,                               // v0.3：true=investigate 后早退
+  "ci_fix": false,                                 // #11：issue 带 ci-fix 标签 → guard 放行 .github/workflows/**
   "review_notes": "...", "triage_notes": "...", "doc_notes": "...",  // v0.3：仓规注入
   "investigate_timeout": 2100, "plan_timeout": 1200, "implement_timeout": 4200,
   "review_timeout": 2700, "fix_review_timeout": 2700, "fix_test_timeout": 900,
@@ -277,6 +278,31 @@ keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须�
 `posted`——`pipeline_bridge.py` 在出口统一补齐别名（缺 `comment_posted` 时用 `posted`
 填充，引擎异常无 `posted` 则为 false）。keeper 侧兼容双读。早退终态已发回评 ≠ 故障，
 告警文案区分「引擎异常无回评」与「终态但回评未发出」（issue #1 误报修复）。
+
+## CI 修复通道（label `ci-fix`，#11）
+
+`.github/**` 禁改名单历史上是四处硬编码（guard 判定 + plan/implement/review 三段提示词），
+于是「目标文件就是 `.github/workflows/*`」的合法 CI 修复单即使门全绿也在 deliver 前被判
+`guarded`（ilink-hub #39）。现在有一条**显式、需人工授权**的通道：
+
+- **声明方式**：给 issue 加标签 `ci-fix`——`gh issue edit <N> -R <repo> --add-label ci-fix`。
+  该标签是**附加**的：issue 仍需带该仓绑定的路由标签才会被扫到。
+  标签需 **triage 及以上权限**才能加，外部 reporter 无法自助声明；`ci_fix` 在**派发时**
+  从 issue label 读入（agent 运行前），运行中的 agent 无法自我提权。
+- **适用范围**：只放行前缀 `.github/workflows/`，**不放行整套 `.github`**——
+  `.github/dependabot.yml`、`.github/actions/**`、`.github/CODEOWNERS` 与名为
+  `.github/workflows` 的文件本身仍被 guard 拦（放行判定带尾斜杠），
+  `.worktrees/**`、含 `..`、绝对路径、`>5000` 行的 oversized 判据一字未动。
+  未声明 `ci-fix` 的 issue 行为不变（含未跟踪的新增 `.github/**` 文件——guard 名单取自
+  `git diff --name-only HEAD` ∪ `git status --porcelain -uall` 的 `??` 路径）。
+- **口径单一事实源**：plan/implement/review 三段提示词共享 flow 内的 `ci_note` 赋值节点，
+  声明与否的措辞只维护一处（见 `flows/issue_pipeline_flow.py` 的 `ci_note`）。
+- **不读 config**：标签名是 `issue_keeper.keeper.CI_FIX_LABEL` 常量，无配置开关；
+  `.github/**` **仍不可由 config 放行**。
+- **不覆盖**：`engine=v2-console` 走 `self-improve-v2`（另一条 flow，有自己的护栏）。
+- **越界回评文案未变**：被拦时仍报越界文件名单，值守据此区分「被拦」与「放行了但越界」。
+- **部署前置**：console 须发布新 semver，否则 bridge 仍用旧定义——旧 guard 不认识
+  `ci_fix`，继续拦，fail-safe，不会误放行。
 
 ## 混合形态：定义与观测归 console，执行留本地（2026-09-28）
 
