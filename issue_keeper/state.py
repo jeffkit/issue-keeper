@@ -13,7 +13,7 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 @dataclass
@@ -154,18 +154,53 @@ def _dump_state_dict(state: State) -> dict[str, Any]:
     return raw
 
 
-def save_state_item(path: Path, repo_slug: str, key: str, item: ItemState) -> None:
-    """单条合并写：重读盘上最新状态 → 只替换这一条 → 原子写回。
+def save_state_item(
+    path: Path, repo_slug: str, key: str, mutate: Callable[[ItemState], None],
+) -> None:
+    """单条合并写：持锁重读盘上最新状态 → 对这条 item 施加 mutate → 原子写回。
 
     解 2026-09-29 的竞态：daemon 一个长周期结束时把**整份**内存状态写回，
-    会覆盖周期中途 `reopen` 的改动。逐条合并后，CLI 与 daemon 谁后写谁覆盖的
-    粒度从「整份文件」缩到「单条 item」，且互不踩别的字段。
+    会覆盖周期中途 `reopen` 的改动。逐条合并后粒度从「整份文件」缩到「单条 item」，
+    且只有调用方显式改的字段会变（不用调用方的旧对象整条替换）。
     """
     with _state_lock(path):
         state = load_state_unlocked(path)
-        rs = state.repo(repo_slug)
-        rs.items[str(key)] = item
+        mutate(state.repo(repo_slug).item(str(key)))
         _save_state_unlocked(path, state)
+
+
+_ITEM_FIELDS = ("processed", "session_id", "processed_comment_ids", "blocked",
+                "wakeup_deps", "in_flight_since", "comment_tasks")
+
+
+def save_state_merged(path: Path, state: State, base: State) -> None:
+    """轮尾合并写：持锁重读盘上状态，只把 `state` 相对 `base` 变过的字段写回。
+
+    daemon 一轮很长（轮首 load → 轮尾写），期间 CLI 的 `reopen` 已写盘的字段必须保留：
+    逐字段与轮首快照 diff，变过的（本轮真改过）写内存值，没变的一律保留盘上值。
+    """
+    with _state_lock(path):
+        disk = load_state_unlocked(path)
+        _merge_state(disk, state, base)
+        _save_state_unlocked(path, disk)
+
+
+def _merge_state(disk: State, mem: State, base: State) -> None:
+    for slug, rs in mem.repos.items():
+        drs = disk.repo(slug)
+        brs = base.repos.get(slug)
+        for key, item in rs.items.items():
+            base_item = brs.items.get(key) if brs else None
+            target = drs.item(key)
+            for name in _ITEM_FIELDS:
+                value = getattr(item, name)
+                if base_item is None or getattr(base_item, name) != value:
+                    setattr(target, name, value)
+    for key, value in mem.patrol.items():
+        if base.patrol.get(key) != value:
+            disk.patrol[key] = value
+    if mem.patrol_cycle != base.patrol_cycle:
+        disk.patrol_cycle = mem.patrol_cycle
 
 
 def load_state_unlocked(path: Path) -> State:

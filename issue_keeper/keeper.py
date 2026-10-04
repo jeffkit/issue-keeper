@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -30,7 +31,7 @@ from .profile import (
 from .reply import polish
 from .screener import ScreenerConfig, Verdict, screen as screen_text
 from .sources import IssueSource, Resource, make_source
-from .state import State, load_state, save_state
+from .state import ItemState, State, load_state, save_state_item, save_state_merged
 
 log = logging.getLogger("issue-keeper")
 
@@ -676,6 +677,7 @@ def _should_auto_review(
 def run_once(config: Config) -> int:
     """执行一轮全量扫描。返回处理条目总数。"""
     state = load_state(config.state_path)
+    base = copy.deepcopy(state)  # 轮首快照：轮尾 diff 用（判断「本轮真改过」）
     total = _reap_pipelines(config, state, config.repos)
     profile_cache: dict[str, ProfileEntry] = {}
     source_cache: dict[str, IssueSource] = {}
@@ -689,7 +691,7 @@ def run_once(config: Config) -> int:
         total += process_repo(binding, config, state, profile_cache, source_cache)
     # keeper 巡检：代人类 review / 主动分诊（按 interval_cycles 节流）
     total += keeper_patrol(config, state, profile_cache, source_cache)
-    save_state(config.state_path, state)
+    save_state_merged(config.state_path, state, base)
     return total
 
 
@@ -915,6 +917,12 @@ def run_daemon(config_path: str) -> None:
         time.sleep(config.poll_interval_secs)
 
 
+def _clear_terminal_state(it: ItemState) -> None:
+    it.processed = False
+    it.blocked = False
+    it.wakeup_deps = []
+
+
 def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
     """把已消费的 issue 重新放回队列（清 processed/blocked），返回实际改动的编号。
 
@@ -938,7 +946,11 @@ def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
             it.wakeup_deps = []
             changed.append(n)
     if changed:
-        save_state(config.state_path, state)
+        # 逐条合并写：每条都在锁内重读盘上最新值再清终态，不用 CLI 自己的旧快照
+        # 整份反盖 daemon 轮内的进度（processed_comment_ids / in_flight_since 等）。
+        for n in changed:
+            save_state_item(config.state_path, binding.repo_slug, str(n),
+                            _clear_terminal_state)
         # 状态透明化（okguitar 2026-09-30 建议）：拦截/终态评论只有「已拦」形态
         # 没有「已解除」，外部无法从 issue 页面区分排队中/被拦——reopen 时补一条
         # 带 bot marker 的状态评论（marker + self_identity 双保险，不会被评论层
