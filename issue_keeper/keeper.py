@@ -1004,6 +1004,11 @@ def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
     与作者日限互补：作者日限防「一人刷多 issue」，这里防「同一 issue 的终态被
     反复重派」——guarded/engine_error 完成后任何把条目拉回队的路径都会再花
     半小时起步跑一整轮，#40 一夜连烧 5 轮全是超时/护栏拦截（2026-09-29）。
+
+    retry-later 不计入：它是 preflight 环境闸（如磁盘守卫）的「没跑、等重试」
+    快速失败（秒级、不消费），配额语义上不是一次 run。计入会出 10-04 事件：
+    守卫风暴把每 issue 的 10 次额度烧在 1 秒的 preflight 上 → 磁盘恢复后
+    当日整批 issue 被日限锁死（同内容重跑才有意义的额度被空转耗尽）。
     """
     import json
     import time
@@ -1022,6 +1027,8 @@ def _issue_over_pipeline_limit(config, repo_full: str, number: int) -> bool:
                 continue
             if rec.get("repo") == repo_full and str(rec.get("issue")) == str(number) \
                     and str(rec.get("ts", "")).startswith(today):
+                if rec.get("status") == "retry-later":
+                    continue                                     # 环境闸快速失败不占额度
                 n += 1
     except Exception:
         return False

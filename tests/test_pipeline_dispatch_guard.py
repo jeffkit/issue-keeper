@@ -678,6 +678,28 @@ def test_issue_cap_zero_disables(tmp_path, monkeypatch):
         Config(pipeline_issue_daily_limit=0), "a/b", 5) is False
 
 
+def test_issue_cap_excludes_retry_later(tmp_path, monkeypatch):
+    """retry-later（磁盘守卫等环境闸快速失败）不占日限额度——否则守卫风暴把
+    issue 的 10 次额度烧在秒级 preflight 上，磁盘恢复后当日整批被锁死
+    （2026-10-04 实证：#87-#103 十单各 10 条 disk retry-later 全被锁）。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ledger = tmp_path / ".issue-keeper" / "pipeline" / "runs.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y-%m-%dT10:00:00+0800", time.localtime())
+    with ledger.open("a", encoding="utf-8") as f:
+        for _ in range(12):   # 远超上限的守卫快速失败
+            f.write(json.dumps({"ts": ts, "repo": "a/b", "issue": 9,
+                                "author": "bob", "status": "retry-later"}) + "\n")
+        # 真实 run 记录仍应计数
+        for _ in range(2):
+            f.write(json.dumps({"ts": ts, "repo": "a/b", "issue": 9,
+                                "author": "bob", "status": "engine_error"}) + "\n")
+    cfg = Config(pipeline_issue_daily_limit=3)
+    assert _issue_over_pipeline_limit(cfg, "a/b", 9) is False   # 只数到 2 条 real run
+    assert _issue_over_pipeline_limit(
+        Config(pipeline_issue_daily_limit=2), "a/b", 9) is True
+
+
 # ── v0.3 per-repo 契约：资格门控 + payload 构造 ──────────────────────
 
 from issue_keeper.config import GateSpec, PipelineRepoConfig  # noqa: E402
