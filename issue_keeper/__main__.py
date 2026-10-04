@@ -381,14 +381,14 @@ def _run_onboard(args) -> int:
 
     # 2) 可选：生成自我介绍
     if args.gen_intro:
-        if not os.environ.get("GLM_API_KEY"):
-            print("未设置 GLM_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            print("未设置 DEEPSEEK_API_KEY，跳过介绍生成（可后续 `team set-intro` 手填）", file=sys.stderr)
         else:
             from .profile import ProfileEntry, invoke_agent
             env = {
-                "ANTHROPIC_API_KEY": os.environ["GLM_API_KEY"],
-                "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
-                "CLAUDE_MODEL": "glm-5.3-flash",
+                "ANTHROPIC_API_KEY": os.environ["DEEPSEEK_API_KEY"],
+                "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+                "CLAUDE_MODEL": "deepseek-flash",
             }
             entry = ProfileEntry(name=args.profile, is_hub=True, cwd=str(project_path),
                                  env=env, timeout_secs=180)
@@ -601,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
                             choices=["actionable", "blocked", "invalid"])
     p_bm_eval = bm_sub.add_parser("eval", help="回放评测（冻结提示词，真实 LLM 单段调用）")
     p_bm_eval.add_argument("name")
-    p_bm_eval.add_argument("--agent", default="glm-turbo")
+    p_bm_eval.add_argument("--agent", default="deepseek-flash")
     p_bm_eval.add_argument("--limit", type=int, default=30)
 
     # internal source 管理

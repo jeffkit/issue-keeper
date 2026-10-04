@@ -18,8 +18,8 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
   - 提示词显式要求先读目标仓 AGENTS.md/CLAUDE.md——仓规契约的主人是各仓
   - push_mode 支持 pr（gh pr create，PR 制仓）与 none（不出害，仅本地 commit）
 
-角色分离（10-01 拍板：全链 GLM-5.3-flash，轻量段不再单独留 glm-turbo）：
-  - glm53-flash    全部段：triage / investigate / plan / implement / fix /
+角色分离（10-04 拍板：全链 DeepSeek flash，GLM 限流切回）：
+  - deepseek-flash 全部段：triage / investigate / plan / implement / fix /
                      review / document / reply——review 同模型但提示词独立、
                      只看 diff+计划+issue 原文，异构复核语义由提示词隔离承担
 
@@ -106,7 +106,7 @@ def issue_pipeline(INPUT):
 
     # ── 1. triage：查重 + 定级（正文只经 body_file，不进 prompt）──
     triage = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.main_clone,
         timeout_secs=300,
         prompt=(
@@ -150,7 +150,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 A/B：blocked / invalid ──
     if parsed.verdict == "blocked":
         reply_blocked = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -170,7 +170,7 @@ def issue_pipeline(INPUT):
 
     if parsed.verdict == "invalid":
         reply_invalid = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -228,7 +228,7 @@ def issue_pipeline(INPUT):
     )
     if setup.ok == False:
         reply_setup_fail = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -246,7 +246,7 @@ def issue_pipeline(INPUT):
         )
         return {"status": "partial", "posted": post_setup_fail.posted}
     investigate = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.worktree_dir,
         # 1800（2026-09-28 由 900 上调）：调研段要读代码 + 先立失败复现测试 +
         # 跑 cargo，而 worktree 是全新的、target/ 为空 → 冷构建常常十几分钟；
@@ -272,7 +272,7 @@ def issue_pipeline(INPUT):
     # 自动改不该自动改的东西（marketplace「改行为请去 argusai 仓」）。
     if INPUT.readonly == True:
         reply_ro = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -293,7 +293,7 @@ def issue_pipeline(INPUT):
 
     # ── 3. plan；人工审核仅 review_mode=human 且 risk=high（未批准 → 暂缓出害）──
     plan = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.worktree_dir,
         timeout_secs=INPUT.plan_timeout,
         prompt=(
@@ -314,7 +314,7 @@ def issue_pipeline(INPUT):
         )
         if approve.status != "replied":
             reply_hold = AGENTRUN(
-                agent="glm53-flash",
+                agent="deepseek-flash",
                 repo=INPUT.main_clone,
                 timeout_secs=600,
                 prompt=(
@@ -333,7 +333,7 @@ def issue_pipeline(INPUT):
 
     # ── 4. implement：按计划实施，不 commit 不 push ──
     implement = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.worktree_dir,
         # 预算沿革：1800（#40 首次被掐）→ 2700 → 3000 → 4200（v1.0.11）。
         # 2026-09-29 四轮实测：implement 是唯一的墙——#40/#31 都在 3000s 被掐，
@@ -376,7 +376,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 C：无改动 / 实施受阻 ──
     if check.has_changes != True:
         reply_nochange = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -395,7 +395,7 @@ def issue_pipeline(INPUT):
 
     # ── 5. 独立 review：只看 diff+计划+issue 原文 ──
     review = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.worktree_dir,
         # 审查员要读整份 diff + 对照计划/验收再自检：600s（#42/#43 被掐）→ 1800 →
         # 2400 → 2700（v1.0.9）。#19 连续两跑都在这里被掐（implement 只用 98s，
@@ -426,7 +426,7 @@ def issue_pipeline(INPUT):
     # ── 出害口 D：review 叫停（fail-safe：解析失败也走这里）──
     if verdict.verdict == "abort":
         reply_abort = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -445,7 +445,7 @@ def issue_pipeline(INPUT):
 
     if verdict.verdict == "fix":
         fix_review = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.worktree_dir,
             # 与 implement 同级：这同样是「读 diff + 改码 + 自检」的活（600→1800→2400
             # →2700，v1.0.9）；#30 在这里被掐过一次。自检同样不要跑全量测试。
@@ -510,7 +510,7 @@ def issue_pipeline(INPUT):
     )
     if gate.passed != True:
         fix_test = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.worktree_dir,
             timeout_secs=INPUT.fix_test_timeout,
             prompt=(
@@ -529,7 +529,7 @@ def issue_pipeline(INPUT):
         if retest.passed != True:
             # 此路径发生在 deliver 之前——如实说明未推送
             reply_partial = AGENTRUN(
-                agent="glm53-flash",
+                agent="deepseek-flash",
                 repo=INPUT.main_clone,
                 timeout_secs=600,
                 prompt=(
@@ -572,7 +572,7 @@ def issue_pipeline(INPUT):
     )
     if guard.ok != True:
         reply_guard = AGENTRUN(
-            agent="glm53-flash",
+            agent="deepseek-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
@@ -592,7 +592,7 @@ def issue_pipeline(INPUT):
 
     # ── 8. document → deliver（幂等）→ merge（按 push_mode）→ 回评 → kanban ──
     document = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.worktree_dir,
         timeout_secs=INPUT.document_timeout,
         prompt=(
@@ -619,7 +619,7 @@ def issue_pipeline(INPUT):
         base_branch=INPUT.base_branch,
     )
     reply = AGENTRUN(
-        agent="glm53-flash",
+        agent="deepseek-flash",
         repo=INPUT.main_clone,
         timeout_secs=600,
         prompt=(

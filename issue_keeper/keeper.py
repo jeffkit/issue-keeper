@@ -1622,8 +1622,8 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         # v2 flow 的 INPUT 契约吃 run_dir（checkpoint 目录；self_improve_bridge_v2
         # 同式 repo/.flowcast/runs/<run_id>），run_id 仅供日志/台账关联。
         "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
-        "agent": pc.agent or "glm53-flash",
-        "reviewer": pc.reviewer or "glm53-flash",
+        "agent": pc.agent or "deepseek-flash",
+        "reviewer": pc.reviewer or "deepseek-flash",
     }
     try:
         execution_id = client.start_execution(flow_id, params)
