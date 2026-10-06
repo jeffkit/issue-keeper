@@ -26,6 +26,8 @@ GITHUB_API = "https://api.github.com"
 
 log = logging.getLogger("issue-keeper.github")
 
+_GH_TIMEOUT_SECS = 60  # 与 keeper 收尾路径（_gh_post_comment/_gh_add_label）同值
+
 
 def _parse_labels(raw: Any) -> list[str]:
     return [l.get("name", "") if isinstance(l, dict) else str(l) for l in (raw or [])]
@@ -111,7 +113,13 @@ def _sort_comments(comments: list[Comment]) -> list[Comment]:
 
 def _run_gh(args: list[str]) -> str:
     cmd = ["gh", *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=_GH_TIMEOUT_SECS)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"gh 命令超时（>{_GH_TIMEOUT_SECS}s）: {' '.join(cmd)}"
+        ) from e
     if proc.returncode != 0:
         raise RuntimeError(
             f"gh 命令失败 ({' '.join(cmd)}): exit={proc.returncode}\n"

@@ -556,6 +556,7 @@ python -m pytest -q                         # 264 个用例：screener / config 
 - **回复方式**：issue-keeper 把 agent 的回复作为评论发出，profile 无关，任何 AgentProc profile 都能用。
 - **会话连续性**：每个 issue/PR 持有一个 agent 会话 uuid，新评论复用该会话，agent 保持上下文。issue 与 PR 互相隔离。
 - **监控范围**：默认只监控 open issue；可按 label 过滤；`monitor_prs` 开启 PR；PR 的普通评论与行内 review comments 均纳入监控（github_token source 自动分页，不丢评论）。
+- **扫描健壮性**：gh 扫描子进程带 60s 超时（与收尾路径 `_gh_post_comment` / `_gh_add_label` 同值），超时转 `RuntimeError` 走既有的 per-kind except——按「该仓本轮扫描失败」降级（error 日志 + 跳过，state 不置 processed，下一轮自然重试），网络瞬断不再让整轮 / daemon 静默挂起（#15）。
 - **防循环**：三层保险（隐藏 marker / 可见前缀 / self_identity）。资源层也识别 marker——AI 自己提的 issue 不触发首次回复，但评论照常处理。
 - **安全过滤**：所有投递给主 agent 的内容先过 screener（纯 HTTP LLM 调用，无本地权限）。fail-safe：配置不全拒绝启动。
 - **可插拔来源**：keeper 主循环依赖 `IssueSource` 协议而非具体 GitHub。当前支持 `github_cli` / `github_token`。加新来源（github_app / internal / discord / http）是纯加法。
