@@ -1902,6 +1902,14 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         "agent": pc.agent or "deepseek-flash",
         "reviewer": pc.reviewer or "deepseek-flash",
     }
+    # per-repo 门禁注入（2026-10-06，多仓支持）：v2 flow 原为 recursive(Rust)
+    # 硬编码 cargo 门——跑别的仓必然假红（plaita#41 实证：cargo fmt 在 Python
+    # 仓报 "could not find Cargo.toml"）。把本仓已配置的 pc.gates 传下去，
+    # flow 侧按序取用（fmt→lint→test 语义位）；不传 = flow 回退 cargo 三段
+    # （recursive 自身零回归）。仅传 name/command，timeout 由 flow 默认（其
+    # 预算按 Rust 冷构建调优，非 Rust 仓通常更快，够用）。
+    if pc.gates:
+        params["gates"] = [{"name": g.name, "cmd": g.command} for g in pc.gates]
     try:
         execution_id = client.start_execution(flow_id, params)
     except _ce.ConsoleExecError as e:
