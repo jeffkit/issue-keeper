@@ -43,6 +43,10 @@ class PipelineConsoleConfig:
 class PipelineConfig:
     """issue-pipeline 管线运行配置（混合形态，2026-09-28）。"""
     console: PipelineConsoleConfig = field(default_factory=PipelineConsoleConfig)
+    # 影子模式专用 console 目标（放量迁移首阶）：影子副本派往**新系统**，
+    # 与 conduit/既有 pipeline.console（旧链路）解耦——改这里不影响 screener/
+    # bridge。未配（url/api_key 空）时影子回退 pipeline.console（单机演练用）。
+    shadow_console: PipelineConsoleConfig = field(default_factory=PipelineConsoleConfig)
     # 非空时 bridge 把执行上报进 console 观测面（写 plaita:execution:{id} 键 +
     # SSE pubsub 频道）。指向 console 所用 Redis，如 redis://localhost:6379/0。
     observability_redis: str = ""
@@ -541,6 +545,9 @@ def _load_pipeline(raw: dict) -> PipelineConfig:
     console_raw = p.get("console") or {}
     if not isinstance(console_raw, dict):
         raise ValueError("pipeline.console 需要是映射（url/api_key/flow_id/refresh_secs/cache_path）")
+    shadow_raw = p.get("shadow_console") or {}
+    if not isinstance(shadow_raw, dict):
+        raise ValueError("pipeline.shadow_console 需要是映射（url/api_key/flow_id）")
     return PipelineConfig(
         console=PipelineConsoleConfig(
             url=_expand_env(console_raw.get("url") or "").strip(),
@@ -549,6 +556,12 @@ def _load_pipeline(raw: dict) -> PipelineConfig:
             refresh_secs=max(30, int(console_raw.get("refresh_secs", 300))),
             cache_path=_expand_env(console_raw.get("cache_path") or "").strip()
             or "~/.issue-keeper/pipeline/flow-cache.json",
+        ),
+        shadow_console=PipelineConsoleConfig(
+            url=_expand_env(shadow_raw.get("url") or "").strip(),
+            api_key=_expand_env(shadow_raw.get("api_key") or "").strip(),
+            flow_id=(shadow_raw.get("flow_id") or "").strip(),
+            refresh_secs=max(30, int(shadow_raw.get("refresh_secs", 300))),
         ),
         observability_redis=_expand_env(p.get("observability_redis") or "").strip(),
     )

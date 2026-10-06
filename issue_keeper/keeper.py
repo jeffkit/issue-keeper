@@ -1948,11 +1948,17 @@ def _dispatch_shadow_execution(config, binding, res, label: str,
 
     from . import console_exec as _ce
 
-    try:
-        client = _ce.client_from_config(config)
-    except _ce.ConsoleExecError as e:
-        log.warning("[%s] 影子派发跳过（console 不可用）：%s", label, e)
-        return
+    # 影子目标 = 新系统 console。优先专用 `shadow_console`（不干扰既有
+    # pipeline.console——后者仍服务 screener/bridge 的旧链路），缺省回退它。
+    shadow_pc = getattr(config.pipeline, "shadow_console", None)
+    if shadow_pc is not None and shadow_pc.url and shadow_pc.api_key:
+        client = _ce.ConsoleExecClient(shadow_pc.url, shadow_pc.api_key)
+    else:
+        try:
+            client = _ce.client_from_config(config)
+        except _ce.ConsoleExecError as e:
+            log.warning("[%s] 影子派发跳过（console 不可用）：%s", label, e)
+            return
 
     flow_id = pc.shadow_flow_id or pc.console_flow_id or "self-improve-v2"
     goal = f"#{res.number} {res.title or ''}\n\n{(res.body or '')[:16000]}".strip()
@@ -2310,7 +2316,11 @@ def _collect_shadow_result(config, binding, artifact_dir: Path, label: str) -> N
         return
     try:
         from . import console_exec as _ce
-        client = _ce.client_from_config(config)
+        shadow_pc = getattr(config.pipeline, "shadow_console", None)
+        if shadow_pc is not None and shadow_pc.url and shadow_pc.api_key:
+            client = _ce.ConsoleExecClient(shadow_pc.url, shadow_pc.api_key)
+        else:
+            client = _ce.client_from_config(config)
         info = client.get_execution(eid)
     except Exception as e:  # noqa: BLE001 — 影子回收失败绝不影响主流程
         log.debug("[%s] 影子回收跳过（%s）", label, e)
