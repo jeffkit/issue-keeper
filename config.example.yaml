@@ -142,6 +142,15 @@ pipeline_repos:
       - name: clippy
         command: cargo clippy --workspace --all-targets --all-features -- -D warnings
         timeout_secs: 1800
+      # recursive CI 的 feature matrix（.github/workflows/ci.yml 的 feature-matrix job）跑 8 个
+      # 变体（bare = no-default-features，另 7 个单特性）；本地只复刻最便宜的 bare 变体，
+      # 补 #94 这类 feature-gating 编译盲区——cfg 掉的使用点只在缺该 feature 时暴露
+      #（unused import / unused variable 被 `-D warnings` 拦下）。增量成本 ≤ ~2 分钟
+      #（增量缓存下仅 lib 重编一次），不跑全 8 变体；600s 为冷缓存余量。
+      - name: feature-matrix-bare
+        command: cargo clippy --lib --no-default-features -- -D warnings
+        timeout_secs: 600
+        paths: ['src/**', 'Cargo.toml', 'Cargo.lock']
       - name: test
         command: cargo test --workspace --no-fail-fast
         timeout_secs: 2400
