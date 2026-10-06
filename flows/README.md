@@ -106,7 +106,7 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
       ├─ invalid(已在 main 修复/无需改动) → 回评 → END        ← #17 重派问题根治
       └─ actionable
          └─ git fetch --prune（clone 新鲜度）
-            └─ worktree add（并发隔离，基线显式 origin/main，防夹带本地未推送提交）
+            └─ worktree prep（幂等：复用 / prune+复用残留分支重建 / 失败回评）
                └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
                   └─ plan(agent 10min) → 02-plan.md（含 COMMIT_MESSAGE）
                      └─ [review_mode=human 且 risk=high → HITL 1h；未批准 → 「暂缓」回评 END]
@@ -223,6 +223,43 @@ recursive 侧 agent 实测报来的两个可修点（+一条跨渠道校验建�
    （依赖闭合自动唤醒或人工接手）。GitHub 仓不经此路径——工作台是从台账/metrics
    派生的只读视图。
 
+## issue #13 处置（2026-10-06）：重派路径的建树缺口
+
+**现象**：重派（`reopen` / engine_error 自动重试）首跳即 **engine_error 终态、不可续跑**，
+回评都没发出——`RESULT {"status": "engine_error", "error": "执行节点setup出错了:
+RuntimeError: FileNotFoundError: ... .worktrees/issue-8 (源码第 208 行)"}`（agentproc#8/#17）。
+
+**根因**：清树（worktree 目录被回收 / reaper 收尾）时 **`pipeline/issue-N` 分支留在仓里**
+（分支由 `-b` 建，清树不动 refs）。旧建树段 `wt_add = CAPTURE(git worktree add <dir> -b
+<branch> origin/<base>)` 必撞「branch already exists」（实测 rc 255），而 **CAPTURE 对非零退出
+不中止流程、其返回码在流程里从未被引用** → 失败被静默吞掉；随后 `setup` code 节点拿
+不存在的目录当 cwd，只 catch `TimeoutExpired` → `FileNotFoundError` 逃逸出节点 = 引擎层异常。
+`setup_command` 为空的仓（recursive / issue-keeper / ilink-hub）更隐蔽：setup 早退不报错，
+炸弹推给 `investigate`/`guard` 等下游节点，**同样是 engine_error，只是死得晚**。
+
+**修法**（`flows/issue_pipeline_flow.py`，编译后 73 节点）：
+- `wt_add` capture → **`wt_prep` code 节点**（幂等判定顺序写死）：
+  ① 目录已是合法 worktree（`rev-parse --is-inside-work-tree` = true）→ 复用上一轮现场；
+  ② 否则 `git worktree prune`（清掉「目录没了、注册还在」的失效项）后，
+     **分支存在 → `worktree add <dir> <branch>` 复用残留分支重建**（保留 keeper 的
+     `wip(issue-N)` 快照提交）；分支不存在 → `worktree add <dir> -b <branch> origin/<base>`
+    首发语义不变；
+  ③ 仍失败（目录非空 / 分支被别的 worktree 占用 / 其他 rc≠0）→
+     `reply_prep_fail → post_prep_fail → END(partial)`，**绝不进 setup/investigate**。
+- `setup` 加固：**空命令早退之前**先判 `worktree_dir` 是否存在（缺失 → `ok=False`，让既有
+  `setup.ok == False → reply_setup_fail` 出口接管，补上此前缺失的 `ok` 键）；`except` 从
+  `TimeoutExpired` 扩到 `(TimeoutExpired, OSError)`（覆盖 cwd 竞态消失等残余路径）。
+
+**重现/回归命令**（离线，不真打 GitHub/LLM）：
+`python3 -m pytest tests/test_issue13_worktree_redispatch.py -q`（清树后重派 / 残留注册 / 缺 cwd /
+首发正向对照 / 编译产物结构断言）。人工复核：
+`git -C <main_clone> worktree add <clone>/.worktrees/issue-N pipeline/issue-N` → `rm -rf` 该目录 →
+重放 `wt_prep`：`prune → add <dir> pipeline/issue-N` rc=0，`git -C <dir> log` 仍见 `wip(issue-N)`。
+
+**发布**：重建 `flows/issue-pipeline.flow.json`（JSON 是产物，不手改）→ console 发布
+**v2.1.2**（节点类型未变，无需 `pip install -e .`）。发布前 bridge 仍按 console 定义执行，
+**不发布 = 修复不生效**。
+
 ## v1.0.5（2026-09-28）：document 提示词 + 质量门转真
 
 - **`document` 段会张冠李戴**：#43 落地时发现它写的 CHANGELOG 条目描述的是 **#45** 的改动
@@ -289,8 +326,10 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
   `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
   改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
   semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
-  `POST /api/flows/{id}/publish`）；当前已发布 **v1.0.3**（1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式
-   `sandbox_backend="subprocess"`——编译器修好后节点级字段才真正进 IR）。
+  `POST /api/flows/{id}/publish`）；当前已发布 **v2.1.2**（2.1.2：`wt_prep` 幂等建树 +
+  setup 缺 cwd 降级回评，#13；1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式
+   `sandbox_backend="subprocess"`——编译器修好后节点级字段才真正进 IR。此行此前长期
+  滞后于 console 实际版本，以 console 最高已发布 semver 为准）。
 - **观测上报**：`payload.observability_redis` 非空时，每次 run 写
   `plaita:execution:{id}`（console 执行列表/详情可见，30 天过期）+ 逐节点
   publish `plaita:execution:events:{id}`（`/executions/{id}/stream` SSE 实时
@@ -329,10 +368,15 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
    `pushed=True`，跳过 `git add/commit/push`——重复投递时工作区里新产生的改动被静默
    丢弃（#45：第二份 run 的改动没进任何提交，只留在 worktree）。重跑语义要么先比
    `HEAD` 与远端，要么无条件 commit 后再判 push。
-7. **`wt_add` 非幂等（2026-09-28 发现）**：`git worktree add <dir> -b <branch> origin/main`
-   在 worktree/分支已存在时失败，而 capture 节点对非零退出不中止流程——于是重投会
-   静默复用**旧的** worktree 基线（#45 的两份「实施记录」正是两个 run 挤在同一
-   worktree）。应在 `wt_add` 前判存在并显式 reset 到 `origin/main`。
+7. ~~**`wt_add` 非幂等（2026-09-28 发现）**~~ **已修（#13，2026-10-06）**：`git worktree
+   add <dir> -b <branch> origin/main` 在 worktree/分支已存在时失败，而 capture 节点对
+   非零退出不中止流程——重投会静默复用**旧的** worktree 基线（#45 的两份「实施记录」
+   正是两个 run 挤在同一 worktree）。旧建议「判存在并显式 reset 到 `origin/main`」**已被
+   否决**：管线分支上可能有 keeper 的 `wip(issue-N)` 快照提交，reset 会把它抹掉。
+   现行语义 = 幂等 `wt_prep`（见「issue #13 处置」）：worktree 就绪则复用；否则
+   `worktree prune` 后**复用残留分支重建**（保留 wip 提交）；目录缺失且分支不存在才
+   按 `-b <branch> origin/<base>` 首发；仍失败 → `reply_prep_fail` 回评 partial。
+   **禁止** `-B` / `reset --hard` / `branch -D` 任何形式的「清干净再来」。
 8. **keeper 串行阻塞（2026-09-28）**：`_invoke_pipeline` 同步等 bridge，单 run 最长
    `pipeline_timeout_secs`（5400s），期间整个 17 仓轮询停摆（#45 实测卡 28 分钟）。
    与第 4 条的 per-repo 队列化一并做。

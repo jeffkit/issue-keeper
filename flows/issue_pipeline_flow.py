@@ -4,7 +4,7 @@
 生成 JSON：python3 flows/build_issue_pipeline.py（产物 flows/issue-pipeline.flow.json）
 
 v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓形状：
-  - 基线分支 INPUT.base_branch（wt_add/sync_main/git_publish 全链参数化；
+  - 基线分支 INPUT.base_branch（wt_prep/sync_main/git_publish 全链参数化；
     argusai 家族 develop、deepseek-harness master 不再被硬编码 origin/main 绊倒）
   - INPUT.setup_command：fresh worktree 无 node_modules/.venv，TS/Python 仓装依赖
   - 质量门 INPUT.test_command + INPUT.gate_timeout_secs：单命令或多门
@@ -17,6 +17,11 @@ v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓
   - 各 agent 段预算 INPUT.*_timeout（默认值 = 旧全局值，per-repo 可覆盖）
   - 提示词显式要求先读目标仓 AGENTS.md/CLAUDE.md——仓规契约的主人是各仓
   - push_mode 支持 pr（gh pr create，PR 制仓）与 none（不出害，仅本地 commit）
+
+v0.3.1（#13）建树幂等自愈：worktree 段不再是 `worktree add -b`（幂等性为零、
+  返回码无人消费），改为 `wt_prep` code 节点（复用 / prune / 复用残留分支重建 /
+  失败 → `reply_prep_fail` 回评 partial 终态）；`setup` 对缺失 cwd 如实降级为
+  `ok=False`（不再让 FileNotFoundError 逃逸成 engine_error 终态）。
 
 角色分离（10-04 拍板：全链 DeepSeek flash，GLM 限流切回）：
   - deepseek-flash 全部段：triage / investigate / plan / implement / fix /
@@ -197,20 +202,71 @@ def issue_pipeline(INPUT):
         command=["git", "-C", INPUT.main_clone, "fetch", "origin", "--prune"],
         timeout_secs=180,
     )
-    CAPTURE(
-        id="wt_add",
-        command=["git", "-C", INPUT.main_clone, "worktree", "add", INPUT.worktree_dir,
-                 "-b", INPUT.branch_name, F.concat("origin/", INPUT.base_branch)],
-        timeout_secs=120,
+    # v0.3.1：建树必须幂等且可自愈——重派/续跑时 worktree 可能已被回收（目录没了，
+    # 但 `-b` 建过的 pipeline/issue-N 分支还留在仓里），旧写法 `worktree add -b`
+    # 必撞「branch already exists」，且 CAPTURE 的返回码无人消费（#13：洞一路漏到
+    # setup 的 cwd → FileNotFoundError → engine_error 终态）。故改 code 节点：
+    # 复用已有 worktree → prune → 复用残留分支重建 → 仍失败则如实回评 partial。
+    # 禁止 `-B` / `reset --hard` / `branch -D`：残留分支上可能有 keeper 的 wip 快照提交。
+    wt_prep = CODE.python(
+        sandbox_backend="subprocess",
+        code=(
+            "def run(input):\n"
+            "    import os, subprocess\n"
+            "    main, wt, branch = input['main_clone'], input['worktree_dir'], input['branch_name']\n"
+            "    base = input.get('base_branch') or 'main'\n"
+            "    def git(*args, cwd=None):\n"
+            "        return subprocess.run(['git', '-C', cwd or main, *args], capture_output=True, text=True)\n"
+            "    def ready():\n"
+            "        if not os.path.isdir(wt):\n"
+            "            return False\n"
+            "        r = git('rev-parse', '--is-inside-work-tree', cwd=wt)\n"
+            "        return r.returncode == 0 and r.stdout.strip() == 'true'\n"
+            "    if ready():\n"
+            "        return {'ok': True, 'note': 'worktree 已存在，复用上一轮现场'}\n"
+            "    git('worktree', 'prune')\n"
+            "    if git('rev-parse', '--verify', '--quiet', 'refs/heads/' + branch).returncode == 0:\n"
+            "        r = git('worktree', 'add', wt, branch)\n"
+            "    else:\n"
+            "        r = git('worktree', 'add', wt, '-b', branch, 'origin/' + base)\n"
+            "    tail = ((r.stdout or '') + (r.stderr or ''))[-500:]\n"
+            "    if r.returncode == 0 and ready():\n"
+            "        return {'ok': True, 'note': 'worktree 就绪'}\n"
+            "    return {'ok': False, 'note': 'worktree 建立失败 rc=' + str(r.returncode), 'error': tail}\n"
+        ),
+        input={"main_clone": INPUT.main_clone, "worktree_dir": INPUT.worktree_dir,
+               "branch_name": INPUT.branch_name, "base_branch": INPUT.base_branch},
     )
+    if wt_prep.ok == False:
+        reply_prep_fail = AGENTRUN(
+            agent="deepseek-flash",
+            repo=INPUT.main_clone,
+            timeout_secs=600,
+            prompt=(
+                "为 GitHub issue 写评论（直接给正文）：工作目录准备失败，自动处理停止。"
+                "失败信息：{% $NODE.wt_prep.note %}；输出尾部：{% $NODE.wt_prep.error %}。"
+                "请维护者检查该仓 `.worktrees/issue-N` 是否被外部回收、或管线分支是否被占用。"
+                "纯文本 3-5 句，不要出现任何本机路径或凭据信息。"
+            ),
+        )
+        post_prep_fail = GITHUB_COMMENT(
+            repo=INPUT.repo_full,
+            issue_number=INPUT.issue_number,
+            text=F.concat('<!-- issue-pipeline -->\n', reply_prep_fail.text),
+            artifact_dir=INPUT.artifact_dir,
+        )
+        return {"status": "partial", "posted": post_prep_fail.posted}
     # v0.3：依赖安装（fresh worktree 无 node_modules/.venv——TS/Python 仓的
     # 门若不先装依赖第一跑就挂）。setup_command 空则跳过。
     setup = CODE.python(
         sandbox_backend="subprocess",
         code=(
             "def run(input):\n"
-            "    import subprocess\n"
+            "    import os, subprocess\n"
             "    cmd = (input.get('setup_command') or '').strip()\n"
+            "    if not os.path.isdir(input['worktree_dir']):\n"
+            "        return {'ran': False, 'ok': False,\n"
+            "                'note': 'worktree 目录不存在（建树失败或被外部回收），跳过 setup'}\n"
             "    if not cmd:\n"
             "        return {'ran': False, 'note': '无 setup 命令，跳过'}\n"
             "    try:\n"
@@ -220,8 +276,8 @@ def issue_pipeline(INPUT):
             "        if r.returncode != 0:\n"
             "            return {'ran': True, 'ok': False, 'note': 'setup 失败', 'error': tail}\n"
             "        return {'ran': True, 'ok': True, 'note': 'setup 完成', 'tail': tail}\n"
-            "    except subprocess.TimeoutExpired:\n"
-            "        return {'ran': True, 'ok': False, 'note': 'setup 超时'}\n"
+            "    except (subprocess.TimeoutExpired, OSError):\n"
+            "        return {'ran': True, 'ok': False, 'note': 'setup 超时或工作目录不可用'}\n"
         ),
         input={"worktree_dir": INPUT.worktree_dir, "setup_command": INPUT.setup_command,
                "setup_timeout_secs": INPUT.setup_timeout_secs},
