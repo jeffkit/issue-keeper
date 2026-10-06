@@ -109,6 +109,24 @@ def client_from_config(config) -> ConsoleExecClient:
     return ConsoleExecClient(pc.url, pc.api_key)
 
 
+def engine_client_from_config(config) -> ConsoleExecClient:
+    """engine=v2-console **真执行**派发/收尾的 client（2026-10-06 修正）。
+
+    与 ``client_from_config``（旧链路 screener/bridge 用 ``pipeline.console``）
+    区分：v2-console 的语义是「走新系统执行」，目标应是**新系统 console**
+    （``pipeline.shadow_console``，多机 worker 集群所在）。此前两者共用
+    ``pipeline.console``，导致金丝雀首次试切把单派进了本机旧 console
+    （8123，本地单机档），而非新系统（远端 8323）——实测缺口。
+
+    ``shadow_console`` 未配（url/api_key 空）时回退 ``pipeline.console``：
+    单机演练/无新系统场景行为不变（零回归）。
+    """
+    sc = getattr(config.pipeline, "shadow_console", None)
+    if sc is not None and sc.url and sc.api_key:
+        return ConsoleExecClient(sc.url, sc.api_key)
+    return client_from_config(config)
+
+
 # ---- verdict 提取与映射（D5：台账写入责任迁到 keeper） ----
 
 def verdict_from_execution(detail: dict) -> dict:
