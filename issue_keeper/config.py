@@ -106,6 +106,14 @@ class PipelineRepoConfig:
     # engine=v2-console 时派发到 console 的 flow id（已发布的 self-improve v2
     # flow）。空 = "self-improve-v2"。
     console_flow_id: str = ""
+    # 影子模式（放量迁移首阶）：本地照常主执行（engine 不变），**同时**旁路派发
+    # 一份到 console 只做验证——影子那份不落地（不发评论/不 push/不改仓）。用于
+    # 「新旧并行对账」：同一 issue 两套结论差异是影子期核心产出。默认关。
+    # 红线：影子副本绝不写 console-exec.json 在途锚（否则 reaper 会把本地主的
+    # 台账当成 console 在途而误判收尾）。
+    shadow: bool = False
+    # 影子副本派发到 console 的 flow id（空 = 复用 console_flow_id / 默认 flow）。
+    shadow_flow_id: str = ""
     # 注入各 agent 段提示词的仓内知识（红线/路由/文档惯例）——替代硬编码在
     # 通用 flow 里的 recursive 专属内容
     review_notes: str = ""
@@ -347,6 +355,8 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
             reviewer=str(item.get("reviewer") or "").strip(),
             engine_env={str(k): str(v) for k, v in (item.get("engine_env") or {}).items()},
             console_flow_id=str(item.get("console_flow_id") or "").strip(),
+            shadow=bool(item.get("shadow", False)),
+            shadow_flow_id=str(item.get("shadow_flow_id") or "").strip(),
             review_notes=str(item.get("review_notes") or ""),
             triage_notes=str(item.get("triage_notes") or ""),
             doc_notes=str(item.get("doc_notes") or ""),

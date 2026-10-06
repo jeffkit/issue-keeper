@@ -1853,6 +1853,10 @@ def _dep_settled(config, repo_full: str, num: int) -> bool:
 # console-exec.json = 在途记录（daemon 重启不丢，reaper 据此轮询）；锁文件写
 # 哨兵串（非数字，_lock_holder 视为无 pid 但不删——在途判定走记录文件）。
 CONSOLE_EXEC_RECORD = "console-exec.json"
+# 影子副本在途锚（与主锚分离——reaper 只认主锚，影子绝不进收尾分流）
+SHADOW_EXEC_RECORD = "shadow-exec.json"
+# 影子副本结果（对账用；只读产物，不进台账）
+SHADOW_RESULT_RECORD = "shadow-result.json"
 CONSOLE_LOCK_SENTINEL = "console"
 
 
@@ -1927,6 +1931,59 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
     log.info("[%s] 已提交 console execution %s（flow=%s，run=%s）",
              label, execution_id, flow_id, run_id)
     return {"status": "dispatched", "comment_posted": True}
+
+
+def _dispatch_shadow_execution(config, binding, res, label: str,
+                                pc: PipelineRepoConfig, artifact_dir: Path) -> None:
+    """影子模式（放量迁移首阶）：本地主执行已在跑，这里再旁路派一份到 console。
+
+    影子副本的**唯一目的**是产出「同一 issue 在新系统下的结论」供对账，因此：
+    - **绝不**写 console-exec.json 在途锚（reaper 会把本地主的台账误判为 console
+      在途）；影子锚单独落 shadow-exec.json，仅供对账读取；
+    - 失败**只记日志不抛**——影子绝不能影响本地主执行的成败；
+    - 落 shadow-result.json（收尾时由 reaper 的 shadow 回收器补写，见
+      _collect_shadow_results）。
+    """
+    import time as _time
+
+    from . import console_exec as _ce
+
+    try:
+        client = _ce.client_from_config(config)
+    except _ce.ConsoleExecError as e:
+        log.warning("[%s] 影子派发跳过（console 不可用）：%s", label, e)
+        return
+
+    flow_id = pc.shadow_flow_id or pc.console_flow_id or "self-improve-v2"
+    goal = f"#{res.number} {res.title or ''}\n\n{(res.body or '')[:16000]}".strip()
+    run_id = f"shadow-{res.number}-{_time.strftime('%m%d%H%M%S')}"
+    params = {
+        "goal": goal,
+        "repo": binding.cwd,
+        "run_id": run_id,
+        "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
+        "agent": pc.agent or "deepseek-flash",
+        "reviewer": pc.reviewer or "deepseek-flash",
+        "shadow": True,          # 供 flow/worker 侧识别并强制不落地（阶段 1a 后启用）
+    }
+    try:
+        execution_id = client.start_execution(flow_id, params)
+    except _ce.ConsoleExecError as e:
+        log.warning("[%s] 影子派发失败（flow=%s，不影响主执行）：%s", label, flow_id, e)
+        return
+
+    rec = {
+        "execution_id": execution_id, "flow_id": flow_id, "run_id": run_id,
+        "engine": "shadow", "shadow_of": "local",
+        "dispatched_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        (artifact_dir / SHADOW_EXEC_RECORD).write_text(
+            json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log.warning("[%s] 写影子锚失败: %s", label, e)
+    log.info("[%s] 影子副本已提交 console execution %s（flow=%s，run=%s）——只算不发，不影响主执行",
+             label, execution_id, flow_id, run_id)
 
 
 def _reap_console_execution(config, binding, it, key, label: str,
@@ -2068,6 +2125,9 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         # 生产路径总是先过 _pipeline_repo_cfg 门控再传入；直接调用（测试/工具）
         # 时退到无门控解析——空门会在 flow 的 GATE 节点大声失败（不再假绿）。
         pc = config.pipeline_repo_cfg(binding.repo)
+    # 仓库契约的稳定别名：`pc` 下方会被 config.pipeline.console 顶掉（既有无害
+    # 遮蔽），影子等需要 per-repo 契约的逻辑一律读 repo_pc，避免踩遮蔽。
+    repo_pc = pc
 
     bridge = Path(config.pipeline_bridge).expanduser()
     if pc.engine == "v2":
@@ -2198,6 +2258,17 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
     # 注意：这里**不**清 retry_later_streak（#6）——它是「本轮是自动重派」的判据，
     # 清了每轮都从 7min 重来，认领评论抑制也失效。
 
+    # 影子模式（放量迁移首阶）：本地主执行已起，旁路再派一份到 console 供对账。
+    # 失败只记日志、不抛——影子绝不能影响主执行；且影子**不写** console-exec.json
+    # 在途锚，故 reaper 的收尾分流（认主锚）不会把本地台账误判为 console 在途。
+    # 注：`pc` 已在上方被 `config.pipeline.console` 顶掉（既有无害遮蔽），故影子
+    # 判定必须用一开始就捕获的仓库契约 `repo_pc`。
+    if repo_pc.shadow:
+        try:
+            _dispatch_shadow_execution(config, binding, res, label, repo_pc, artifact_dir)
+        except Exception as e:  # noqa: BLE001 — 影子是旁路，任何异常都不该外溢
+            log.warning("[%s] 影子派发异常（已忽略，不影响主执行）: %s", label, e)
+
     # 认领评论（可关）：多会话/多人并行时，这是「谁在做」的机器可读信号——
     # 2026-09-29 与另一会话在同一 issue 上撞车的教训。
     # #6/#12：本轮为自动重派（retry-later / failed / engine_error 三支共用
@@ -2214,6 +2285,54 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         except Exception as e:
             log.warning("[%s] 认领评论失败（不影响派发）: %s", label, e)
     return {"status": "dispatched", "comment_posted": True}
+
+
+def _collect_shadow_result(config, binding, artifact_dir: Path, label: str) -> None:
+    """影子副本回收（放量迁移首阶）：轮询 shadow 执行的终态，落结果供对账。
+
+    **只读语义**：仅记录 console 侧执行的成败/耗时到 shadow-result.json；绝不写
+    台账、不发评论、不动本地主执行的任何状态。终态落定后删 shadow-exec.json 锚
+    （避免每轮重复轮询）。
+    """
+    import time as _time
+
+    anchor_file = artifact_dir / SHADOW_EXEC_RECORD
+    if not anchor_file.exists():
+        return
+    try:
+        rec = json.loads(anchor_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        anchor_file.unlink(missing_ok=True)
+        return
+    eid = rec.get("execution_id")
+    if not eid:
+        anchor_file.unlink(missing_ok=True)
+        return
+    try:
+        from . import console_exec as _ce
+        client = _ce.client_from_config(config)
+        info = client.get_execution(eid)
+    except Exception as e:  # noqa: BLE001 — 影子回收失败绝不影响主流程
+        log.debug("[%s] 影子回收跳过（%s）", label, e)
+        return
+    status = str((info or {}).get("status") or "")
+    if status in ("queued", "running", "pending", ""):
+        return  # 仍在途，下轮再查
+    out = {
+        "execution_id": eid, "flow_id": rec.get("flow_id"), "run_id": rec.get("run_id"),
+        "shadow_status": status,
+        "start_time": (info or {}).get("start_time"),
+        "end_time": (info or {}).get("end_time"),
+        "error": (info or {}).get("error"),
+        "collected_at": _time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        (artifact_dir / SHADOW_RESULT_RECORD).write_text(
+            json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        log.warning("[%s] 写影子结果失败: %s", label, e)
+    anchor_file.unlink(missing_ok=True)
+    log.info("[%s] 影子副本终态=%s（已落 shadow-result.json 供对账）", label, status)
 
 
 def _reap_pipelines(config, state, bindings) -> int:
@@ -2241,6 +2360,13 @@ def _reap_pipelines(config, state, bindings) -> int:
             slug = binding.repo.split("/")[-1]
             artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{key}").expanduser()
             lock = artifact_dir / PIPELINE_LOCK_NAME
+
+            # 影子副本回收（放量迁移首阶·只读）：有 shadow 锚就查一次终态落对账结果。
+            # 纯旁路——不写台账、不改主执行状态，失败静默。
+            try:
+                _collect_shadow_result(config, binding, artifact_dir, label)
+            except Exception as e:  # noqa: BLE001
+                log.debug("[%s] 影子回收异常（忽略）: %s", label, e)
 
             console_rec = _console_exec_record(artifact_dir)
             if console_rec is not None:
