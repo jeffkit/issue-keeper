@@ -64,9 +64,14 @@ plaita-nodes **0.6.0** 新增三节点（`dff35ab`+`ca1654d`，已推 origin）�
 - **`github_comment`×9**：替代 post_* 九连拷——消毒（路径/密钥/`$()` 打码）、
   `dedup_marker` 去重、`footer` 尾注（成功路径核验行由 `F.concat` 拼 `pub.pushed`/`pub.note`）、
   artifact 留档；dry-run 写草稿不连网；
-- **`parse_json`×2**：替代 parsed/verdict——#43 健壮解析策略沉淀入库（逐行倒序严格
+- **`parse_json`×2**（#17 起 ×3，见下）：替代 parsed/verdict——#43 健壮解析策略沉淀入库（逐行倒序严格
   JSON → rfind 切片），`choices` verdict 白名单 + `default` fail-safe（明细追加进
   `notes`/`parse_error`）；triage 的 acceptance 经 `join_fields` 自动拼 `acceptance_str`；
+  **#17**：triage 侧 `default.verdict` 退出 choices（`"degraded"`）——「解析失败」
+  （基础设施故障）与「真判 blocked」（业务判定）从此可区分，失败路径由
+  `parsed.parse_ok != True` 路由进降级分支；分支里的第三个 `parse_json`（`salvage`，
+  去掉 verdict 白名单）只做一次容错重解析、结果进注解，**不接业务出害口**（否则要给
+  blocked/invalid 各复制一套回评提示词）；
 - **`git_publish`×1**：替代 deliver+merge，并**修掉缺口 #6**——旧 deliver 见远端已有
   分支就跳过 commit（重投丢改动），新语义=有改动一律先 commit、远端头==本地头才
   跳过 push；main 模式 ff 合并 `origin/<branch>` 不变。
@@ -104,7 +109,8 @@ screener闸(INPUT.screener_verdict != safe → 拒评短路)
    └─ triage(agent, 查重+定级, 正文只经 body_file；依赖门硬判据)
       ├─ blocked(依赖未就绪/已有在途) → 回评 → END
       ├─ invalid(已在 main 修复/无需改动) → 回评 → END        ← #17 重派问题根治
-      └─ actionable
+      ├─ 解析失败（基础设施故障，非业务判定）→ 落盘 triage-raw.txt + 明示故障回评 → 降级继续（不落 blocked）
+      └─ actionable / degraded
          └─ git fetch --prune（clone 新鲜度）
             └─ worktree add（并发隔离，基线显式 origin/main，防夹带本地未推送提交）
                └─ investigate(agent 10min, bug 先立失败测试) → 01-investigation.md
@@ -133,7 +139,8 @@ HITL 条件化+未批准即停、partial/hold 如实「未推送」、deliver/�
 ls-remote 查重）、diff 护栏（.github/** 与超大 diff）、评论出害前消毒
 （本机路径/密钥模式 → [REDACTED]）、git fetch 同步（origin/main 基线）、
 triage 区分 invalid/blocked-in-flight、
-解析失败 fail-safe（triage→blocked 人工复核；review→abort）。
+解析失败 fail-safe（triage→基础设施故障：落盘 + 明示故障回评 + 降级继续，#17 起；
+review→abort）。
 
 **部署强制项（README 职责，不落 flow）**：
 1. 默认 `push_mode: branch`；`main` 模式必须 HITL 可用（HITL_BASE_URL/HITL_URL 已配），
@@ -271,7 +278,8 @@ recursive 侧 agent 实测报来的两个可修点（+一条跨渠道校验建�
 返回（end output）：`{status: done|rejected|blocked|invalid|nochange|abort|partial|
 guarded|onhold|readonly, tests_passed, pushed, merged, comment_posted, kanban_ok}`。
 keeper 按 status 决定重派/告警/转人工；`comment_posted=false` 必须告警
-（readonly=只调查不开工的终态，v0.3 新增）。
+（readonly=只调查不开工的终态，v0.3 新增）。状态名 #17 未新增：triage 解析失败
+不再产生 `blocked`（判不出 ≠ 判为否），该 run 走后续真实终态。
 
 **comment_posted 归一化**：成功路径直接返回 `comment_posted`；业务早退路径历史返回
 `posted`——`pipeline_bridge.py` 在出口统一补齐别名（缺 `comment_posted` 时用 `posted`
