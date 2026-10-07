@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""keeper 派发决策影子（**只读**）—— keeper→flow Phase 2 的第一件产物。
+
+目标：把「keeper 本轮会派发哪些 issue、其余为什么跳过」用 flow 形态**独立算一遍**，
+与现役 keeper 的实际决策影子对账；对账若干 case 后再切派发权（Phase 3）。
+
+红线（本 flow 只读）：
+- 不派发、不回评、不改 state.json / internal.db / GitHub；唯一输出 = 本机
+  `~/.issue-keeper/shadow/decisions-<ts>.json` + `latest.json`（落在执行机上）。
+- screener 是 LLM 判定，影子**不复制**（成本/非确定性）——对 keeper 尚未建状态的
+  issue 标记 `would_screen_then_dispatch`（预期发散类，对账时单列）。
+
+图结构（引擎逻辑在图里；CODE 只做 IO 叶子）：
+  facts（读 keeper config/state/runs.jsonl + gh 扫各仓 open issues → join 好的事实清单）
+    → MAP gate（图内 if/elif 链 = 闸门次序，对齐 keeper 实际判定）
+    → report（落盘 + 摘要）
+
+运行前提：**在保持有 keeper 状态的那台机上跑**（现为 tcloud_gz）——调度 params 里
+带 `repo=/home/ubuntu/projects/infra4agent/issue-keeper`，worker 亲和机制会把它
+交接给远端机（Mac worker 判路径不存在 → TaskNotForThisWorker 交接）。
+
+编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
+        python3 flows/build_keeper_shadow.py
+（code= 不能引用模块常量——codeflow 实锤坑；下列 code 一律写完整字面量。）
+"""
+from __future__ import annotations
+
+from plaita.dsl.codeflow import CODE, MAP, flow
+from plaita.node import register_code_node
+
+register_code_node(default_backend="subprocess")
+
+
+@flow("keeper-shadow", desc="【影子·只读】keeper 派发决策影子——每轮算一遍「会派谁/为何跳过」，与现役 keeper 对账；不做任何写入")
+def keeper_shadow(INPUT):
+    # ── ① 事实装载（IO 叶子：config/state/台账 + gh 扫单，join 成 items）─────
+    facts = CODE(id="facts", lang="python", input={"ik_home": INPUT.ik_home}, code="""
+def run(input):
+    import json, os, subprocess, time
+    IK = os.path.expanduser(input.get("ik_home") or "~/.issue-keeper")
+    # ---- keeper 配置（pipeline_repos / 闸门参数）
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(os.path.join(IK, "config.yaml"), encoding="utf-8")) or {}
+    except Exception as e:
+        return {"error": "config 读取失败: %s" % e, "items": [], "errors": [],
+                "generated_at": int(time.time()), "g_inflight": 0, "g_max": 0, "repos_scanned": 0}
+    repos = {k: v for k, v in (cfg.get("pipeline_repos") or {}).items()
+             if (v or {}).get("mode") != "readonly"}
+    g_max = int(cfg.get("pipeline_max_in_flight") or 0)
+    r_limits = {str(k): int(v) for k, v in (cfg.get("pipeline_repo_limits") or {}).items()}
+    issue_daily = int(cfg.get("pipeline_issue_daily_limit") or 0)
+    author_daily = int(cfg.get("author_daily_limit") or 0)
+    exempt = {str(a).lower() for a in (cfg.get("author_daily_limit_exempt") or [])}
+    allow = {str(a).lower() for a in (cfg.get("author_allowlist") or [])}
+    optout = [str(x) for x in (cfg.get("opt_out_labels") or ["keeper-ignore"])]
+    # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）
+    try:
+        st = json.load(open(os.path.join(IK, "state.json"), encoding="utf-8"))
+    except Exception:
+        st = {"repos": {}}
+    srepos = st.get("repos") or {}
+    # ---- 在途计数（镜像 keeper _count_in_flight：全网 in_flight_since 逐仓累计）
+    g_inflight = 0
+    r_inflight = {}
+    for slug, rv in srepos.items():
+        for _num, it in (((rv or {}).get("items")) or {}).items():
+            if it.get("in_flight_since"):
+                g_inflight += 1
+                r_inflight[slug] = r_inflight.get(slug, 0) + 1
+    # ---- 台账 runs.jsonl：今日有效 run 计数（与 keeper 同口径：非终态类才计额度）
+    NON_QUOTA = ("retry-later", "failed", "guarded", "partial")
+    today = time.strftime("%Y-%m-%d")
+    issue_today, author_today = {}, {}
+    try:
+        with open(os.path.join(IK, "pipeline", "runs.jsonl"), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if not str(rec.get("ts", "")).startswith(today):
+                    continue
+                if rec.get("status") in NON_QUOTA:
+                    continue
+                key = "%s#%s" % (rec.get("repo"), rec.get("issue"))
+                issue_today[key] = issue_today.get(key, 0) + 1
+                au = (rec.get("author") or "").lower()
+                if au:
+                    author_today[au] = author_today.get(au, 0) + 1
+    except Exception:
+        pass
+    # ---- 扫单（gh，按仓并行——sandbox 墙钟默认 10s，串行 14 仓必超）
+    now_ts = time.time()
+    items, errors = [], []
+    def _scan(repo_full):
+        try:
+            p = subprocess.run(["gh", "issue", "list", "--repo", repo_full, "--state", "open",
+                                "--limit", "100",
+                                "--json", "number,title,author,labels,createdAt,updatedAt"],
+                               capture_output=True, text=True, timeout=8)
+            if p.returncode != 0:
+                return repo_full, None, "gh exit=%s %s" % (p.returncode, (p.stderr or "").strip()[:160])
+            return repo_full, json.loads(p.stdout or "[]"), None
+        except Exception as e:
+            return repo_full, None, str(e)[:160]
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=6) as ex:
+        scanned = list(ex.map(_scan, sorted(repos)))
+    for repo_full, issues, err in scanned:
+        if err is not None:
+            errors.append("%s: %s" % (repo_full, err))
+            continue
+        slug = repo_full.replace("/", "-")
+        for iss in issues:
+            num = iss.get("number")
+            it = (((srepos.get(slug) or {}).get("items") or {}).get(str(num))) or {}
+            author = ((iss.get("author") or {}).get("login") or "")
+            labels = [l.get("name") for l in (iss.get("labels") or []) if isinstance(l, dict)]
+            items.append({
+                "repo": repo_full, "number": num,
+                "title": (iss.get("title") or "")[:120],
+                "author": author, "labels": labels,
+                "created_at": iss.get("createdAt") or "",
+                "updated_at": iss.get("updatedAt") or "",
+                "opt_out": any(l in optout for l in labels),
+                "allow_ok": (not allow) or (author.lower() in allow),
+                "has_state": bool(it),
+                "st_processed": bool(it.get("processed")),
+                "st_blocked": bool(it.get("blocked")),
+                "st_inflight": bool(it.get("in_flight_since")),
+                "st_retry_after": float(it.get("retry_after") or 0),
+                "st_screener_streak": int(it.get("screener_retry_streak") or 0),
+                "wakeup_deps": list(it.get("wakeup_deps") or []),
+                "issue_today": issue_today.get("%s#%s" % (repo_full, num), 0),
+                "author_today": author_today.get(author.lower(), 0),
+                "author_exempt": author.lower() in exempt,
+                "g_inflight": g_inflight, "g_max": g_max,
+                "r_inflight": r_inflight.get(slug, 0),
+                "r_limit": r_limits.get(repo_full, -1),
+                "issue_daily": issue_daily, "author_daily": author_daily,
+                "now_ts": now_ts,
+            })
+    return {"items": items, "errors": errors, "generated_at": now_ts,
+            "g_inflight": g_inflight, "g_max": g_max, "repos_scanned": len(repos)}
+""")
+
+    # ── ② 闸门判定（图内 if/elif 链；**次序对齐 keeper 实际判定顺序**：
+    #       cycle 级 processed 过滤 → opt-out → 在途 → 退避 → allowlist →
+    #       作者/单日限 → blocked → screener 退避 → 全局背压 → 按仓配额）──────
+    for x in MAP(NODE.facts.items, id="gate"):
+        if x.st_processed == True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "已处理（processed）"}
+        if x.opt_out == True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "opt-out 标签"}
+        if x.st_inflight == True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "已在途（同 issue run 在跑）"}
+        if x.st_retry_after > x.now_ts:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "retry-later 退避中"}
+        if x.allow_ok != True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "作者不在 allowlist"}
+        if x.author_exempt != True and x.author_daily > 0 and x.author_today >= x.author_daily:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "作者当日 run 达上限", "author_today": x.author_today}
+        if x.issue_daily > 0 and x.issue_today >= x.issue_daily:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "本 issue 当日 run 达上限", "issue_today": x.issue_today}
+        if x.st_blocked == True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "blocked（依赖/screener 判定）", "deps": x.wakeup_deps}
+        if x.st_screener_streak > 0:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "screener 未判定退避中", "streak": x.st_screener_streak}
+        if x.g_max > 0 and x.g_inflight >= x.g_max:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "全局背压满（在途到闸）",
+                    "g_inflight": x.g_inflight, "g_max": x.g_max}
+        if x.r_limit == 0:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "本仓停派（配额=0）"}
+        if x.r_limit > 0 and x.r_inflight >= x.r_limit:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "skip", "reason": "本仓配额满",
+                    "r_inflight": x.r_inflight, "r_limit": x.r_limit}
+        if x.has_state == True:
+            return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                    "decision": "would_dispatch", "reason": "可派发", "has_state": True}
+        return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
+                "decision": "would_dispatch", "reason": "可派发（需先过 screener：keeper 无该 issue 状态）",
+                "has_state": False}
+
+    # ── ③ 报告落盘（IO 叶子）────────────────────────────────────────────
+    rep = CODE(id="report", lang="python", input={"rows": NODE.gate, "ik_home": INPUT.ik_home,
+                                                  "facts_errors": NODE.facts.errors,
+                                                  "generated_at": NODE.facts.generated_at}, code="""
+def run(input):
+    import json, os, time
+    rows = input.get("rows") or []
+    IK = os.path.expanduser(input.get("ik_home") or "~/.issue-keeper")
+    outdir = os.path.join(IK, "shadow")
+    os.makedirs(outdir, exist_ok=True)
+    would = [r for r in rows if r.get("decision") == "would_dispatch"]
+    skips = {}
+    for r in rows:
+        if r.get("decision") != "would_dispatch":
+            skips[r.get("reason")] = skips.get(r.get("reason"), 0) + 1
+    doc = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "keeper-shadow flow（只读影子；对照物=现役 keeper 的 keeper.log 决策）",
+        "repos_scanned": len({r.get("repo") for r in rows}),
+        "total_open_matched": len(rows),
+        "would_dispatch": len(would),
+        "skip_by_reason": skips,
+        "facts_errors": input.get("facts_errors") or [],
+        "rows": rows,
+    }
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(outdir, "decisions-%s.json" % stamp)
+    for p in (path, os.path.join(outdir, "latest.json")):
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=2)
+    summary = "keeper-shadow: open=%d would_dispatch=%d skips=%s" % (
+        len(rows), len(would), json.dumps(skips, ensure_ascii=False))
+    return {"summary": summary, "path": path, "would_dispatch": len(would),
+            "facts_errors": doc["facts_errors"], "doc": doc}
+""")
+    return rep
