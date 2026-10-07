@@ -208,14 +208,27 @@ def run(input):
                                                      "ik_home": INPUT.ik_home,
                                                      "repo_root": INPUT.repo_root}, code="""
 def run(input):
-    import json, os, sys, time
-    allow = [str(x) for x in (input.get("dispatch_repos") or [])]
-    if not allow:
+    import json, os, re, sys, time
+    allow_raw = [str(x) for x in (input.get("dispatch_repos") or [])]
+    if not allow_raw:
         return {"mode": "shadow", "dispatched": [], "note": "dispatch_repos 空：纯影子，零写入"}
+    allow_all = "*" in allow_raw
+    allow = set(x for x in allow_raw if x != "*")
     ik = os.path.expanduser(input.get("ik_home") or "~/.issue-keeper")
     root = os.path.expanduser(input.get("repo_root") or "")
     if root and root not in sys.path:
         sys.path.insert(0, root)
+    # worker 进程 env 不含 keeper 的 env.sh（DEEPSEEK_API_KEY 等）——手工注入，
+    # 否则 screener 的 ${DEEPSEEK_API_KEY} 展开为空、LLM 调用必失败。
+    try:
+        envf = os.path.join(ik, "env.sh")
+        for line in open(envf, encoding="utf-8"):
+            m = re.match(r"[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)=(.+)", line.strip())
+            if m and m.group(1) not in os.environ:
+                v = m.group(2).split(" #", 1)[0].strip()   # 剥行内注释（env.sh 实有）
+                os.environ[m.group(1)] = v.strip('"').strip("'")
+    except OSError:
+        pass
     from issue_keeper.config import load_config
     from issue_keeper.sources import Resource
     from issue_keeper.state import load_state, save_state_item
@@ -226,36 +239,51 @@ def run(input):
                    for it in rs.items.values() if it.in_flight_since)
     budget = max(0, int(cfg.pipeline_max_in_flight or 0) - inflight)
     bindings = {b.repo: b for b in cfg.repos}
-    dispatched, skipped = [], []
-    for r in input.get("rows") or []:
+    src_cache = {}
+    out = {"mode": "canary", "allow": "*" if allow_all else sorted(allow),
+           "budget_left": budget, "screened": [], "dispatched": [], "skipped": []}
+
+    def _persist_fields(slug, num, it):
+        def _mut(x):
+            x.blocked = it.blocked
+            x.screener_retry_streak = it.screener_retry_streak
+            x.retry_after = it.retry_after
+            x.in_flight_since = it.in_flight_since
+        save_state_item(cfg.state_path, slug, str(num), _mut)
+
+    # 派发次序对齐 keeper：priority_repos 优先，其次按仓/单号（槽位竞争的公平性）
+    prio = set(cfg.pipeline_priority_repos or [])
+    rows = sorted(input.get("rows") or [],
+                  key=lambda r: (0 if r.get("repo") in prio else 1,
+                                 r.get("repo") or "", int(r.get("num") or 0)))
+    for r in rows:
+        repo, num = r.get("repo"), r.get("num")
+        if r.get("decision") != "would_dispatch":
+            continue
+        if not (allow_all or repo in allow):
+            continue
         if budget <= 0:
-            break
-        if r.get("decision") != "would_dispatch" or r.get("repo") not in allow:
+            out["skipped"].append({"repo": repo, "num": num, "why": "预算用尽（在途到闸）"})
             continue
-        if not r.get("has_state"):
-            skipped.append({"repo": r.get("repo"), "num": r.get("num"),
-                            "why": "无 keeper 状态（未过 screener）→ 留给 keeper"})
-            continue
-        b = bindings.get(r.get("repo"))
+        b = bindings.get(repo)
         if b is None:
-            skipped.append({"repo": r.get("repo"), "num": r.get("num"), "why": "无绑定"})
+            out["skipped"].append({"repo": repo, "num": num, "why": "无绑定"})
             continue
-        slug = r["repo"].split("/")[-1]
-        it = st.repo(slug).item(str(r["num"]))
+        slug = repo.split("/")[-1]
+        it = st.repo(slug).item(str(num))
         if it.in_flight_since:
-            skipped.append({"repo": r["repo"], "num": r.get("num"), "why": "状态已在途（并发窗口）"})
+            out["skipped"].append({"repo": repo, "num": num, "why": "状态已在途（并发窗口）"})
             continue
-        pc = cfg.pipeline_repo_cfg(r["repo"])
-        # 正文按需取（facts 不扫 body；只对真派发目标做一次 gh view）
+        pc = cfg.pipeline_repo_cfg(repo)
         import subprocess
         try:
-            p = subprocess.run(["gh", "issue", "view", str(r["num"]), "--repo", r["repo"],
+            p = subprocess.run(["gh", "issue", "view", str(num), "--repo", repo,
                                 "--json", "body,title,author,labels,createdAt,updatedAt"],
                                capture_output=True, text=True, timeout=8)
             d = json.loads(p.stdout or "{}") if p.returncode == 0 else {}
         except Exception:
             d = {}
-        res = Resource(kind="issue", number=int(r["num"]),
+        res = Resource(kind="issue", number=int(num),
                        title=d.get("title") or r.get("title") or "",
                        body=d.get("body") or "",
                        author=(d.get("author") or {}).get("login") or r.get("author") or "",
@@ -263,26 +291,59 @@ def run(input):
                        state="open", created_at=d.get("createdAt") or r.get("created_at") or "",
                        updated_at=d.get("updatedAt") or r.get("updated_at") or "",
                        status="", actor_type="agent")
-        label = "%s issue#%s" % (r["repo"], r["num"])
+        label = "%s issue#%s" % (repo, num)
+        # ── intake 承接：未过筛的单由 flow 走 screener（keeper 库同款语义）──
+        if not r.get("has_state"):
+            try:
+                sc = cfg.screener
+                src = K._ensure_source(b, src_cache)
+                vp = K._visible_prefix(b, cfg)
+                if sc.enabled and K._author_trusted_by_screener(cfg, res.author):
+                    out["screened"].append({"repo": repo, "num": num, "verdict": "trusted-pass"})
+                elif sc.enabled:
+                    msg = K._compose_new_message(b, res, src, K._agent_label(b, cfg), cfg)
+                    verdict = K._screen_or_block(msg, sc, label + " body")
+                    vd = K._screener_disposition(verdict, sc)
+                    if vd == "block":
+                        it.blocked = True
+                        it.screener_retry_streak = 0
+                        if sc.on_unsafe == "comment":
+                            K._post_unsafe_notice(src, b, res, cfg.bot_marker, vp,
+                                                  reason=verdict.reason)
+                        _persist_fields(slug, num, it)
+                        out["screened"].append({"repo": repo, "num": num, "verdict": "block"})
+                        continue
+                    if vd != "pass":
+                        K._hold_for_screener(src, b, cfg, res, sc, it, verdict,
+                                             visible_prefix=vp, label=label)
+                        _persist_fields(slug, num, it)
+                        out["screened"].append({"repo": repo, "num": num, "verdict": vd})
+                        continue
+                    out["screened"].append({"repo": repo, "num": num, "verdict": "pass"})
+            except Exception as e:
+                out["skipped"].append({"repo": repo, "num": num,
+                                       "why": "screener 异常: %s" % str(e)[:140]})
+                continue
+        # ── 派发（keeper 库同款：payload/产物/锚 一字不差）──
         try:
             pres = K._dispatch_pipeline(cfg, b, res, it, label, pc=pc)
         except Exception as e:
-            skipped.append({"repo": r["repo"], "num": r.get("num"),
-                            "why": "派发异常: %s" % str(e)[:160]})
+            out["skipped"].append({"repo": repo, "num": num,
+                                   "why": "派发异常: %s" % str(e)[:140]})
             continue
         if it.in_flight_since:
             anchor = it.in_flight_since
-            save_state_item(cfg.state_path, slug, str(r["num"]),
-                            lambda x: setattr(x, "in_flight_since", anchor))
-            dispatched.append({"repo": r["repo"], "num": r.get("num"),
-                               "status": pres.get("status"), "label": label,
-                               "anchor": anchor})
+            save_state_item(cfg.state_path, slug, str(num),
+                            lambda x, a=anchor: setattr(x, "in_flight_since", a))
+            out["dispatched"].append({"repo": repo, "num": num,
+                                      "status": pres.get("status"), "label": label,
+                                      "anchor": anchor})
             budget -= 1
+            out["budget_left"] = budget
         else:
-            skipped.append({"repo": r["repo"], "num": r.get("num"),
-                            "why": "dispatch 未落锚: %s" % pres.get("status")})
-    return {"mode": "canary", "allow": allow, "budget_left": budget,
-            "dispatched": dispatched, "skipped": skipped}
+            out["skipped"].append({"repo": repo, "num": num,
+                                   "why": "dispatch 未落锚: %s" % pres.get("status")})
+    return out
 """)
 
     # ── ④ 报告落盘（IO 叶子）────────────────────────────────────────────
