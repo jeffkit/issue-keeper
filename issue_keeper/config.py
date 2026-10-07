@@ -218,6 +218,12 @@ class Config:
     # true 时新 issue 首响应交给 issue-pipeline flow（flows/pipeline_bridge.py
     # 子进程），单体 claude CLI 路径保留为回退。评论层处理仍走 legacy。
     pipeline_mode: bool = False
+    # ── 派发权归属（2026-10-07，keeper→flow 迁移）──────────────────────
+    # "keeper"（默认）：intake（screener + 首次派发）由 keeper 承担，行为不变。
+    # "flow"：派发权已移交 keeper-shadow flow——keeper 跳过管线仓的「首次处理」
+    # 段（screener + 派发），只保留 reaper / 评论 / reopen / 巡检等收尾职责；
+    # 防双筛（两处 screener 会给同单发两份通告）与双派。
+    pipeline_dispatch_owner: str = "keeper"
     pipeline_bridge: Path = Path(
         "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py")
     # 桥子进程整跑超时（秒）：到点 killpg 整个进程组（agent 子树一并清）
@@ -670,6 +676,7 @@ def load_config(path: str | os.PathLike) -> Config:
         keeper_patrol=patrol,
         keeper_timeout_secs=max(60, int(raw.get("keeper_timeout_secs", 3900))),
         pipeline_mode=bool(raw.get("pipeline_mode", False)),
+        pipeline_dispatch_owner=str(raw.get("pipeline_dispatch_owner") or "keeper").strip().lower(),
         pipeline_bridge=_expand_path(
             raw.get("pipeline_bridge")
             or "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py"),

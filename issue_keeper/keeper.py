@@ -564,7 +564,17 @@ def _process_resource(
         return handled
 
     # ── 1) 新资源本体：首次处理 ────────────────────────────────────
-    if not it.processed and not it.blocked:
+    # 派发权移交（2026-10-07 keeper→flow）：owner=flow 且本仓有管线契约 → intake
+    # （screener + 首次派发）由 keeper-shadow flow 承担；keeper 跳过本段，只保留
+    # 下方评论处理与轮首 reaper 等收尾职责。防双筛（两处 screener 会给同单发两份
+    # 通告）与双派。非管线仓（无契约/readonly 走 legacy 的）不受影响。
+    _handover = False
+    if config.pipeline_mode and str(getattr(config, "pipeline_dispatch_owner", "keeper")) == "flow":
+        _handover = _pipeline_repo_cfg(config, binding)[0] is not None
+    if _handover and not it.processed:
+        log.info("[%s] 派发权已移交 flow（pipeline_dispatch_owner=flow）——"
+                 "keeper 跳过首次处理（screener/派发由 keeper-shadow 承担）", label)
+    if (not it.processed and not it.blocked) and not _handover:
         # 三层防循环之资源层：AI 自己提的 issue（body 含 marker / 可见前缀）
         # 不触发首次 agent 回复，但评论层照常处理
         if _is_bot_output(res.body or "", config.bot_marker, visible_prefix):
