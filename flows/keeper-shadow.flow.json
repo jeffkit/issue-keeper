@@ -4,7 +4,7 @@
  "inputType": {
   "dataType": "object"
  },
- "desc": "【影子·只读】keeper 派发决策影子——每轮算一遍「会派谁/为何跳过」，与现役 keeper 对账；不做任何写入",
+ "desc": "【影子/金丝雀】keeper 派发决策 + 可选 canary 派发——dispatch_repos 空=纯影子零写入；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）",
  "nodes": [
   {
    "type": "start",
@@ -24,17 +24,33 @@
   },
   {
    "type": "code",
+   "id": "disp",
+   "language": "python",
+   "code": "\ndef run(input):\n    import json, os, sys, time\n    allow = [str(x) for x in (input.get(\"dispatch_repos\") or [])]\n    if not allow:\n        return {\"mode\": \"shadow\", \"dispatched\": [], \"note\": \"dispatch_repos 空：纯影子，零写入\"}\n    ik = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    root = os.path.expanduser(input.get(\"repo_root\") or \"\")\n    if root and root not in sys.path:\n        sys.path.insert(0, root)\n    from issue_keeper.config import load_config\n    from issue_keeper.sources import Resource\n    from issue_keeper.state import load_state, save_state_item\n    from issue_keeper import keeper as K\n    cfg = load_config(os.path.join(ik, \"config.yaml\"))\n    st = load_state(cfg.state_path)\n    inflight = sum(1 for rs in st.repos.values()\n                   for it in rs.items.values() if it.in_flight_since)\n    budget = max(0, int(cfg.pipeline_max_in_flight or 0) - inflight)\n    bindings = {b.repo: b for b in cfg.repos}\n    dispatched, skipped = [], []\n    for r in input.get(\"rows\") or []:\n        if budget <= 0:\n            break\n        if r.get(\"decision\") != \"would_dispatch\" or r.get(\"repo\") not in allow:\n            continue\n        if not r.get(\"has_state\"):\n            skipped.append({\"repo\": r.get(\"repo\"), \"num\": r.get(\"num\"),\n                            \"why\": \"无 keeper 状态（未过 screener）→ 留给 keeper\"})\n            continue\n        b = bindings.get(r.get(\"repo\"))\n        if b is None:\n            skipped.append({\"repo\": r.get(\"repo\"), \"num\": r.get(\"num\"), \"why\": \"无绑定\"})\n            continue\n        slug = r[\"repo\"].split(\"/\")[-1]\n        it = st.repo(slug).item(str(r[\"num\"]))\n        if it.in_flight_since:\n            skipped.append({\"repo\": r[\"repo\"], \"num\": r.get(\"num\"), \"why\": \"状态已在途（并发窗口）\"})\n            continue\n        pc = cfg.pipeline_repo_cfg(r[\"repo\"])\n        # 正文按需取（facts 不扫 body；只对真派发目标做一次 gh view）\n        import subprocess\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"view\", str(r[\"num\"]), \"--repo\", r[\"repo\"],\n                                \"--json\", \"body,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            d = json.loads(p.stdout or \"{}\") if p.returncode == 0 else {}\n        except Exception:\n            d = {}\n        res = Resource(kind=\"issue\", number=int(r[\"num\"]),\n                       title=d.get(\"title\") or r.get(\"title\") or \"\",\n                       body=d.get(\"body\") or \"\",\n                       author=(d.get(\"author\") or {}).get(\"login\") or r.get(\"author\") or \"\",\n                       labels=[l.get(\"name\") for l in (d.get(\"labels\") or []) if isinstance(l, dict)],\n                       state=\"open\", created_at=d.get(\"createdAt\") or r.get(\"created_at\") or \"\",\n                       updated_at=d.get(\"updatedAt\") or r.get(\"updated_at\") or \"\",\n                       status=\"\", actor_type=\"agent\")\n        label = \"%s issue#%s\" % (r[\"repo\"], r[\"num\"])\n        try:\n            pres = K._dispatch_pipeline(cfg, b, res, it, label, pc=pc)\n        except Exception as e:\n            skipped.append({\"repo\": r[\"repo\"], \"num\": r.get(\"num\"),\n                            \"why\": \"派发异常: %s\" % str(e)[:160]})\n            continue\n        if it.in_flight_since:\n            anchor = it.in_flight_since\n            save_state_item(cfg.state_path, slug, str(r[\"num\"]),\n                            lambda x: setattr(x, \"in_flight_since\", anchor))\n            dispatched.append({\"repo\": r[\"repo\"], \"num\": r.get(\"num\"),\n                               \"status\": pres.get(\"status\"), \"label\": label,\n                               \"anchor\": anchor})\n            budget -= 1\n        else:\n            skipped.append({\"repo\": r[\"repo\"], \"num\": r.get(\"num\"),\n                            \"why\": \"dispatch 未落锚: %s\" % pres.get(\"status\")})\n    return {\"mode\": \"canary\", \"allow\": allow, \"budget_left\": budget,\n            \"dispatched\": dispatched, \"skipped\": skipped}\n",
+   "input": {
+    "rows": "$NODE.gate",
+    "dispatch_repos": "$INPUT.dispatch_repos",
+    "ik_home": "$INPUT.ik_home",
+    "repo_root": "$INPUT.repo_root"
+   },
+   "next": "rep",
+   "source_line": 206
+  },
+  {
+   "type": "code",
    "id": "rep",
    "language": "python",
-   "code": "\ndef run(input):\n    import json, os, time\n    rows = input.get(\"rows\") or []\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    outdir = os.path.join(IK, \"shadow\")\n    os.makedirs(outdir, exist_ok=True)\n    would = [r for r in rows if r.get(\"decision\") == \"would_dispatch\"]\n    skips = {}\n    for r in rows:\n        if r.get(\"decision\") != \"would_dispatch\":\n            skips[r.get(\"reason\")] = skips.get(r.get(\"reason\"), 0) + 1\n    doc = {\n        \"generated_at\": time.strftime(\"%Y-%m-%d %H:%M:%S\"),\n        \"source\": \"keeper-shadow flow（只读影子；对照物=现役 keeper 的 keeper.log 决策）\",\n        \"repos_scanned\": len({r.get(\"repo\") for r in rows}),\n        \"total_open_matched\": len(rows),\n        \"would_dispatch\": len(would),\n        \"skip_by_reason\": skips,\n        \"facts_errors\": input.get(\"facts_errors\") or [],\n        \"rows\": rows,\n    }\n    stamp = time.strftime(\"%Y%m%d-%H%M%S\")\n    path = os.path.join(outdir, \"decisions-%s.json\" % stamp)\n    for p in (path, os.path.join(outdir, \"latest.json\")):\n        with open(p, \"w\", encoding=\"utf-8\") as fh:\n            json.dump(doc, fh, ensure_ascii=False, indent=2)\n    summary = \"keeper-shadow: open=%d would_dispatch=%d skips=%s\" % (\n        len(rows), len(would), json.dumps(skips, ensure_ascii=False))\n    return {\"summary\": summary, \"path\": path, \"would_dispatch\": len(would),\n            \"facts_errors\": doc[\"facts_errors\"], \"doc\": doc}\n",
+   "code": "\ndef run(input):\n    import json, os, time\n    rows = input.get(\"rows\") or []\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    outdir = os.path.join(IK, \"shadow\")\n    os.makedirs(outdir, exist_ok=True)\n    would = [r for r in rows if r.get(\"decision\") == \"would_dispatch\"]\n    skips = {}\n    for r in rows:\n        if r.get(\"decision\") != \"would_dispatch\":\n            skips[r.get(\"reason\")] = skips.get(r.get(\"reason\"), 0) + 1\n    doc = {\n        \"generated_at\": time.strftime(\"%Y-%m-%d %H:%M:%S\"),\n        \"source\": \"keeper-shadow flow（决策影子 + 可选 canary 派发；对照物=现役 keeper 的 keeper.log 决策）\",\n        \"repos_scanned\": len({r.get(\"repo\") for r in rows}),\n        \"total_open_matched\": len(rows),\n        \"would_dispatch\": len(would),\n        \"skip_by_reason\": skips,\n        \"facts_errors\": input.get(\"facts_errors\") or [],\n        \"dispatch\": input.get(\"dispatch_result\") or {},\n        \"rows\": rows,\n    }\n    stamp = time.strftime(\"%Y%m%d-%H%M%S\")\n    path = os.path.join(outdir, \"decisions-%s.json\" % stamp)\n    for p in (path, os.path.join(outdir, \"latest.json\")):\n        with open(p, \"w\", encoding=\"utf-8\") as fh:\n            json.dump(doc, fh, ensure_ascii=False, indent=2)\n    dres = doc[\"dispatch\"] or {}\n    summary = \"keeper-shadow: open=%d would_dispatch=%d dispatched=%d skips=%s mode=%s\" % (\n        len(rows), len(would), len(dres.get(\"dispatched\") or []),\n        json.dumps(skips, ensure_ascii=False), dres.get(\"mode\") or \"-\")\n    return {\"summary\": summary, \"path\": path, \"would_dispatch\": len(would),\n            \"dispatched\": len(dres.get(\"dispatched\") or []),\n            \"facts_errors\": doc[\"facts_errors\"], \"doc\": doc}\n",
    "input": {
     "rows": "$NODE.gate",
     "ik_home": "$INPUT.ik_home",
     "facts_errors": "$NODE.facts.errors",
-    "generated_at": "$NODE.facts.generated_at"
+    "generated_at": "$NODE.facts.generated_at",
+    "dispatch_result": "$NODE.disp",
+    "dispatch_repos": "$INPUT.dispatch_repos"
    },
    "next": "ret_rep",
-   "source_line": 201
+   "source_line": 289
   },
   {
    "type": "end",
@@ -42,8 +58,8 @@
    "output": "$NODE.rep",
    "resultType": "success",
    "name": "return rep",
-   "desc": "return rep（第 235 行）",
-   "source_line": 235
+   "desc": "return rep（第 329 行）",
+   "source_line": 329
   },
   {
    "type": "map",
@@ -523,7 +539,7 @@
      }
     ]
    },
-   "next": "rep",
+   "next": "disp",
    "source_line": 154
   }
  ]

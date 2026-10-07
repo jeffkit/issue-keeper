@@ -31,7 +31,7 @@ from plaita.node import register_code_node
 register_code_node(default_backend="subprocess")
 
 
-@flow("keeper-shadow", desc="【影子·只读】keeper 派发决策影子——每轮算一遍「会派谁/为何跳过」，与现役 keeper 对账；不做任何写入")
+@flow("keeper-shadow", desc="【影子/金丝雀】keeper 派发决策 + 可选 canary 派发——dispatch_repos 空=纯影子零写入；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）")
 def keeper_shadow(INPUT):
     # ── ① 事实装载（IO 叶子：config/state/台账 + gh 扫单，join 成 items）─────
     facts = CODE(id="facts", lang="python", input={"ik_home": INPUT.ik_home}, code="""
@@ -197,10 +197,100 @@ def run(input):
                 "decision": "would_dispatch", "reason": "可派发（需先过 screener：keeper 无该 issue 状态）",
                 "has_state": False}
 
-    # ── ③ 报告落盘（IO 叶子）────────────────────────────────────────────
+    # ── ③ 派发（canary 白名单；空=纯影子零写入）──────────────────────────
+    # 红线：只有 `dispatch_repos` 白名单内的仓、且 has_state=True（已被 keeper 过筛）
+    # 的单才会真派发；派发与状态写回**复用 keeper 库函数**（_dispatch_pipeline /
+    # save_state_item），保证 in_flight 锚 / 产物 / 去重语义与 keeper 一字不差，
+    # 使现役 keeper 的 reaper 能正常收尾这些 run；keeper 轮末的 save_state_merged
+    # （「没变的一律保留盘上值」）保护本节点写入不被覆盖。
+    disp = CODE(id="dispatch", lang="python", input={"rows": NODE.gate,
+                                                     "dispatch_repos": INPUT.dispatch_repos,
+                                                     "ik_home": INPUT.ik_home,
+                                                     "repo_root": INPUT.repo_root}, code="""
+def run(input):
+    import json, os, sys, time
+    allow = [str(x) for x in (input.get("dispatch_repos") or [])]
+    if not allow:
+        return {"mode": "shadow", "dispatched": [], "note": "dispatch_repos 空：纯影子，零写入"}
+    ik = os.path.expanduser(input.get("ik_home") or "~/.issue-keeper")
+    root = os.path.expanduser(input.get("repo_root") or "")
+    if root and root not in sys.path:
+        sys.path.insert(0, root)
+    from issue_keeper.config import load_config
+    from issue_keeper.sources import Resource
+    from issue_keeper.state import load_state, save_state_item
+    from issue_keeper import keeper as K
+    cfg = load_config(os.path.join(ik, "config.yaml"))
+    st = load_state(cfg.state_path)
+    inflight = sum(1 for rs in st.repos.values()
+                   for it in rs.items.values() if it.in_flight_since)
+    budget = max(0, int(cfg.pipeline_max_in_flight or 0) - inflight)
+    bindings = {b.repo: b for b in cfg.repos}
+    dispatched, skipped = [], []
+    for r in input.get("rows") or []:
+        if budget <= 0:
+            break
+        if r.get("decision") != "would_dispatch" or r.get("repo") not in allow:
+            continue
+        if not r.get("has_state"):
+            skipped.append({"repo": r.get("repo"), "num": r.get("num"),
+                            "why": "无 keeper 状态（未过 screener）→ 留给 keeper"})
+            continue
+        b = bindings.get(r.get("repo"))
+        if b is None:
+            skipped.append({"repo": r.get("repo"), "num": r.get("num"), "why": "无绑定"})
+            continue
+        slug = r["repo"].split("/")[-1]
+        it = st.repo(slug).item(str(r["num"]))
+        if it.in_flight_since:
+            skipped.append({"repo": r["repo"], "num": r.get("num"), "why": "状态已在途（并发窗口）"})
+            continue
+        pc = cfg.pipeline_repo_cfg(r["repo"])
+        # 正文按需取（facts 不扫 body；只对真派发目标做一次 gh view）
+        import subprocess
+        try:
+            p = subprocess.run(["gh", "issue", "view", str(r["num"]), "--repo", r["repo"],
+                                "--json", "body,title,author,labels,createdAt,updatedAt"],
+                               capture_output=True, text=True, timeout=8)
+            d = json.loads(p.stdout or "{}") if p.returncode == 0 else {}
+        except Exception:
+            d = {}
+        res = Resource(kind="issue", number=int(r["num"]),
+                       title=d.get("title") or r.get("title") or "",
+                       body=d.get("body") or "",
+                       author=(d.get("author") or {}).get("login") or r.get("author") or "",
+                       labels=[l.get("name") for l in (d.get("labels") or []) if isinstance(l, dict)],
+                       state="open", created_at=d.get("createdAt") or r.get("created_at") or "",
+                       updated_at=d.get("updatedAt") or r.get("updated_at") or "",
+                       status="", actor_type="agent")
+        label = "%s issue#%s" % (r["repo"], r["num"])
+        try:
+            pres = K._dispatch_pipeline(cfg, b, res, it, label, pc=pc)
+        except Exception as e:
+            skipped.append({"repo": r["repo"], "num": r.get("num"),
+                            "why": "派发异常: %s" % str(e)[:160]})
+            continue
+        if it.in_flight_since:
+            anchor = it.in_flight_since
+            save_state_item(cfg.state_path, slug, str(r["num"]),
+                            lambda x: setattr(x, "in_flight_since", anchor))
+            dispatched.append({"repo": r["repo"], "num": r.get("num"),
+                               "status": pres.get("status"), "label": label,
+                               "anchor": anchor})
+            budget -= 1
+        else:
+            skipped.append({"repo": r["repo"], "num": r.get("num"),
+                            "why": "dispatch 未落锚: %s" % pres.get("status")})
+    return {"mode": "canary", "allow": allow, "budget_left": budget,
+            "dispatched": dispatched, "skipped": skipped}
+""")
+
+    # ── ④ 报告落盘（IO 叶子）────────────────────────────────────────────
     rep = CODE(id="report", lang="python", input={"rows": NODE.gate, "ik_home": INPUT.ik_home,
                                                   "facts_errors": NODE.facts.errors,
-                                                  "generated_at": NODE.facts.generated_at}, code="""
+                                                  "generated_at": NODE.facts.generated_at,
+                                                  "dispatch_result": NODE.disp,
+                                                  "dispatch_repos": INPUT.dispatch_repos}, code="""
 def run(input):
     import json, os, time
     rows = input.get("rows") or []
@@ -214,12 +304,13 @@ def run(input):
             skips[r.get("reason")] = skips.get(r.get("reason"), 0) + 1
     doc = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "keeper-shadow flow（只读影子；对照物=现役 keeper 的 keeper.log 决策）",
+        "source": "keeper-shadow flow（决策影子 + 可选 canary 派发；对照物=现役 keeper 的 keeper.log 决策）",
         "repos_scanned": len({r.get("repo") for r in rows}),
         "total_open_matched": len(rows),
         "would_dispatch": len(would),
         "skip_by_reason": skips,
         "facts_errors": input.get("facts_errors") or [],
+        "dispatch": input.get("dispatch_result") or {},
         "rows": rows,
     }
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -227,9 +318,12 @@ def run(input):
     for p in (path, os.path.join(outdir, "latest.json")):
         with open(p, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, ensure_ascii=False, indent=2)
-    summary = "keeper-shadow: open=%d would_dispatch=%d skips=%s" % (
-        len(rows), len(would), json.dumps(skips, ensure_ascii=False))
+    dres = doc["dispatch"] or {}
+    summary = "keeper-shadow: open=%d would_dispatch=%d dispatched=%d skips=%s mode=%s" % (
+        len(rows), len(would), len(dres.get("dispatched") or []),
+        json.dumps(skips, ensure_ascii=False), dres.get("mode") or "-")
     return {"summary": summary, "path": path, "would_dispatch": len(would),
+            "dispatched": len(dres.get("dispatched") or []),
             "facts_errors": doc["facts_errors"], "doc": doc}
 """)
     return rep
