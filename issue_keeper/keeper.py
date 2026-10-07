@@ -2085,7 +2085,9 @@ def _reap_console_execution(config, binding, it, key, label: str,
 
     决策表（设计稿 §G5）：error → resume-retry ×1（断点步进，免整跑重做）；
     running + last_update_time 年龄超阈 → zombie（cancel + engine_error 行）；
-    其余终态 → verdict 映射落账。非 engine_error 的收尾回评由本函数出
+    GET 404 且在 `console_queue_grace_secs` 宽限内 → 记录未落（排队中），返回
+    None 不动作不重派（plaita#18）；其余终态 → verdict 映射落账。
+    非 engine_error 的收尾回评由本函数出
     （console flow 无回评节点契约），避免共享兜底「未确认发出回评」文案。
 
     void=True（#7 窗口内人工 reopen，run 结论作废）：照常轮询判终态并清锚，但不发
@@ -2105,6 +2107,17 @@ def _reap_console_execution(config, binding, it, key, label: str,
         log.warning("[%s] console 不可达，本轮跳过：%s", label, e)
         return None
     except _ce.ConsoleExecNotFound:
+        # plaita#18：POST 只入队 Redis，执行记录由 worker 消费时才首次落盘——
+        # 派发到被消费之间 GET 恒 404。宽限期内这是**排队中**（背压队列里排队
+        # 是设计内行为），判 engine_error 会 re-dispatch 同一 issue（重复执行，
+        # 两条 run 同时 land 还会撞 git 合并）。超期仍 404 才走既有自愈路径。
+        if _ce.record_queued(crec, config.console_queue_grace_secs,
+                             inflight_since=getattr(it, "in_flight_since", None),
+                             now=now):
+            log.info("[%s] execution %s 尚无记录（派发于 %s，宽限 %ss）——判排队中，"
+                     "本轮不动作不重派", label, crec.get("execution_id"),
+                     crec.get("dispatched_at"), config.console_queue_grace_secs)
+            return None
         detail = {"status": "error",
                   "error": {"message": "execution 404（console 侧被清理/TTL 过期?）"}}
     except _ce.ConsoleExecError as e:

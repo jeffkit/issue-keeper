@@ -8,6 +8,7 @@ execution 终态 + 节点输出自行落账，映射函数在本模块（与 flo
 | 错误类型           | 判定源                    | 处置                                  |
 | 引擎/节点崩溃      | execution status=error    | resume-retry ×1（续原 execution）     |
 | retry 后仍 error   | 台账连续 engine_error     | 既有升级人工语义（封顶 2）            |
+| 记录未落（排队中） | GET 404 且记录年龄 < 宽限 | 视为 queued，不动作不重派（plaita#18）|
 | worker zombie      | last_update_time 年龄超阈 | cancel + 重派（engine_error 台账行）  |
 | 环境性             | verdict=retry-later       | 既有 retry-later 不消费语义           |
 | 内容性             | verdict=failed-preserved  | 既有 failed 语义                      |
@@ -181,6 +182,34 @@ def map_verdict(verdict: dict) -> dict:
     return {"status": "engine_error", "pushed": False, "merged": False,
             "comment_posted": False,
             "error": str(verdict.get("why") or "engine_error")[-500:]}
+
+
+def record_queued(crec: dict, grace_secs: float,
+                  inflight_since: float | None = None,
+                  now: float | None = None) -> bool:
+    """在途记录仍在「已派发未消费」窗口内（plaita#18）？
+
+    时序事实：console POST 只把消息写进 Redis（execution_id 铸造但不落记录），
+    执行记录由 worker 消费时才首次落盘——两次之间 `GET /api/executions/<id>`
+    恒为 404。背压排队下这个窗口可远超一个 keeper 巡检周期，把 404 判成
+    engine_error 会重派同一 issue（重复执行）。
+
+    年龄取记录里的 `dispatched_at`（派发时刻），缺失则退 `inflight_since`
+    （reaper 的在途基线，与派发同一时钟读数）。
+    """
+    ts = str(crec.get("dispatched_at") or "")
+    base: float | None = None
+    if ts:
+        try:
+            from datetime import datetime
+            base = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            base = None
+    if base is None:
+        base = inflight_since
+    if base is None:
+        return False
+    return ((now if now is not None else time.time()) - base) < grace_secs
 
 
 def zombie(detail: dict, threshold_secs: float, now: float | None = None) -> bool:

@@ -118,6 +118,11 @@ pipeline:
 # per-repo engine_env 里显式配了 RECURSIVE_RUN_DEADLINE 则以显式值为准。
 pipeline_timeout_secs: 5400
 run_deadline_margin_secs: 300
+# engine=v2-console 的「已派发未消费」宽限期（秒，plaita#18）：console POST 只
+# 入队 Redis，执行记录由 worker 消费时才首次落盘——两次之间 GET 恒 404。宽限期
+# 内判「排队中」（不动作不重派），超期仍 404 才走 engine_error 自愈路径。必须
+# > 最长排队等待（背压队列 + worker 满载时的排队是设计内行为）。
+console_queue_grace_secs: 1800
 
 # ─── per-repo 管线契约（pipeline_repos，v0.3 2026-09-30）──────────────
 # 每个仓自带：基线分支 / 依赖安装 / 质量门（单命令或多门清单）/ 交付策略 /

@@ -230,6 +230,12 @@ class Config:
     # error 执行 resume-retry 次数上限（G1：续原 execution 从断点步进，免整跑
     # 重做）。超限落 engine_error 台账行走既有重派/升级语义。
     console_retry_max: int = 1
+    # 「已派发未消费」宽限期（秒，plaita#18）：console POST 只把任务入队 Redis，
+    # 执行记录由 worker **消费时**才首次落盘——派发到被消费之间
+    # GET /api/executions/<id> 恒为 404。在此宽限期内把 404 判为**排队中**
+    # （不动作、不重派），超期仍 404 才落既有 engine_error 自愈路径。宽限期须
+    # > 最长排队等待（背压队列 + worker 满载时的排队是设计内行为），默认 1800s。
+    console_queue_grace_secs: int = 1800
     # run 级 deadline 注入的提前量（秒）：派发 engine=v2 的 run 时，keeper 把
     # RECURSIVE_RUN_DEADLINE = 派发时刻 + pipeline_timeout_secs - 本值 注入
     # engine_env，让 recursive v3 宿主在 reaper SIGKILL 前先到点优雅退出
@@ -669,6 +675,12 @@ def load_config(path: str | os.PathLike) -> Config:
             or "~/projects/infra4agent/issue-keeper/flows/pipeline_bridge.py"),
         pipeline_timeout_secs=max(300, int(raw.get("pipeline_timeout_secs", 5400))),
         run_deadline_margin_secs=max(0, int(raw.get("run_deadline_margin_secs", 300))),
+        # 2026-10-07 修复：console_* 三旋钮此前只写进 dataclass 默认值、无人读
+        # yaml——与 pipeline_max_in_flight 同款死旋钮。宽限期尤其致命：背压队列
+        # 排队 > 默认 1800s 时 404 仍被误判 engine_error → 重派（plaita#18）。
+        console_queue_grace_secs=max(0, int(raw.get("console_queue_grace_secs", 1800))),
+        console_zombie_secs=max(0, int(raw.get("console_zombie_secs", 7200))),
+        console_retry_max=max(0, int(raw.get("console_retry_max", 1))),
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),

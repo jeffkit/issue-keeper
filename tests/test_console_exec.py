@@ -81,6 +81,33 @@ class TestZombie:
         assert ce.zombie(self._detail(99999, status="completed"), 7200) is False
 
 
+class TestRecordQueued:
+    """plaita#18：「已派发未消费」窗口（GET 404）判排队中，非故障。"""
+
+    def _now(self):
+        return datetime(2026, 10, 7, 12, 0, 0).timestamp()
+
+    def test_fresh_record_is_queued(self):
+        now = self._now()
+        crec = {"dispatched_at": (datetime.fromtimestamp(now)
+                                  - timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%S%z")}
+        assert ce.record_queued(crec, 1800, now=now) is True
+
+    def test_old_record_is_not_queued(self):
+        now = self._now()
+        crec = {"dispatched_at": (datetime.fromtimestamp(now)
+                                  - timedelta(seconds=3600)).strftime("%Y-%m-%dT%H:%M:%S%z")}
+        assert ce.record_queued(crec, 1800, now=now) is False
+
+    def test_missing_dispatched_at_falls_back_to_inflight_since(self):
+        now = self._now()
+        assert ce.record_queued({}, 1800, inflight_since=now - 60, now=now) is True
+        assert ce.record_queued({}, 1800, inflight_since=now - 3600, now=now) is False
+
+    def test_no_clock_reference_is_not_queued(self):
+        assert ce.record_queued({}, 1800, now=self._now()) is False
+
+
 class TestClientErrors:
     def test_404_maps_to_not_found(self, monkeypatch):
         import urllib.error
@@ -113,9 +140,12 @@ class TestClientErrors:
 
 
 class FakeClient:
-    def __init__(self, detail=None, fail_start=None):
+    def __init__(self, detail=None, fail_start=None, not_found_get=False,
+                 fail_resume=False):
         self.detail = detail or {}
         self.fail_start = fail_start
+        self.not_found_get = not_found_get
+        self.fail_resume = fail_resume
         self.started = []
         self.resumed = []
         self.cancelled = []
@@ -127,10 +157,14 @@ class FakeClient:
         return "exec-123"
 
     def get_execution(self, eid):
+        if self.not_found_get:
+            raise ce.ConsoleExecNotFound(f"/api/executions/{eid}: 404")
         return self.detail
 
     def resume(self, eid, resume_type, data=None):
         self.resumed.append((eid, resume_type))
+        if self.fail_resume:
+            raise ce.ConsoleExecNotFound(f"/api/executions/{eid}/resume: 404")
         return {}
 
     def cancel(self, eid):
@@ -307,6 +341,40 @@ class TestReapConsole:
         last = json.loads(ledger[-1])
         assert last["status"] == "done" and last["comment_posted"] is True
         assert last["flow_source"] == "v2-console"
+
+    def _write_rec(self, art, age_secs):
+        (art / K.CONSOLE_EXEC_RECORD).write_text(json.dumps({
+            "execution_id": "exec-123", "flow_id": "self-improve-v2",
+            "retry_count": 0,
+            "dispatched_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z", time.localtime(time.time() - age_secs))}))
+
+    def test_404_within_grace_is_queued_not_engine_error(self, art, monkeypatch):
+        """plaita#18：派发后记录未落（worker 未消费）→ 404 判排队中，不重派。
+
+        时序：console POST 只入队 Redis，执行记录由 worker 消费时才首次落盘；
+        背压排队下该窗口 >1 个 keeper 周期。误判 engine_error 会 re-dispatch
+        同一 issue → 重复执行。
+        """
+        self._write_rec(art, age_secs=60)
+        client = FakeClient(not_found_get=True)
+        cfg, it, row, posted = self._reap(art, monkeypatch, client)
+        assert row is None                       # 仍在途
+        assert client.resumed == []              # 不 resume
+        assert posted == []                      # 不回评
+        assert (art / K.CONSOLE_EXEC_RECORD).exists()      # 在途锚保留
+        assert not (art.parent / "runs.jsonl").exists()    # 不落台账行
+
+    def test_404_past_grace_keeps_self_heal_path(self, art, monkeypatch):
+        """记录年龄超宽限期仍 404 → 既有自愈路径（resume → 失败转 engine_error）。"""
+        self._write_rec(art, age_secs=9999)   # in_flight_since 仍是新鲜的 100s
+        client = FakeClient(not_found_get=True, fail_resume=True)
+        cfg, it, row, posted = self._reap(art, monkeypatch, client)
+        assert client.resumed == [("exec-123", "retry")]
+        assert row["status"] == "engine_error" and "404" in row["error"]
+        assert not (art / K.CONSOLE_EXEC_RECORD).exists()
+        ledger = (art.parent / "runs.jsonl").read_text().strip().splitlines()
+        assert json.loads(ledger[-1])["status"] == "engine_error"
 
     def test_console_unreachable_skips_round(self, art, monkeypatch):
         import urllib.error

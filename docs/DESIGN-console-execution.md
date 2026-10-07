@@ -227,6 +227,10 @@ plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.
   决策表：error → resume-retry ×1（G1 续原 execution）→ 仍 error → engine_error
   行走既有重派/升级；running 心跳超阈 → zombie cancel + engine_error 行；
   非 engine_error 的收尾回评由 keeper 出（console flow 无回评节点契约）；
+- **事后修订（plaita#18）**：GET 404 不再无条件判 engine_error——记录年龄在
+  `console_queue_grace_secs`（默认 1800s）内视为「已派发未消费」（console
+  POST 只入队 Redis，记录由 worker 消费时落盘），不动作不重派；超期仍 404
+  才走上述既有自愈路径。
 - 在途判定：`_pipeline_in_flight` 认 console-exec.json（哨兵锁「console」仅
   占位，killpg 路径被 console 分支拦截）。
 

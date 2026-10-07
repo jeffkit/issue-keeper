@@ -185,6 +185,29 @@ class TestConfigLoading:
         assert c.failed_auto_retry == 1
         assert c.pipeline_needs_human_label == "needs-human"
 
+    def test_console_knobs_from_yaml(self, tmp_path):
+        """console_* 旋钮必须真从 yaml 读（死旋钮回归：默认值曾把 yaml 静默吞掉）。
+
+        console_queue_grace_secs 决定「已派发未消费」的 404 判排队还是
+        engine_error（plaita#18）——读了不生效时操作员唯一的旋钮无效。
+        """
+        cfg = _write(tmp_path, _base(
+            tmp_path,
+            "console_queue_grace_secs: 1234\n"
+            "console_zombie_secs: 9000\n"
+            "console_retry_max: 3\n" + _valid_screener()))
+        c = load_config(cfg)
+        assert c.console_queue_grace_secs == 1234
+        assert c.console_zombie_secs == 9000
+        assert c.console_retry_max == 3
+
+    def test_console_knobs_defaults(self, tmp_path):
+        cfg = _write(tmp_path, _base(tmp_path, _valid_screener()))
+        c = load_config(cfg)
+        assert c.console_queue_grace_secs == 1800
+        assert c.console_zombie_secs == 7200
+        assert c.console_retry_max == 1
+
     def test_needs_human_label_override(self, tmp_path):
         cfg = _write(tmp_path, _base(
             tmp_path,
