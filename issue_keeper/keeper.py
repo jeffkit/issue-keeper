@@ -1947,8 +1947,14 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
     # 必须对齐——这里显式用 bash -c 包装（shlex.quote 保引号）。
     if pc.gates:
         import shlex as _shlex
-        params["gates"] = [{"name": g.name, "cmd": f"bash -c {_shlex.quote(g.command)}"}
+        params["gates"] = [{"name": g.name, "cmd": f"bash -c {_shlex.quote(g.command)}",
+                            "timeout_secs": int(g.timeout_secs or 0)}
                            for g in pc.gates]
+    # setup 透传（2026-10-07）：flow 的 preflight 会在 worktree 建立后执行
+    # `bash -c <setup_command>`（900s 预算；失败=preflight 失败）。非 Rust 仓
+    # （TS/Python）在 fresh worktree 里必须先装依赖，否则门必挂。
+    if (pc.setup_command or "").strip():
+        params["setup_command"] = pc.setup_command
     try:
         execution_id = client.start_execution(flow_id, params)
     except _ce.ConsoleExecError as e:

@@ -212,14 +212,20 @@ class TestDispatchConsole:
         pc.gates = [GateSpec(name="tests",
                              command="pytest -q && pytest tests/e2e -q",
                              timeout_secs=1800)]
+        pc.setup_command = "pnpm install --frozen-lockfile"
         it = ItemState()
         out = K._dispatch_console_execution(cfg, _binding(), _res(), it, "l",
                                             pc, art, art / "00-issue.md")
         assert out["status"] == "dispatched"
-        gates = client.started[0][1]["gates"]
+        params = client.started[0][1]
+        gates = params["gates"]
         assert gates[0]["name"] == "tests"
         assert gates[0]["cmd"].startswith("bash -c ")
         assert "pytest -q && pytest tests/e2e -q" in gates[0]["cmd"]
+        # per-repo 预算透传（flow 侧 fmt/lint/test 三槽位读注入值，2026-10-07）
+        assert gates[0]["timeout_secs"] == 1800
+        # setup 透传（flow preflight 在 worktree 建立后执行）
+        assert params["setup_command"] == "pnpm install --frozen-lockfile"
 
     def test_dispatch_failure_is_engine_error_without_record(self, art, monkeypatch):
         _wire(monkeypatch, FakeClient(fail_start="boom"))
