@@ -226,6 +226,9 @@ plaita 引擎并行改造线已收束（0ac9347）、provider key 内联于 `~/.
   engine_error 自动重派与连击升级 / 兜底回评 / WIP 快照 / 看板，零改动）；
   决策表：error → resume-retry ×1（G1 续原 execution）→ 仍 error → engine_error
   行走既有重派/升级；running 心跳超阈 → zombie cancel + engine_error 行；
+  **GET 404 且 console-exec 记录年龄 < `console_queued_grace_secs`（默认 1800s）
+  → 排队中，不动作不重派**（console POST 只写 Redis、记录要 worker 消费才落盘，
+  排队窗口内 404 是常态；此前把它当 engine_error 重派 → 重复执行，背压下必现）；
   非 engine_error 的收尾回评由 keeper 出（console flow 无回评节点契约）；
 - 在途判定：`_pipeline_in_flight` 认 console-exec.json（哨兵锁「console」仅
   占位，killpg 路径被 console 分支拦截）。

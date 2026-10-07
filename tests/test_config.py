@@ -191,6 +191,16 @@ class TestConfigLoading:
             'pipeline_needs_human_label: "等人处理"\n' + _valid_screener()))
         assert load_config(cfg).pipeline_needs_human_label == "等人处理"
 
+    def test_console_queued_grace_secs_wired_from_yaml(self, tmp_path):
+        """#18：宽限期必须真从 yaml 读——本仓已有两起「旋钮无人读取」的事故。"""
+        cfg = _write(tmp_path, _base(
+            tmp_path, "console_queued_grace_secs: 600\n" + _valid_screener()))
+        assert load_config(cfg).console_queued_grace_secs == 600
+        # 0 有意义（关掉宽限 = 退回旧自愈），不得被 max(1, ...) 抬起
+        cfg0 = _write(tmp_path, _base(
+            tmp_path, "console_queued_grace_secs: 0\n" + _valid_screener()))
+        assert load_config(cfg0).console_queued_grace_secs == 0
+
 
 class TestPipelineRepos:
     """v0.3 per-repo 管线契约解析。"""

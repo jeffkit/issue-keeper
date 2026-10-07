@@ -2085,6 +2085,7 @@ def _reap_console_execution(config, binding, it, key, label: str,
 
     决策表（设计稿 §G5）：error → resume-retry ×1（断点步进，免整跑重做）；
     running + last_update_time 年龄超阈 → zombie（cancel + engine_error 行）；
+    GET 404 且记录年龄 < console_queued_grace_secs → 排队中（返回 None，不重派）；
     其余终态 → verdict 映射落账。非 engine_error 的收尾回评由本函数出
     （console flow 无回评节点契约），避免共享兜底「未确认发出回评」文案。
 
@@ -2105,6 +2106,18 @@ def _reap_console_execution(config, binding, it, key, label: str,
         log.warning("[%s] console 不可达，本轮跳过：%s", label, e)
         return None
     except _ce.ConsoleExecNotFound:
+        # 排队窗口 ≠ 引擎故障：console POST 只把消息写进 Redis（execution_id 即刻
+        # 铸造但不落记录），执行记录由 worker 消费时才首次落盘——故「已派发未消费」
+        # 期间 GET 必 404。宽限期内判排队中（不动作不重派），超期才按终态走既有
+        # 自愈（记录被清理/TTL 过期/派发丢失）。
+        age = _ce.dispatch_age_secs(crec, now=now)
+        since = getattr(it, "in_flight_since", None)
+        if age is None and since is not None:  # 记录缺 dispatched_at：退回在途锚
+            age = now - since
+        if age is None or age < config.console_queued_grace_secs:
+            log.info("[%s] console execution 尚无记录（已派发 %s），按排队中处理，不重派",
+                     label, f"{age:.0f}s" if age is not None else "年龄未知")
+            return None
         detail = {"status": "error",
                   "error": {"message": "execution 404（console 侧被清理/TTL 过期?）"}}
     except _ce.ConsoleExecError as e:

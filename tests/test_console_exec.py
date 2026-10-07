@@ -23,6 +23,13 @@ from issue_keeper.sources import Resource
 from issue_keeper.state import ItemState, State
 
 
+def _dispatched_at(ago_secs: float) -> str:
+    """派发时刻串，格式与 keeper 写 console-exec.json 的完全一致（time.strftime
+    的 %z 才有偏移；datetime.now() 是 naive，strftime("%z") 为空的坑）。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z",
+                         time.localtime(time.time() - ago_secs))
+
+
 # ---------- console_exec 纯函数 ----------
 
 
@@ -81,6 +88,19 @@ class TestZombie:
         assert ce.zombie(self._detail(99999, status="completed"), 7200) is False
 
 
+class TestDispatchAge:
+    """#18：排队窗口内 execution 还没有记录，派发年龄是唯一可用信号。"""
+
+    def test_parses_dispatched_at(self):
+        age = ce.dispatch_age_secs({"dispatched_at": _dispatched_at(120)})
+        assert age is not None and 118 <= age <= 125
+
+    def test_missing_or_bad_timestamp_is_none(self):
+        assert ce.dispatch_age_secs({}) is None
+        assert ce.dispatch_age_secs({"dispatched_at": ""}) is None
+        assert ce.dispatch_age_secs({"dispatched_at": "not-a-time"}) is None
+
+
 class TestClientErrors:
     def test_404_maps_to_not_found(self, monkeypatch):
         import urllib.error
@@ -136,6 +156,28 @@ class FakeClient:
     def cancel(self, eid):
         self.cancelled.append(eid)
         return {}
+
+
+class NotFoundClient:
+    """GET 恒 404（已派发未消费），并记录任何重派/续跑企图（#18）。"""
+
+    def __init__(self):
+        self.started = []
+        self.resumed = []
+
+    def start_execution(self, flow_id, params):
+        self.started.append((flow_id, params))
+        return "exec-dup"
+
+    def get_execution(self, eid):
+        raise ce.ConsoleExecNotFound(f"/api/executions/{eid}: 404")
+
+    def resume(self, eid, resume_type, data=None):
+        self.resumed.append((eid, resume_type))
+        raise ce.ConsoleExecNotFound(f"/api/executions/{eid}/resume: 404")
+
+    def cancel(self, eid):
+        raise ce.ConsoleExecNotFound(f"/api/executions/{eid}/cancel: 404")
 
 
 def _cfg(console=True, **over) -> Config:
@@ -323,3 +365,96 @@ class TestReapConsole:
                                         {"execution_id": "e"}, time.time())
         assert row is None
         assert (art / K.CONSOLE_EXEC_RECORD).exists()  # 在途锚保留
+
+
+# ---------- #18：已派发未消费的 404 = 排队，不是 engine_error ----------
+
+
+class TestQueuedNotFound:
+    """console POST 只写 Redis、记录由 worker 消费时才落盘 → 排队期间 GET 必 404。
+
+    旧行为把 404 判成 engine_error → resume-retry 同样 404 → engine_error 自动重试
+    → 同 issue 重复执行（背压排队 >1 个 keeper 周期时必现）。
+    """
+
+    def _reap(self, art, monkeypatch, *, ago=None, since_ago=100.0, client=None,
+              cfg=None):
+        rec = {"execution_id": "exec-123", "flow_id": "self-improve-v2",
+               "retry_count": 0}
+        if ago is not None:
+            rec["dispatched_at"] = _dispatched_at(ago)
+        (art / K.CONSOLE_EXEC_RECORD).write_text(json.dumps(rec))
+        cfg = cfg or _cfg()
+        it = ItemState()
+        it.in_flight_since = time.time() - since_ago
+        posted = _wire(monkeypatch, client or NotFoundClient())
+        row = K._reap_console_execution(cfg, _binding(), it, "5", "l", art,
+                                        rec, time.time())
+        return cfg, it, row, posted
+
+    def test_fresh_record_is_queued(self, art, monkeypatch):
+        client = NotFoundClient()
+        _, _, row, posted = self._reap(art, monkeypatch, ago=60, client=client)
+        assert row is None, "宽限期内 404 须判排队中，不得产 engine_error"
+        assert client.resumed == [], "排队窗口内不得 resume-retry"
+        assert (art / K.CONSOLE_EXEC_RECORD).exists(), "在途锚保留，等 worker 消费"
+        assert not (art.parent / "runs.jsonl").exists(), "排队中不落台账行"
+        assert posted == []
+
+    def test_age_unknown_falls_back_to_in_flight_anchor(self, art, monkeypatch):
+        _, _, row, _ = self._reap(art, monkeypatch, ago=None, since_ago=100.0)
+        assert row is None, "记录缺 dispatched_at 时退回在途锚判龄，仍算排队"
+
+    def test_age_unknown_but_stale_anchor_self_heals(self, art, monkeypatch):
+        _, _, row, _ = self._reap(art, monkeypatch, ago=None, since_ago=99999.0)
+        assert row["status"] == "engine_error" and "404" in row["error"]
+
+    def test_stale_record_keeps_self_heal_path(self, art, monkeypatch):
+        cfg = _cfg(console_queued_grace_secs=1800)
+        _, _, row, posted = self._reap(art, monkeypatch, ago=3600, cfg=cfg)
+        assert row["status"] == "engine_error" and "404" in row["error"]
+        assert not (art / K.CONSOLE_EXEC_RECORD).exists(), "超宽限期仍 404：按终态清锚"
+        ledger = (art.parent / "runs.jsonl").read_text().strip().splitlines()
+        assert json.loads(ledger[-1])["status"] == "engine_error"
+        assert posted == [], "engine_error 的收尾回评由共享收尾出，此处不发"
+
+    def test_grace_is_configurable(self, art, monkeypatch):
+        cfg = _cfg(console_queued_grace_secs=60)
+        _, _, row, _ = self._reap(art, monkeypatch, ago=120, cfg=cfg)
+        assert row["status"] == "engine_error"
+
+
+def test_背压排队的404不触发重派(tmp_path, monkeypatch, caplog):
+    """#18 场景级：worker 忙（消息排队未消费 → GET 404）时连轮巡检不得重派。
+
+    排队等待 >1 个 keeper 巡检周期（300s）时必现——重复执行 = 重复烧槽/重复
+    回评/同仓并发 land 竞态。
+    """
+    from tests.test_pipeline_dispatch_guard import (
+        _bindings, _in_flight_state, _pipeline_cfg)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = _pipeline_cfg(tmp_path / "b", state_file=tmp_path / "state.json")
+    state, it, art = _in_flight_state(tmp_path, repo="a/b", since=time.time() - 400)
+    (art / K.PIPELINE_LOCK_NAME).write_text(K.CONSOLE_LOCK_SENTINEL)
+    (art / K.CONSOLE_EXEC_RECORD).write_text(json.dumps(
+        {"execution_id": "exec-queued", "flow_id": "self-improve-v2",
+         "retry_count": 0, "dispatched_at": _dispatched_at(0)}))
+    client = NotFoundClient()
+    monkeypatch.setattr(ce, "client_from_config", lambda cfg: client)
+    monkeypatch.setattr(K, "_gh_post_comment", lambda *a, **k: None)
+
+    with caplog.at_level("INFO"):
+        for _ in range(3):  # 3 个巡检周期
+            K._reap_pipelines(cfg, state, _bindings(repo="a/b"))
+
+    assert "resume-retry 失败" not in caplog.text
+    assert "engine_error 自动重试" not in caplog.text
+    assert "按排队中处理" in caplog.text, "须走排队分支（否则断言可能空过）"
+    assert it.in_flight_since is not None, "排队中的 run 仍在途：不得清锚重派"
+    assert it.processed is False and it.retry_after is None
+    assert client.started == [], "重派 = 同 issue 重复执行（#18）"
+    assert client.resumed == [], "排队窗口内不得 resume-retry"
+    rec = json.loads((art / K.CONSOLE_EXEC_RECORD).read_text())
+    assert rec["execution_id"] == "exec-queued", "每条 issue 只应有一个执行记录"
+    assert not (art.parent / "runs.jsonl").exists(), "排队中不落台账行"

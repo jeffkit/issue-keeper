@@ -9,6 +9,7 @@ execution 终态 + 节点输出自行落账，映射函数在本模块（与 flo
 | 引擎/节点崩溃      | execution status=error    | resume-retry ×1（续原 execution）     |
 | retry 后仍 error   | 台账连续 engine_error     | 既有升级人工语义（封顶 2）            |
 | worker zombie      | last_update_time 年龄超阈 | cancel + 重派（engine_error 台账行）  |
+| 已派发未消费       | GET 404 + 记录年龄 < 宽限 | 排队中：不动作不重派（info 日志）     |
 | 环境性             | verdict=retry-later       | 既有 retry-later 不消费语义           |
 | 内容性             | verdict=failed-preserved  | 既有 failed 语义                      |
 
@@ -23,6 +24,7 @@ import json
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 # v2 flow 末端 verdict 节点 id 约定（console 发布的 self-improve v2 flow 须
 # 把 verdict dict 赋进 $NODE.<verdict 节点>；发布契约见 flows/README.md）。
@@ -38,7 +40,28 @@ class ConsoleExecUnavailable(ConsoleExecError):
 
 
 class ConsoleExecNotFound(ConsoleExecError):
-    """execution 不存在（被清理/TTL 过期）——按终态处理。"""
+    """execution 不存在（被清理/TTL 过期）——按终态处理。
+
+    注意「记录还没落」与「被清理/TTL 过期」在 HTTP 层不可区分：console POST
+    只把消息写进 Redis（execution_id 即刻铸造但**不落记录**），执行记录由 worker
+    消费时才首次落盘。排队窗口内 GET 必 404，故调用方须用 ``dispatch_age_secs``
+    配合宽限期把「排队中」摘出来（见 keeper._reap_console_execution）。
+    """
+
+
+def dispatch_age_secs(record: dict, now: float | None = None) -> float | None:
+    """console-exec 在途记录的派发年龄（秒）；dispatched_at 缺失/不可解析 → None。
+
+    这是排队窗口内唯一可用的时间信号（execution 侧还没有记录）。
+    """
+    ts = str(record.get("dispatched_at") or "")
+    if not ts:
+        return None
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+    return (now if now is not None else time.time()) - dt.timestamp()
 
 
 class ConsoleExecClient:
@@ -195,7 +218,6 @@ def zombie(detail: dict, threshold_secs: float, now: float | None = None) -> boo
     if not ts:
         return False
     try:
-        from datetime import datetime
         age = (now if now is not None else time.time()) - \
             datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except ValueError:

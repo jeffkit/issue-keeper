@@ -119,6 +119,13 @@ pipeline:
 pipeline_timeout_secs: 5400
 run_deadline_margin_secs: 300
 
+# 已派发未消费的宽限期（秒）：console 派发只把消息写进 Redis，execution 记录
+# 由 worker 消费时才落盘——排队期间 GET /api/executions/<id> 必 404。记录年龄
+# 小于本值 → 判「排队中」，不动作不重派（等 worker 消费）；超期仍 404 才按引擎
+# 故障走既有自愈（resume/重派/升级）。须 > 最长排队等待（队列深度 × 单 run
+# 时长）：配小了会在背压下把排队误判成 engine_error → 重复执行。
+console_queued_grace_secs: 1800
+
 # ─── per-repo 管线契约（pipeline_repos，v0.3 2026-09-30）──────────────
 # 每个仓自带：基线分支 / 依赖安装 / 质量门（单命令或多门清单）/ 交付策略 /
 # 审核模式 / 仓规注入（红线·路由·文档惯例）/ 段预算覆盖。
