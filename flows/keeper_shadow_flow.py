@@ -269,7 +269,9 @@ def run(input):
         if b is None:
             out["skipped"].append({"repo": repo, "num": num, "why": "无绑定"})
             continue
-        slug = repo.split("/")[-1]
+        # state 的 repo 键约定 = repo 全名 replace("/","-")（keeper 同款；
+        # 用裸仓名会创建幽灵键，reaper 看不到 → run 永不收尾）
+        slug = repo.replace("/", "-")
         it = st.repo(slug).item(str(num))
         if it.in_flight_since:
             out["skipped"].append({"repo": repo, "num": num, "why": "状态已在途（并发窗口）"})
