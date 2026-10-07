@@ -17,7 +17,8 @@ import pytest
 
 from issue_keeper import console_exec as ce
 from issue_keeper import keeper as K
-from issue_keeper.config import Config, PipelineConsoleConfig, PipelineConfig, RepoBinding
+from issue_keeper.config import (Config, GateSpec, PipelineConsoleConfig,
+                                 PipelineConfig, RepoBinding)
 from issue_keeper.sources import Resource
 from issue_keeper.state import ItemState, State
 
@@ -196,6 +197,29 @@ class TestDispatchConsole:
         assert dispatch["worktree_dir"].endswith(".worktrees/issue-5")
         assert (art / K.PIPELINE_LOCK_NAME).read_text() == K.CONSOLE_LOCK_SENTINEL
         assert it.in_flight_since is not None
+
+    def test_dispatch_wraps_gate_cmds_in_bash_c(self, art, monkeypatch):
+        """门命令必须显式 bash -c 包装（plaita#28「gates/tests 失败」根因）。
+
+        flow 的 GATE 节点对单字符串命令按 argv 执行、不经 shell：不包装则
+        `cd X && Y` 静默假绿（cd 吞掉剩余参数返回 0）、`pytest … && pytest …`
+        参数错乱报 usage error。本地 gate_runner 对同一份命令是 bash -c 语义，
+        两条路径必须对齐。"""
+        client = FakeClient()
+        _wire(monkeypatch, client)
+        cfg = _cfg()
+        pc = cfg.pipeline_repo_cfg("jeffkit/recursive")
+        pc.gates = [GateSpec(name="tests",
+                             command="pytest -q && pytest tests/e2e -q",
+                             timeout_secs=1800)]
+        it = ItemState()
+        out = K._dispatch_console_execution(cfg, _binding(), _res(), it, "l",
+                                            pc, art, art / "00-issue.md")
+        assert out["status"] == "dispatched"
+        gates = client.started[0][1]["gates"]
+        assert gates[0]["name"] == "tests"
+        assert gates[0]["cmd"].startswith("bash -c ")
+        assert "pytest -q && pytest tests/e2e -q" in gates[0]["cmd"]
 
     def test_dispatch_failure_is_engine_error_without_record(self, art, monkeypatch):
         _wire(monkeypatch, FakeClient(fail_start="boom"))

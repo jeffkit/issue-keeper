@@ -1938,8 +1938,17 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
     # flow 侧按序取用（fmt→lint→test 语义位）；不传 = flow 回退 cargo 三段
     # （recursive 自身零回归）。仅传 name/command，timeout 由 flow 默认（其
     # 预算按 Rust 冷构建调优，非 Rust 仓通常更快，够用）。
+    #
+    # ⚠️ 执行语义（2026-10-07 修复，plaita#28「gates/tests 失败」根因）：flow 的
+    # GATE 节点对单字符串命令做 shlex.split 后**按 argv 执行、不经 shell**
+    # （plaita_nodes/gate.py）——门命令里的 `&&`/`cd`/环境前缀会被拆成 argv：
+    # 轻则参数错乱报 usage error，重则 `cd X && …` 静默假绿（cd 吞掉剩余参数）。
+    # 本地 gate_runner 对同一份命令是 ["bash","-c",cmd]（shell 语义），两条路径
+    # 必须对齐——这里显式用 bash -c 包装（shlex.quote 保引号）。
     if pc.gates:
-        params["gates"] = [{"name": g.name, "cmd": g.command} for g in pc.gates]
+        import shlex as _shlex
+        params["gates"] = [{"name": g.name, "cmd": f"bash -c {_shlex.quote(g.command)}"}
+                           for g in pc.gates]
     try:
         execution_id = client.start_execution(flow_id, params)
     except _ce.ConsoleExecError as e:
