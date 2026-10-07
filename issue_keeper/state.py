@@ -44,6 +44,10 @@ class ItemState:
     # {"pid": int|None, "started_at": float, "attempts": int}。派发时写入、
     # 收尸后清除；daemon 重启后按 pid 存活接管（防重复调起）。
     comment_tasks: dict = field(default_factory=dict)
+    # 人工 reopen 时刻（epoch 秒，2026-10-07 #7）：reopen 时写。reaper 收尾见它
+    # 晚于本次派发（`in_flight_since`）即说明人工在 run 窗口内要求重跑——跳过
+    # processed=True 并直接重派，别把这条 reopen 静默吃掉。
+    manual_reopen_at: float | None = None
 
 
 @dataclass
@@ -106,6 +110,8 @@ def load_state(path: Path) -> State:
             it.retry_later_streak = int(idata.get("retry_later_streak") or 0)
             it.screener_retry_streak = int(idata.get("screener_retry_streak") or 0)
             it.comment_tasks = dict(idata.get("comment_tasks") or {})
+            it.manual_reopen_at = (
+                float(idata["manual_reopen_at"]) if idata.get("manual_reopen_at") else None)
     state.patrol = dict(raw.get("patrol") or {})
     state.patrol_cycle = int(raw.get("patrol_cycle") or 0)
     return state
@@ -163,6 +169,7 @@ def _dump_state_dict(state: State) -> dict[str, Any]:
                     "retry_later_streak": it.retry_later_streak,
                     "screener_retry_streak": it.screener_retry_streak,
                     "comment_tasks": it.comment_tasks,
+                    "manual_reopen_at": it.manual_reopen_at,
                 }
                 for key, it in rs.items.items()
             }
@@ -189,7 +196,14 @@ def save_state_item(
 
 _ITEM_FIELDS = ("processed", "session_id", "processed_comment_ids", "blocked",
                 "wakeup_deps", "in_flight_since", "retry_after", "retry_later_streak",
-                "screener_retry_streak", "comment_tasks")
+                "screener_retry_streak", "comment_tasks", "manual_reopen_at")
+
+# 轮内 CLI reopen 占有的字段：它清掉的终态，**加上标记本身**——盘上的
+# manual_reopen_at 比轮首快照新，就说明本轮中途又来过一次 reopen，daemon 的收尾
+# （processed=True / 消费掉标记）不得反盖回去（#7——CLI 报「已重新入队」却静默无效）。
+_REOPEN_OWNED_FIELDS = ("processed", "blocked", "wakeup_deps", "retry_after",
+                        "retry_later_streak", "screener_retry_streak",
+                        "manual_reopen_at")
 
 
 def save_state_merged(path: Path, state: State, base: State) -> None:
@@ -211,7 +225,14 @@ def _merge_state(disk: State, mem: State, base: State) -> None:
         for key, item in rs.items.items():
             base_item = brs.items.get(key) if brs else None
             target = drs.item(key)
+            base_reopen = getattr(base_item, "manual_reopen_at", None) if base_item else None
+            # 盘上 manual_reopen_at 比轮首快照新 = CLI 在本轮中途 reopen，其清终态
+            # 结果优先于本轮 daemon 的收尾（否则整份合并把 reopen 吃回去）。
+            cli_reopened = (target.manual_reopen_at is not None
+                            and target.manual_reopen_at != base_reopen)
             for name in _ITEM_FIELDS:
+                if cli_reopened and name in _REOPEN_OWNED_FIELDS:
+                    continue
                 value = getattr(item, name)
                 if base_item is None or getattr(base_item, name) != value:
                     setattr(target, name, value)

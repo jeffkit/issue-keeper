@@ -1061,6 +1061,9 @@ def _clear_terminal_state(it: ItemState) -> None:
     it.retry_after = None      # #8：人工 reopen 立即重派，不被上轮退避挡住
     it.retry_later_streak = 0  # #6：人工干预即重算连击，退避从 7min 起
     it.screener_retry_streak = 0  # #5：同理，screener 连击从 0 重算
+    # #7：记 reopen 时刻——reaper 收尾见它晚于本次派发即跳过 processed 重派。
+    # 刻意**不**清 in_flight_since：run 还在跑时 reaper 仍要认这个在途锚。
+    it.manual_reopen_at = time.time()
 
 
 def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
@@ -1071,6 +1074,11 @@ def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
     （2026-09-28 的 /tmp/run_batch_41_44.py 就是这么来的，代价是丢掉 keeper 的
     兜底回评与看板联动）。只清 processed/blocked/wakeup_deps：评论级进度
     （processed_comment_ids）保留，免得把已经答过的旧评论再答一遍。
+
+    在途条目也算「改动」并记 `manual_reopen_at`（#7）：run 结束到轮首收尾之间
+    有中位 533s 的窗口，此时条目 processed=False 但 in_flight_since 仍在——旧
+    逻辑判「本就没被消费」直接返回，人工的重跑意图随后被 reaper 的 processed=True
+    静默吃掉。
     """
     binding = next((b for b in config.repos if b.repo == repo), None)
     if binding is None:
@@ -1080,7 +1088,7 @@ def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
     changed: list[int] = []
     for n in numbers:
         it = rs.item(str(n))
-        if it.processed or it.blocked:
+        if it.processed or it.blocked or getattr(it, "in_flight_since", None):
             it.processed = False
             it.blocked = False
             it.wakeup_deps = []
@@ -2042,7 +2050,8 @@ def _dispatch_shadow_execution(config, binding, res, label: str,
 
 
 def _reap_console_execution(config, binding, it, key, label: str,
-                            artifact_dir: Path, crec: dict, now: float) -> dict | None:
+                            artifact_dir: Path, crec: dict, now: float,
+                            void: bool = False) -> dict | None:
     """v2-console 在途轮询（G5/G6）。返回 None=仍在途；否则返回已落账的台账行，
     交回 _reap_pipelines 走共享收尾（读回校验/engine_error 重派/升级/兜底回评）。
 
@@ -2050,6 +2059,10 @@ def _reap_console_execution(config, binding, it, key, label: str,
     running + last_update_time 年龄超阈 → zombie（cancel + engine_error 行）；
     其余终态 → verdict 映射落账。非 engine_error 的收尾回评由本函数出
     （console flow 无回评节点契约），避免共享兜底「未确认发出回评」文案。
+
+    void=True（#7 窗口内人工 reopen，run 结论作废）：照常轮询判终态并清锚，但不发
+    终态回评、不落台账行——收尾分流在此处发生，晚于它的 void 判定会留下「结论作废」
+    却已回评的痕迹。
     """
     import time as _time
 
@@ -2105,8 +2118,9 @@ def _reap_console_execution(config, binding, it, key, label: str,
     else:
         row = _ce.map_verdict(_ce.verdict_from_execution(detail))
 
-    # 非 engine_error：keeper 出真实收尾回评（回评礼仪不变），并记入台账行
-    if row["status"] != "engine_error" and not bool(row.get("comment_posted")):
+    # 非 engine_error：keeper 出真实收尾回评（回评礼仪不变），并记入台账行。
+    # void（#7 窗口内人工 reopen）：结论作废，两者都不留。
+    if not void and row["status"] != "engine_error" and not bool(row.get("comment_posted")):
         parts = [f"管线收尾（console 执行）：status={row['status']}"]
         if row.get("note"):
             parts.append(str(row["note"]))
@@ -2122,16 +2136,18 @@ def _reap_console_execution(config, binding, it, key, label: str,
         except Exception as e:
             log.error("[%s] console 收尾回评失败: %s", label, e)
 
-    _append_pipeline_record(binding.repo, number, {
-        **row, "flow_source": "v2-console",
-        "execution_id": crec.get("execution_id"),
-    })
+    if not void:
+        _append_pipeline_record(binding.repo, number, {
+            **row, "flow_source": "v2-console",
+            "execution_id": crec.get("execution_id"),
+        })
     # 终态已落账：清在途锚与锁（共享收尾按无锁/终态处理）
     (artifact_dir / CONSOLE_EXEC_RECORD).unlink(missing_ok=True)
     (artifact_dir / PIPELINE_LOCK_NAME).unlink(missing_ok=True)
     (artifact_dir.parent / GLOBAL_LOCK_NAME).unlink(missing_ok=True)
-    log.info("[%s] console execution 终态落账：status=%s（execution=%s）",
-             label, row["status"], crec.get("execution_id"))
+    log.info("[%s] console execution 终态%s：status=%s（execution=%s）",
+             label, "作废（人工 reopen）" if void else "落账",
+             row["status"], crec.get("execution_id"))
     return row
 def _engine_env_with_run_deadline(config, pc, start_ts: float, label: str) -> dict:
     """构造 dispatch engine_env：engine=v2 注入 RECURSIVE_RUN_DEADLINE（2026-10-02 评审遗留 #3）。
@@ -2396,6 +2412,7 @@ def _reap_pipelines(config, state, bindings) -> int:
     """收尸：对所有 in_flight 条目判「run 是否已结束」，结束则补回评/状态/看板。
 
     返回本轮收尾的条数。判定：
+    - run 已结束且人工 reopen 晚于本次派发 → 结论作废：清在途锚但不置 processed（#7）；
     - run.lock 的 pid 活着且未超 pipeline_timeout_secs → 还在跑，跳过；
     - pid 活着但超时 → killpg（bridge 是 start_new_session，整组清）+ engine_error；
     - pid 死了 → bridge 已退出：读台账该 issue 最晚一条记录拿 status/comment_posted；
@@ -2425,11 +2442,18 @@ def _reap_pipelines(config, state, bindings) -> int:
             except Exception as e:  # noqa: BLE001
                 log.debug("[%s] 影子回收异常（忽略）: %s", label, e)
 
+            # #7 窗口内人工 reopen：本次 run 结论作废（判定分支在下方分流之后——
+            # 「还在跑」要先放行，等 run 结束再作废）。console 分流在轮询到终态时
+            # 会发终态回评/落台账行，故先把结论算出来传进去抑制。
+            void_run = bool(getattr(it, "manual_reopen_at", None)
+                            and it.manual_reopen_at > since)
+
             console_rec = _console_exec_record(artifact_dir)
             if console_rec is not None:
                 # engine=v2-console 在途：轮询 execution，终态则落账后走共享收尾
                 row = _reap_console_execution(config, binding, it, key, label,
-                                              artifact_dir, console_rec, now)
+                                              artifact_dir, console_rec, now,
+                                              void=void_run)
                 if row is None:
                     continue  # 仍在途（本轮无终态/console 不可达）
                 rec = row
@@ -2470,6 +2494,29 @@ def _reap_pipelines(config, state, bindings) -> int:
                     err = f"超时（{config.pipeline_timeout_secs}s），进程组已清"
             number = int(key.split(":")[-1])
             kind = "pr" if key.startswith("pr:") else "issue"
+
+            # ── 人工 reopen 晚于本次派发：run 结论作废，直接重派（#7）────────
+            # 收尾只在轮首发生一次，run 结束 → 收尾之间有实测中位 533s 的窗口
+            # （轮内同步 agent 调用可拉到 >1h）。人工在窗口内 reopen 表达的是
+            # 「按最新内容重跑」，此时条目 processed=False 但 in_flight_since
+            # 仍在——若照常 processed=True，这次 reopen 就被静默吃掉（#100/#97/
+            # #107 被反复 re-screen 的痕迹）。清在途锚但不置 processed →
+            # run_once 随后的扫仓当轮直接重派（不消费首响、不吃退避）。
+            # 到此为止 run 已确证结束（在跑的上面已 continue），console 分流的
+            # 终态回评/台账行也已由 `void=` 抑制——不留「结论作废」的痕迹。
+            if void_run:
+                # 本次派发的产物锚要清干净，否则重派会被 `_pipeline_in_flight` 挡住
+                for anchor in (artifact_dir / CONSOLE_EXEC_RECORD, lock,
+                               artifact_dir.parent / GLOBAL_LOCK_NAME):
+                    anchor.unlink(missing_ok=True)
+                it.in_flight_since = None
+                it.manual_reopen_at = None
+                it.retry_after = None
+                it.retry_later_streak = 0
+                finalized += 1
+                log.info("[%s] 窗口内人工 reopen 晚于本次派发，run(%s) 结论作废，直接重派",
+                         label, status)
+                continue
 
             # ── 跨渠道读回校验（recursive#2）：台账说没回评，先去目标渠道核实——
             # bridge 在「评论已发出」与「台账落盘」之间崩溃、或旧版台账键漏记
@@ -2609,6 +2656,7 @@ def _reap_pipelines(config, state, bindings) -> int:
                     log.error("[%s] 兜底回评失败: %s", label, e)
             it.processed = True
             it.in_flight_since = None
+            it.manual_reopen_at = None  # #7：在途窗口已结束，人工 reopen 标记失效
             it.retry_after = None      # #8：收尾即销掉陈旧退避，不留幽灵字段
             it.retry_later_streak = 0  # #6：终态收尾即清零，下次故障重新 7min 起算
             finalized += 1
