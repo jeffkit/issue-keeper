@@ -25,6 +25,7 @@ from issue_keeper.keeper import (
     ALREADY_RUNNING,
     _author_over_limit,
     _count_in_flight,
+    _count_repo_in_flight,
     _dispatch_pipeline,
     _global_pipeline_in_flight,
     _issue_over_pipeline_limit,
@@ -32,6 +33,7 @@ from issue_keeper.keeper import (
     _pipeline_in_flight,
     _reap_pipelines,
     _release_pipeline_lock,
+    _repo_quota_exceeded,
     reopen_issues,
 )
 from issue_keeper.sources import Resource
@@ -389,6 +391,49 @@ def test_count_in_flight():
     st.repo("b").item("3").in_flight_since = time.time()
     assert _count_in_flight(st) == 2
     assert a.in_flight_since is None
+
+
+# ── 按仓配额（S5，2026-10-07）：长任务仓不得占满全部槽位饿死轻仓 ──
+
+def _bind(repo: str) -> RepoBinding:
+    return RepoBinding(repo=repo, profile="x")
+
+
+def test_repo_quota_blocks_at_cap():
+    st = State()
+    st.repo("jeffkit-recursive").item("121").in_flight_since = time.time()
+    st.repo("jeffkit-recursive").item("128").in_flight_since = time.time()
+    st.repo("jeffkit-plaita").item("28").in_flight_since = time.time()
+    cfg = Config(pipeline_repo_limits={"jeffkit/recursive": 2})
+    over, cur, cap = _repo_quota_exceeded(cfg, st, _bind("jeffkit/recursive"))
+    assert (over, cur, cap) == (True, 2, 2)
+    # 未配置配额的仓不受影响（只算自己的在途，不超限）
+    over2, cur2, cap2 = _repo_quota_exceeded(cfg, st, _bind("jeffkit/plaita"))
+    assert (over2, cur2, cap2) == (False, 0, 0)
+    assert _count_repo_in_flight(st, "jeffkit-plaita") == 1
+
+
+def test_repo_quota_zero_pauses_repo():
+    cfg = Config(pipeline_repo_limits={"jeffkit/recursive": 0})
+    over, cur, cap = _repo_quota_exceeded(cfg, State(), _bind("jeffkit/recursive"))
+    assert (over, cur, cap) == (True, 0, 0)
+
+
+def test_repo_quota_unset_is_noop():
+    st = State()
+    st.repo("jeffkit-recursive").item("1").in_flight_since = time.time()
+    over, cur, cap = _repo_quota_exceeded(Config(), st, _bind("jeffkit/recursive"))
+    assert (over, cur, cap) == (False, 0, 0)
+
+
+def test_repo_quota_slug_mapping():
+    """binding.repo（斜杠形）→ state 键（slug 形）不能错位。"""
+    st = State()
+    st.repo("jeffkit-recursive").item("1").in_flight_since = time.time()
+    st.repo("jeffkit-recursive").item("2").in_flight_since = time.time()
+    cfg = Config(pipeline_repo_limits={"jeffkit/recursive": 1})
+    over, cur, cap = _repo_quota_exceeded(cfg, st, _bind("jeffkit/recursive"))
+    assert (over, cur, cap) == (True, 2, 1)
 
 
 # ── reaper 跨渠道读回 + WIP 快照 + 看板收尾（recursive#2 的三个可修点）──

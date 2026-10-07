@@ -627,6 +627,12 @@ def _process_resource(
                     log.info("[%s] 在途管线 run %d/%d，本轮不派发", label,
                              in_flight, config.pipeline_max_in_flight)
                     return 0
+                _over, _cur, _cap = _repo_quota_exceeded(config, state, binding)
+                if _over:
+                    # 按仓配额（S5）：该仓已在途到顶——同样不标记 processed，下轮再试。
+                    log.info("[%s] 本仓在途 run %d/%d（按仓配额），本轮不派发", label,
+                             _cur, _cap)
+                    return 0
                 pres = _dispatch_pipeline(config, binding, res, it, label, pc=_pc)
                 if pres.get("status") == ALREADY_RUNNING:
                     # 同 issue 已有 run 在跑（run.lock 的 pid 活着）。不置 processed、
@@ -1301,6 +1307,27 @@ def _count_in_flight(state) -> int:
         for it in rs.items.values()
         if getattr(it, "in_flight_since", None)
     )
+
+
+def _count_repo_in_flight(state, repo_slug: str) -> int:
+    """本仓当前在途管线 run 数（按仓配额 S5 用）。"""
+    if state is None:
+        return 0
+    rs = state.repos.get(repo_slug)
+    if rs is None:
+        return 0
+    return sum(1 for it in rs.items.values() if getattr(it, "in_flight_since", None))
+
+
+def _repo_quota_exceeded(config, state, binding) -> tuple[bool, int, int]:
+    """按仓配额（S5，2026-10-07）：返回 (是否超限, 本仓在途, 配额)。
+
+    未配置该仓的配额时恒返回 (False, 0, 0)——空默认=行为不变。0 配额=该仓暂停派发。"""
+    cap = (getattr(config, "pipeline_repo_limits", None) or {}).get(binding.repo)
+    if cap is None:
+        return False, 0, 0
+    cur = _count_repo_in_flight(state, binding.repo_slug)
+    return cur >= cap, cur, cap
 
 
 def _gh_post_comment(kind: str, repo: str, number: int, body: str) -> None:

@@ -270,6 +270,12 @@ class Config:
     # 槽位释放时先被派发——治理「排末位的仓被前序仓的失败-重试循环长期饿死」
     # （2026-10-05 实证：recursive 批次被饿 8h）。空默认=纯扫描序，行为不变。
     pipeline_priority_repos: tuple[str, ...] = ()
+    # 按仓派发配额（S5，2026-10-07）：{仓库全名: 本仓在途 run 上限}，与全局
+    # pipeline_max_in_flight 叠加生效——全局闸管总量，本闸管单仓。治理「长任务仓
+    # （Rust 构建 30-60min+）长期占满全部槽位、轻仓队列零派发」（2026-10-07 实证：
+    # recursive 独占 3/3，plaita 队列 6+ 单持续等槽）。空默认=不设限，行为不变；
+    # 上限 0 = 该仓暂停派发。
+    pipeline_repo_limits: dict[str, int] = field(default_factory=dict)
     # 派发时在 issue 上发一条「已认领」评论：多会话/多人并行的机器可读信号
     # （2026-09-29 与另一会话在同一 issue 撞车的教训）。
     pipeline_claim_comment: bool = True
@@ -638,6 +644,11 @@ def load_config(path: str | os.PathLike) -> Config:
     if not isinstance(priority_raw, (list, tuple)):
         raise ValueError("pipeline_priority_repos 需要是列表（仓库全名，如 [owner/repo]）")
     pipeline_priority_repos = tuple(str(x).strip() for x in priority_raw if str(x).strip())
+    limits_raw = raw.get("pipeline_repo_limits") or {}
+    if not isinstance(limits_raw, dict):
+        raise ValueError("pipeline_repo_limits 需要是映射（仓库全名 → 上限，如 {owner/repo: 2}）")
+    pipeline_repo_limits = {str(k).strip(): max(0, int(v))
+                            for k, v in limits_raw.items() if str(k).strip()}
     repos = _order_repos(repos, pipeline_priority_repos)
 
     cfg = Config(
@@ -662,6 +673,7 @@ def load_config(path: str | os.PathLike) -> Config:
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
         pipeline_priority_repos=pipeline_priority_repos,
+        pipeline_repo_limits=pipeline_repo_limits,
         comment_max_in_flight=max(1, int(raw.get("comment_max_in_flight", 3))),
         # 2026-09-30 修复：与 max_in_flight 同款死旋钮——yaml 无人读取，恒为
         # 默认 2，#67/#70（各 2 run）被误判日上限锁死（runtime yaml 实配 10）。

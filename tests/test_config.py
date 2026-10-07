@@ -304,3 +304,25 @@ class TestPipelineRepos:
             "    test_command: t\n"
         ))
         assert c.pipeline_repo_cfg("a/b").enabled is False
+
+
+class TestPipelineRepoLimits:
+    """S5 按仓派发配额（2026-10-07）解析：空默认=不设限，行为不变。"""
+
+    def _cfg(self, tmp_path, extra: str):
+        cfg = _write(tmp_path, _base(tmp_path, _valid_screener() + extra))
+        return load_config(cfg)
+
+    def test_limits_parsed(self, tmp_path):
+        c = self._cfg(tmp_path,
+                      "pipeline_repo_limits:\n"
+                      "  jeffkit/recursive: 2\n"
+                      "  jeffkit/plaita: 0\n")
+        assert c.pipeline_repo_limits == {"jeffkit/recursive": 2, "jeffkit/plaita": 0}
+
+    def test_limits_default_empty(self, tmp_path):
+        assert self._cfg(tmp_path, "").pipeline_repo_limits == {}
+
+    def test_limits_bad_type_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="pipeline_repo_limits"):
+            self._cfg(tmp_path, "pipeline_repo_limits: [a, b]\n")
