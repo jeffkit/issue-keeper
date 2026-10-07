@@ -1842,21 +1842,40 @@ def _pipeline_repo_cfg(config: Config, binding: RepoBinding) -> tuple[PipelineRe
     return pc, ""
 
 
+def _gate_runner_path(config: Config) -> Path:
+    """gate_runner.py 的位置（本地路径与 console 路径共用的**单一事实源**）。"""
+    return Path(config.pipeline_bridge).expanduser().parent / "gates" / "gate_runner.py"
+
+
+def _gate_spec(pc: PipelineRepoConfig) -> dict:
+    """本仓的 gate spec（结构与 gate_runner 的 --spec 输入一致）。
+
+    console 路径（engine=v2-console）与本地路径共用同一份 spec 生成——保证
+    「N 道门 / 独立预算 / paths 条件 / autofix 重检」两条路径逐字段等价
+    （2026-10-07，jeffkit 指示「flow 严格按原来的实现，不许短斤缺两」）。"""
+    if pc.gates:
+        gates = [{"name": g.name, "command": g.command,
+                  "timeout_secs": g.timeout_secs, "paths": list(g.paths or []),
+                  "autofix": g.autofix}
+                 for g in pc.gates]
+    elif (pc.test_command or "").strip():
+        # 仅配 test_command 的旧式仓：包成单道门走同一 runner（避免 console
+        # 路径掉进 flow 的 cargo 回退——非 Rust 仓必假红）。
+        gates = [{"name": "test", "command": pc.test_command.strip(),
+                  "timeout_secs": 0, "paths": [], "autofix": ""}]
+    else:
+        return {}
+    return {"base": pc.base_branch, "gates": gates}
+
+
 def _gate_runner_invocation(config: Config, pc: PipelineRepoConfig, artifact_dir: Path) -> str:
     """多门仓：写 spec 到产物目录，test_command = gate_runner 调用（argv 可执行）。"""
     import json
 
-    runner = Path(config.pipeline_bridge).expanduser().parent / "gates" / "gate_runner.py"
-    spec = {
-        "base": pc.base_branch,
-        "gates": [{"name": g.name, "command": g.command,
-                   "timeout_secs": g.timeout_secs, "paths": g.paths,
-                   "autofix": g.autofix}
-                  for g in pc.gates],
-    }
     spec_file = artifact_dir / "gates.json"
-    spec_file.write_text(json.dumps(spec, ensure_ascii=False, indent=1), encoding="utf-8")
-    return f"python3 {runner} --spec {spec_file} --cwd ."
+    spec_file.write_text(json.dumps(_gate_spec(pc), ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    return f"python3 {_gate_runner_path(config)} --spec {spec_file} --cwd ."
 
 
 
@@ -1958,6 +1977,15 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         params["gates"] = [{"name": g.name, "cmd": f"bash -c {_shlex.quote(g.command)}",
                             "timeout_secs": int(g.timeout_secs or 0)}
                            for g in pc.gates]
+    # 完整 gate spec 透传（2026-10-07，jeffkit 指示「flow 严格按原来的实现」）：
+    # flow v1.0.5 起优先消费 gates_spec —— 在 run_dir 落盘后调**同一个**
+    # gate_runner.py，N 道门/独立预算/paths 条件/autofix 与本地路径逐字段等价；
+    # gates 三段（旧形态）保留作回滚兼容（旧 flow 版本仍可跑，只是降级）。
+    _spec = _gate_spec(pc)
+    if _spec:
+        params["gates_spec"] = json.dumps(_spec, ensure_ascii=False)
+        params["gate_runner"] = str(_gate_runner_path(config))
+        params["gate_timeout_secs"] = pc.effective_gate_timeout()
     # setup 透传（2026-10-07）：flow 的 preflight 会在 worktree 建立后执行
     # `bash -c <setup_command>`（900s 预算；失败=preflight 失败）。非 Rust 仓
     # （TS/Python）在 fresh worktree 里必须先装依赖，否则门必挂。

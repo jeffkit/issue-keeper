@@ -226,6 +226,14 @@ class TestDispatchConsole:
         assert gates[0]["timeout_secs"] == 1800
         # setup 透传（flow preflight 在 worktree 建立后执行）
         assert params["setup_command"] == "pnpm install --frozen-lockfile"
+        # 完整 gate spec 透传（flow v1.0.5 主路径：落盘后调同一个 gate_runner，
+        # N 道门/独立预算/paths/autofix 与本地路径逐字段等价）
+        spec = json.loads(params["gates_spec"])
+        assert spec["base"] == "main"
+        assert spec["gates"][0]["name"] == "tests"
+        assert spec["gates"][0]["command"] == "pytest -q && pytest tests/e2e -q"  # 原文，不包 bash -c
+        assert params["gate_runner"].endswith("flows/gates/gate_runner.py")
+        assert params["gate_timeout_secs"] > 0
 
     def test_dispatch_failure_is_engine_error_without_record(self, art, monkeypatch):
         _wire(monkeypatch, FakeClient(fail_start="boom"))
