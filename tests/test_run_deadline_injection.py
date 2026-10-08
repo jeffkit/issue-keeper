@@ -57,7 +57,14 @@ def _copying_bridge(tmp_path):
 def _wait_seen(art, timeout=5.0):
     seen = art / "dispatch.json.seen.json"
     deadline = time.time() + timeout
-    while not seen.exists() and time.time() < deadline:
+    while time.time() < deadline:
+        if seen.exists():
+            # exists 先于内容可见：shutil.copy 先建目标文件再写内容，
+            # 满载下轮询会读到空文件（JSONDecodeError char 0）——重读即可
+            try:
+                return json.loads(seen.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                pass
         time.sleep(0.05)
     assert seen.exists(), "假 bridge 未落 dispatch.json 副本"
     return json.loads(seen.read_text(encoding="utf-8"))
