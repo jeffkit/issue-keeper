@@ -114,5 +114,17 @@ dependabot PR 标题"bump @types/node from **20**.19.30"撞上 issue#20 的子�
 4. `/reject` 目前只升级不自动处置——后续可接「按 reject 描述重开管线」。
 5. **schedule trigger 端点行为不稳**（18:19 有效、20:07 入队消息消失）——待查，
    短期用 enable+定时火兜底。
-6. **VM 磁盘**：recursive 克隆 16G（.worktrees 为主）是最大可回收项；#147 评论
-   agent 仍活跃于该克隆，回收须等其空闲 + B 班按域处置。
+6. **VM 磁盘**：已按 jeffkit 拍板处置（16G worktree 回收 + tunely 阈值 8G），余量 28G。
+
+## 漂移审计（2026-10-08 22:1x，jeffkit 令「今晚处理」）
+
+| flow | 发现 | 处置 |
+|---|---|---|
+| `self-improve-v2` | 产物落后源码 1288 行（`6c65905b`#83 于 10-08 01:57 落地后未重编译未发布） | ✅ **已闭合**：重编译（100+52 节点）→ `flow_v2_paths.py` 42/42 → console **v1.0.7** 发布 → 与本地产物逐字节一致（recursive `5fb1dfec`） |
+| `keeper-watch` | 疑似 console(0.0.3, 2700s) ≠ repo(1500s) | ✅ **误报**：`1b5dea0` 已同步三者（v0.0.3 预算 1500→2700 有据：17:15 恢复专火超时实证） |
+| `self-improve-v2-sbx` | JSON(12:41) 新于源码(01:12) | ✅ 无漂移 |
+| **recursive 二进制** | 两台 worker 均为 **0.8.3（Mac 构建于 00:08）**，早于 `6c65905b`（01:57）→ **缺 #83 的 agent.rs 确定性修复**（execute_single 双计时器竞态；运行时影响小） | ⏳ **P1 待部署**：release 构建 + 双机安装；建议顺带把版本号 bump 纪律立起来（改动落了、版本没动，导致无法用版本判断部署状态） |
+
+结构性观察（P2）：#83 的看门狗接线在**宿主层 bridge**（`self_improve_bridge_v2.main()`），
+而生产走 console/worker 路径——**该层在 console 路径上不存在**。若要让看门狗覆盖
+console 执行，需要把接线沉到 flow_worker 侧或做成 plaita-nodes 层装饰（另立设计）。
