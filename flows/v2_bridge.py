@@ -112,13 +112,14 @@ def main() -> None:
     gf.write_text(goal, encoding="utf-8")
 
     run_id = f"pipeline-{payload.get('issue_number')}-{time.strftime('%m%d%H%M%S')}"
-    # 全链 DeepSeek flash（2026-10-04 起 GLM 限流切回）。实现/评审同 preset
-    # （executor/maxSteps/env 全同构，~/.plaita/agents.json），per-repo 覆盖走
-    # dispatch payload 的 agent/reviewer 字段（pipeline_repos 契约）。
+    # 全链 GLM-5.3-flash（jeffkit 2026-09-30 拍板，2026-10-01 午后纠正：此前的
+    # glm-52 默认是切档之前的遗留）。实现/评审同 preset（executor/maxSteps/env
+    # 全同构，~/.plaita/agents.json），per-repo 覆盖走 dispatch payload 的
+    # agent/reviewer 字段（pipeline_repos 契约）。
     cmd = [sys.executable, str(v2),
            "--goal-file", str(gf), "--repo", main_clone, "--run-id", run_id,
-           "--agent", payload.get("agent") or "deepseek-flash",
-           "--reviewer", payload.get("reviewer") or "deepseek-flash"]
+           "--agent", payload.get("agent") or "glm53-flash",
+           "--reviewer", payload.get("reviewer") or "glm53-flash"]
     if payload.get("dry_run"):
         cmd.append("--dry-run")
 

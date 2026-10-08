@@ -165,7 +165,7 @@ def label_case(name: str, case_id: str, expected: str, version: int | None = Non
     return {"labeled": True, "case": case_id, "expected": expected, "version": v}
 
 
-def eval_triage(name: str, version: int | None = None, agent: str = "deepseek-flash",
+def eval_triage(name: str, version: int | None = None, agent: str = "glm-turbo",
                 limit: int = 30, root: pathlib.Path | None = None) -> dict:
     """回放评测：对有金标的 case 用冻结提示词跑一次 triage agent，按 expected 打分。
 
