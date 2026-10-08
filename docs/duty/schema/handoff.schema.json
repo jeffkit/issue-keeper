@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infra4agent.local/duty/handoff.schema.json",
+  "title": "duty:handoff",
+  "description": "滚动交接。取代 handoffs/A-handoff-*.md / B-handoff-*.md。**结构化是重点**：现役是散文，机器无法查'在途有哪些'；此处把关键项变成可查询字段，散文留在 narrative。",
+  "type": "object",
+  "required": ["schema_version", "role", "generation", "round", "written_at"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "duty/handoff@0" },
+    "role": { "$ref": "roster.schema.json#/$defs/Role" },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "写这份 handoff 时的值班世代。下一轮据此判'我读到的是不是我这一代的交接'。"
+    },
+    "round": { "type": "integer", "minimum": 1 },
+    "written_at": { "type": "string", "format": "date-time" },
+    "supersedes": {
+      "type": "string",
+      "description": "上一份 handoff 的标识。读路径应始终取**最新**一份（现役纪律：开机读滚动 handoff 的最新一份）。"
+    },
+    "in_flight": {
+      "type": "array",
+      "description": "在途清单。**这是最重要的结构化项**——现役'在途 6/6 全僵尸'这类判断，迁移后是查询而非阅读。",
+      "items": {
+        "type": "object",
+        "required": ["kind", "ref"],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "enum": ["pipeline_run", "execution", "pr", "sandbox"] },
+          "ref": { "type": "string", "description": "execution id / issue 号 / PR 号。" },
+          "repo": { "type": "string" },
+          "issue_number": { "type": "integer", "minimum": 1 },
+          "state": {
+            "enum": ["running", "zombie", "paused", "waiting", "unknown"],
+            "description": "zombie = 命中僵尸三判据（console running + 无租约 + 无 worker）。"
+          },
+          "host": { "enum": ["mac", "vm", "sandbox", "unknown"] },
+          "started_at": { "type": "string", "format": "date-time" },
+          "note": { "type": "string", "maxLength": 1000 }
+        }
+      }
+    },
+    "todo": {
+      "type": "array",
+      "description": "留给下一轮的待办（**可执行**的，不是愿望）。",
+      "items": {
+        "type": "object",
+        "required": ["summary"],
+        "additionalProperties": false,
+        "properties": {
+          "summary": { "type": "string", "maxLength": 500 },
+          "trigger": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "**何时**做（时刻/条件）。如'17:09:01 额度重置后'。缺失 = 立即可做。"
+          },
+          "priority": { "enum": ["P0", "P1", "P2", "P3"] },
+          "directive_id": { "type": "string", "pattern": "^D-[0-9]{4,}$" },
+          "command": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "可直接执行的命令/配方（现役 handoff 里手写的 ssh 配方）。"
+          }
+        }
+      }
+    },
+    "watched": {
+      "type": "array",
+      "description": "观察项：下轮需复核但不一定动作。",
+      "items": {
+        "type": "object",
+        "required": ["summary"],
+        "additionalProperties": false,
+        "properties": {
+          "summary": { "type": "string", "maxLength": 500 },
+          "since": { "type": "string", "format": "date-time" },
+          "condition": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "什么条件下升级为动作。"
+          }
+        }
+      }
+    },
+    "criteria": {
+      "type": "array",
+      "description": "新判据/口径（现役 handoff 的'新判据/口径'段）。**这些是教训的沉淀点**，结构化后可被检索复用。",
+      "items": {
+        "type": "object",
+        "required": ["summary"],
+        "additionalProperties": false,
+        "properties": {
+          "summary": { "type": "string", "maxLength": 1000 },
+          "domain": { "enum": ["A", "B", "controller", "shared"] },
+          "source": {
+            "type": "string",
+            "maxLength": 500,
+            "description": "来源（事故/issue/轮次），便于回溯。"
+          }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "description": "环境快照。现役 handoff 的'盘面'段。",
+      "additionalProperties": false,
+      "properties": {
+        "disk_local_gib": { "type": "number", "minimum": 0 },
+        "disk_remote_gib": { "type": "number", "minimum": 0 },
+        "worker_tasks": { "type": "integer", "minimum": 0 },
+        "queue_dlq": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "array", "items": { "type": "string", "maxLength": 500 } }
+      }
+    },
+    "narrative": {
+      "type": "string",
+      "maxLength": 20000,
+      "description": "给人读的完整交接正文。**不参与机器判定**。现役 handoff 的全部散文内容落这里，保证信息不丢。"
+    },
+    "size_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "渲染后大小。现役纪律'≤4KB'的度量点（供告警，不硬拒）。"
+    }
+  }
+}

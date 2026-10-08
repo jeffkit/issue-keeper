@@ -1,0 +1,203 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infra4agent.local/duty/state.schema.json",
+  "title": "duty:state",
+  "description": "轮次状态与结构化轮报。取代 rounds.log（人读的一行）与 state.json 的值守部分。一轮一条 state 记录；轮报由它渲染。",
+  "type": "object",
+  "required": ["schema_version", "role", "generation", "round", "started_at", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "duty/state@0" },
+    "role": { "$ref": "roster.schema.json#/$defs/Role" },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "轮次所属值班世代（对 roster.generation）。换班对账用。"
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "该角色的全局轮次号（跨世代递增，对应现役 rounds.log 的'轮次=N'）。"
+    },
+    "started_at": { "type": "string", "format": "date-time" },
+    "finished_at": { "type": "string", "format": "date-time" },
+    "status": {
+      "enum": ["running", "ok", "attention", "failed", "aborted"],
+      "description": "轮次终态。ok=无异常；attention=有需下轮/主控关注项；failed=本轮未完成职责；aborted=被外部中断。"
+    },
+    "execution_ref": {
+      "type": "string",
+      "description": "本轮的 flow execution id（flow 形态）或 sess_xxx（zcode 形态）。追溯用。"
+    },
+    "actions": {
+      "type": "array",
+      "description": "本轮实际执行的**有副作用**动作。只读动作不记（避免噪音）。这是审计的主入口。",
+      "items": { "$ref": "#/$defs/Action" }
+    },
+    "intents_rejected": {
+      "type": "array",
+      "description": "被 GATE 拒绝的 intent（越权尝试留痕）。§5 授权档的核心产出——现在是'没人知道'，迁移后是结构化记录。",
+      "items": {
+        "type": "object",
+        "required": ["capability", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "capability": { "$ref": "roster.schema.json#/$defs/Capability" },
+          "target": { "type": "string" },
+          "reason": {
+            "type": "string",
+            "description": "拒绝原因：'capability-not-granted' / 'path-rule:<id>' / 'evidence-missing:<key>'。"
+          },
+          "attempted_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "description": "本轮观察到的、需下轮或主控关注的事项。取代轮报里的'异常='段。",
+      "items": {
+        "type": "object",
+        "required": ["severity", "summary"],
+        "additionalProperties": false,
+        "properties": {
+          "severity": { "enum": ["info", "warn", "critical"] },
+          "summary": { "type": "string", "maxLength": 500 },
+          "evidence": {
+            "type": "string",
+            "maxLength": 2000,
+            "description": "可核验的证据（命令输出/ID/路径）。**无证据的 finding 应降级为 info**。"
+          },
+          "escalate": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否需要 jeffkit 拍板（升级路由的输入）。"
+          }
+        }
+      }
+    },
+    "health": {
+      "type": "object",
+      "description": "健康行固定项。现役 playbook §4 要求'健康行固定项'，此处结构化为必填集合。",
+      "additionalProperties": false,
+      "properties": {
+        "peers": {
+          "type": "object",
+          "description": "其他班次判活结果：role → 'alive' | 'stale' | 'dead' | 'unknown'。",
+          "propertyNames": { "enum": ["controller", "A", "B", "sandbox"] },
+          "additionalProperties": { "enum": ["alive", "stale", "dead", "unknown"] }
+        },
+        "disk": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "local_free_gib": { "type": "number", "minimum": 0 },
+            "remote_free_gib": { "type": "number", "minimum": 0 },
+            "guard_line_gib": { "type": "number", "default": 20 },
+            "below_line": { "type": "boolean" }
+          }
+        },
+        "in_flight": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "count": { "type": "integer", "minimum": 0 },
+            "capacity": { "type": "integer", "minimum": 0 },
+            "zombie_count": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "僵尸三判据命中数（console running + 无租约 + 无 worker）。"
+            }
+          }
+        },
+        "queue": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "stream_len": { "type": "integer", "minimum": 0 },
+            "pel": { "type": "integer", "minimum": 0 },
+            "dlq": { "type": "integer", "minimum": 0, "description": "只看不清（纪律）。" }
+          }
+        },
+        "services": {
+          "type": "object",
+          "description": "外部依赖探活：名称 → 'active'|'degraded'|'down'|'unknown'。",
+          "additionalProperties": { "enum": ["active", "degraded", "down", "unknown"] }
+        },
+        "throughput": {
+          "type": "object",
+          "description": "吞吐行（playbook §3.6 立制）。",
+          "additionalProperties": false,
+          "properties": {
+            "window_days": { "type": "integer", "minimum": 1 },
+            "opened": { "type": "integer", "minimum": 0 },
+            "closed": { "type": "integer", "minimum": 0 },
+            "registered": { "type": "integer", "minimum": 0 },
+            "daily_avg": { "type": "number", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "directives_read": {
+      "type": "array",
+      "description": "本轮读到的 issued 指令号（对账'每轮第 0 步'是否真执行）。",
+      "items": { "type": "string", "pattern": "^D-[0-9]{4,}$" }
+    },
+    "directives_acked": {
+      "type": "array",
+      "description": "本轮回执的指令号。与 directives 状态机对账。",
+      "items": { "type": "string", "pattern": "^D-[0-9]{4,}$" }
+    },
+    "handoff_written": {
+      "type": "string",
+      "description": "本轮写出的 handoff 标识。缺失 = 轮末三件套没做完（告警）。"
+    },
+    "narrative": {
+      "type": "string",
+      "maxLength": 8000,
+      "description": "给人读的轮报正文（原 rounds.log 的自由文本部分）。**不参与任何机器判定**——机器判定一律走上面的结构化字段。"
+    },
+    "degraded": {
+      "type": "object",
+      "description": "降级标记（§7）。非空表示本轮在受限模式下运行。",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["read-only", "no-projection", "no-core-write"],
+          "description": "read-only=内核不可读只巡检；no-projection=GitHub 不可达；no-core-write=存储只读。"
+        },
+        "reason": { "type": "string", "maxLength": 500 },
+        "since": { "type": "string", "format": "date-time" }
+      }
+    }
+  },
+  "$defs": {
+    "Action": {
+      "type": "object",
+      "required": ["capability", "level", "summary", "at"],
+      "additionalProperties": false,
+      "properties": {
+        "capability": { "$ref": "roster.schema.json#/$defs/Capability" },
+        "level": {
+          "$ref": "roster.schema.json#/$defs/Level",
+          "description": "执行时依据的档位。audit 时用它回答'这个动作当初凭什么放行'。"
+        },
+        "summary": { "type": "string", "maxLength": 500 },
+        "target": {
+          "type": "string",
+          "description": "动作对象（issue 号 / execution id / 路径 / 服务名）。"
+        },
+        "evidence": {
+          "type": "object",
+          "description": "裁决所需证据（如 require-evidence 规则要求的 symlink_check）。",
+          "additionalProperties": true
+        },
+        "approved_by": {
+          "type": "string",
+          "description": "人在环档：resume 的批准者标识。authorized 档：留空或角色名。"
+        },
+        "at": { "type": "string", "format": "date-time" },
+        "duration_secs": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

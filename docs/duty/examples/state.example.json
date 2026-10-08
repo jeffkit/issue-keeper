@@ -1,0 +1,93 @@
+{
+  "schema_version": "duty/state@0",
+  "role": "A",
+  "generation": 14,
+  "round": 109,
+  "started_at": "2026-10-08T16:00:00+08:00",
+  "finished_at": "2026-10-08T16:05:00+08:00",
+  "status": "attention",
+  "execution_ref": "sess_3a7fd820-7a91-4dc9-8e1e-9e08a7fcaa88",
+  "actions": [
+    {
+      "capability": "close_issue",
+      "level": "authorized",
+      "summary": "验收关闭 recursive#52（tracking 架构缺陷 9 项，子单全落地）",
+      "target": "jeffkit/recursive#52",
+      "evidence": {
+        "merge_base_ancestor": 8,
+        "cherry_equivalent": 1,
+        "grep_verified": 1,
+        "comment": "issuecomment-6055557108"
+      },
+      "at": "2026-10-08T16:02:00+08:00"
+    }
+  ],
+  "intents_rejected": [
+    {
+      "capability": "reopen_issue",
+      "target": "jeffkit/recursive#52",
+      "reason": "capability-not-granted",
+      "attempted_at": "2026-10-08T16:03:00+08:00"
+    }
+  ],
+  "findings": [
+    {
+      "severity": "critical",
+      "summary": "6 个在途 run 全僵尸（GLM 1308 停摆），按 D-0027 故意保留作背压",
+      "evidence": "exec ids: 56d2dc82/348a9015/61354d8e/42880276/2966c465/7d1a627a；0 租约；PEL=0；三 worker tasks=0",
+      "escalate": false
+    },
+    {
+      "severity": "warn",
+      "summary": "恢复窗口时序缺口：额度 17:09 重置，keeper 僵尸线 17:40-17:45 会从零重跑丢 impl，而 A 下轮 fire=18:00 已晚于该线；需主控 17:10 注入一轮走 resume 保成果",
+      "evidence": "已请主控注入（#2 issuecomment-6055531290）",
+      "escalate": true
+    },
+    {
+      "severity": "info",
+      "summary": "keeper 陈旧态：state.json 中 jeffkit-recursive/items/52 blocked=true 但 wakeup_deps=[]，依赖门永不自动释放（实际 9 条 depends-on 全 CLOSED）",
+      "evidence": "建议 flow/keeper 加体检：blocked=true 且 wakeup_deps 空且正文 depends-on 全 closed → 告警",
+      "escalate": false
+    }
+  ],
+  "health": {
+    "peers": {
+      "controller": "alive",
+      "B": "alive"
+    },
+    "disk": {
+      "local_free_gib": 131,
+      "remote_free_gib": 21,
+      "guard_line_gib": 20,
+      "below_line": false
+    },
+    "in_flight": {
+      "count": 6,
+      "capacity": 6,
+      "zombie_count": 6
+    },
+    "queue": {
+      "stream_len": 0,
+      "pel": 0,
+      "dlq": 18
+    },
+    "services": {
+      "keeper": "active",
+      "console": "active",
+      "worker-mac": "active",
+      "worker-vm": "active",
+      "sched-ctrl": "active"
+    },
+    "throughput": {
+      "window_days": 7,
+      "opened": 166,
+      "closed": 135,
+      "registered": 51,
+      "daily_avg": 19.3
+    }
+  },
+  "directives_read": ["D-0027", "D-0013"],
+  "directives_acked": ["D-0027"],
+  "handoff_written": "A-handoff-20261008-1610.md",
+  "narrative": "四仓零变动（自 15:15 无新落地/新关闭/待回复留言；plaita origin/main=ea53e46、recursive=c392d3c1）。但依赖门核销出一单：recursive#52（tracking 架构缺陷 9 项）→ 验收关闭。停摆期核账（D-0027 前置）全数核实：6 exec 全 running 但 Redis 租约 0 条=僵尸；三 worker 0 任务、stream=0/PEL=0、budget_left=0、DLQ=18；远端 config max_in_flight=4。本轮零动作（17:09 前禁 reopen/重派/cancel）。"
+}

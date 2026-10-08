@@ -53,6 +53,9 @@ def run(input):
     author_daily = int(cfg.get("author_daily_limit") or 0)
     exempt = {str(a).lower() for a in (cfg.get("author_daily_limit_exempt") or [])}
     allow = {str(a).lower() for a in (cfg.get("author_allowlist") or [])}
+    # 2026-10-08 外部验收闭环（jeffkit 拍板）：external_authors = 不在 allowlist 的
+    # 外部作者，其 issue 同样接单开发（screener 照走；验收由 issue-accept flow 承接）。
+    external = {str(a).lower() for a in (cfg.get("external_authors") or [])}
     optout = [str(x) for x in (cfg.get("opt_out_labels") or ["keeper-ignore"])]
     # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）
     try:
@@ -128,6 +131,7 @@ def run(input):
                 "updated_at": iss.get("updatedAt") or "",
                 "opt_out": any(l in optout for l in labels),
                 "allow_ok": (not allow) or (author.lower() in allow),
+                "external_ok": author.lower() in external,
                 "has_state": bool(it),
                 "st_processed": bool(it.get("processed")),
                 "st_blocked": bool(it.get("blocked")),
@@ -164,9 +168,9 @@ def run(input):
         if x.st_retry_after > x.now_ts:
             return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
                     "decision": "skip", "reason": "retry-later 退避中"}
-        if x.allow_ok != True:
+        if x.allow_ok != True and x.external_ok != True:
             return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
-                    "decision": "skip", "reason": "作者不在 allowlist"}
+                    "decision": "skip", "reason": "作者不在 allowlist/external_authors"}
         if x.author_exempt != True and x.author_daily > 0 and x.author_today >= x.author_daily:
             return {"repo": x.repo, "num": x.number, "title": x.title, "author": x.author,
                     "decision": "skip", "reason": "作者当日 run 达上限", "author_today": x.author_today}

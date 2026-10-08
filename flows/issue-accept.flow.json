@@ -1,0 +1,98 @@
+{
+  "runtime": "python",
+  "flow_id": "issue-accept",
+  "inputType": {
+    "dataType": "object"
+  },
+  "desc": "【值守·A 班】外部验收闭环（tunely 试点）：初验 done 单→回评请验收→/accept 合并关单；ctrl 队列 10min",
+  "nodes": [
+    {
+      "type": "start",
+      "id": "start",
+      "next": "facts"
+    },
+    {
+      "type": "code",
+      "id": "facts",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, subprocess\n\n    REPO = input.get(\"repo\") or \"jeffkit/tunely\"\n    BOT = (input.get(\"bot\") or \"jeffkit\").strip().lower()\n    MAX_SCAN = int(input.get(\"max_scan\") or 20)\n\n    def sh(cmd, timeout=40):\n        try:\n            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)\n            return (r.stdout or \"\").strip()\n        except Exception as e:\n            return \"\"\n\n    raw = sh(\"gh issue list -R %s --state open --json number,title,author,updatedAt,labels\" % REPO)\n    try:\n        issues = json.loads(raw)\n    except Exception:\n        issues = []\n    issues.sort(key=lambda x: str(x.get(\"updatedAt\") or \"\"), reverse=True)\n    issues = issues[:MAX_SCAN]\n\n    ACCEPT = (\"/accept\", \"验收通过\")\n    REJECT = (\"/reject\", \"验收不通过\")\n\n    items = []\n    for it in issues:\n        n = it.get(\"number\")\n        cj = sh('gh api \"repos/%s/issues/%s/comments?per_page=100\"' % (REPO, n))\n        try:\n            comments = json.loads(cj)\n        except Exception:\n            comments = []\n        bot_done_at, awaiting_at = None, None\n        accept_sig, reject_sig = None, None\n        last_bot_done_head = \"\"\n        for c in comments:\n            au = ((c.get(\"user\") or {}).get(\"login\") or \"\").strip().lower()\n            body = c.get(\"body\") or \"\"\n            cat = c.get(\"created_at\") or \"\"\n            if au == BOT and \"[issue-pipeline]\" in body and \"status=done\" in body:\n                bot_done_at = cat\n                last_bot_done_head = body[:600]\n            if \"duty:awaiting-accept\" in body:\n                awaiting_at = cat\n            if au and au != BOT:\n                low = body.strip().lower()\n                if low.startswith(\"/accept\") or \"验收通过\" in body:\n                    if awaiting_at is None or cat >= awaiting_at:\n                        accept_sig = {\"at\": cat, \"by\": au, \"head\": body[:200]}\n                if low.startswith(\"/reject\") or \"验收不通过\" in body:\n                    if awaiting_at is None or cat >= awaiting_at:\n                        reject_sig = {\"at\": cat, \"by\": au, \"head\": body[:200]}\n        if bot_done_at or awaiting_at or accept_sig or reject_sig:\n            items.append({\n                \"number\": n, \"title\": it.get(\"title\") or \"\",\n                \"author\": ((it.get(\"author\") or {}).get(\"login\") or \"\"),\n                \"bot_done_at\": bot_done_at, \"awaiting_at\": awaiting_at,\n                \"accept\": accept_sig, \"reject\": reject_sig,\n                \"last_bot_done_head\": last_bot_done_head,\n            })\n    return {\"items\": items, \"repo\": REPO, \"bot\": BOT}\n",
+      "input": {
+        "repo": "$INPUT.repo",
+        "bot": "$INPUT.bot",
+        "max_scan": "$INPUT.max_scan"
+      },
+      "next": "triage",
+      "source_line": 42
+    },
+    {
+      "type": "code",
+      "id": "triage",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json\n    items = input.get(\"items\") or []\n    max_verify = int(input.get(\"max_verify\") or 2)\n    max_close = int(input.get(\"max_close\") or 3)\n\n    to_verify, to_close, to_reject = [], [], []\n    for it in sorted(items, key=lambda x: x.get(\"number\") or 0):\n        if it.get(\"accept\"):\n            if it.get(\"awaiting_at\"):\n                to_close.append(it)\n        elif it.get(\"reject\"):\n            if it.get(\"awaiting_at\"):\n                to_reject.append(it)\n        elif it.get(\"bot_done_at\") and not it.get(\"awaiting_at\"):\n            to_verify.append(it)\n\n    findings = []\n    for it in to_reject:\n        findings.append({\"severity\": \"warn\",\n                         \"summary\": \"issue #%s 外部验收方报告问题（/reject）：%s\"\n                                    % (it.get(\"number\"), (it.get(\"reject\") or {}).get(\"head\", \"\")[:150]),\n                         \"escalate\": True})\n    report = json.dumps({\n        \"repo\": \"\", \"to_verify\": to_verify[:max_verify],\n        \"to_close\": to_close[:max_close], \"to_reject\": to_reject,\n        \"findings\": findings,\n    }, ensure_ascii=False)\n    return {\"to_verify\": to_verify[:max_verify], \"to_close\": to_close[:max_close],\n            \"to_reject\": to_reject, \"findings\": findings, \"report\": report}\n",
+      "input": {
+        "items": "$NODE.facts.items",
+        "max_verify": "$INPUT.max_verify",
+        "max_close": "$INPUT.max_close"
+      },
+      "next": "verify",
+      "source_line": 110
+    },
+    {
+      "type": "agentrun",
+      "id": "verify",
+      "agent": "deepseek-flash",
+      "repo": "/Users/kong/projects/infra4agent",
+      "timeout_secs": 900,
+      "prompt": "$F.concat(\"你是 infra4agent 大仓的「A 班验收」（issue-accept flow 初验轮；jeffkit 委托授权）。\\n本轮待初验清单（可能为空）内嵌在 <<<REPORT>>> 里（JSON 的 to_verify 字段，repo 字段在 facts 段）。\\n\\n职责：对每个待初验 issue 做**独立读码初验**（不是开发方的自测复述）：\\n1) `gh issue view <N> --repo <repo>` 读需求与全部评论；\\n2) 找关联 PR：`gh pr list --repo <repo> --state open --json number,title,headRefName` （head 分支通常含 issue 号）；无 open PR → 在该仓 `git log --oneline -8 --all --grep \\\"#<N>\\\"` 找落地提交（push_mode=main 的仓直接进 main）；\\n3) 读改动：有 PR 用 `gh pr diff <PR#> --repo <repo>`（大 diff 只读 stat + 关键文件）；\\n4) 判定：改动是否**针对该 issue 的需求**、无越范围改动、无明显坏味道。本轮不重跑测试门（门由管线跑过，你是读码初验）；无法确认就 ok=false 并说明。\\n\\n输出纪律：**最后一行输出一行严格 JSON**，形如：\\n{\\\"results\\\":[{\\\"issue\\\":24,\\\"ok\\\":true,\\\"pr\\\":17,\\\"summary\\\":\\\"一句话判定理由（中文，≤80字）\\\"}]}\\n待初验清单为空时：不做任何工具调用，直接输出 {\\\"results\\\":[]}。\\n\\n<<<REPORT>>>\\n\", $NODE.triage.report, \"\\n<<<END REPORT>>>\\n\")",
+      "next": "act",
+      "source_line": 146
+    },
+    {
+      "type": "code",
+      "id": "act",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, subprocess, tempfile, os\n\n    REPO = input.get(\"repo\") or \"jeffkit/tunely\"\n    DRY = bool(input.get(\"dryrun\"))\n    to_close = input.get(\"to_close\") or []\n    actions, posted, merged, close_errors = [], [], [], []\n\n    def sh(cmd, timeout=60):\n        try:\n            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)\n            return (r.stdout or \"\").strip() or (r.stderr or \"\").strip()\n        except Exception as e:\n            return \"\"\n\n    def gh_comment(n, body):\n        fd, p = tempfile.mkstemp(suffix=\".md\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(body)\n        out = sh(\"gh issue comment %s --repo %s --body-file %s\" % (n, REPO, p))\n        os.unlink(p)\n        return out\n\n    # ── 4a. 解析初验结果 → 发「请验收」──\n    results = []\n    text = str(input.get(\"verify_text\") or \"\")\n    for line in reversed([x.strip() for x in text.splitlines() if x.strip()]):\n        if line.startswith(\"{\") and '\"results\"' in line:\n            try:\n                results = json.loads(line).get(\"results\") or []\n                break\n            except Exception:\n                pass\n    else:\n        i, j = text.rfind(\"{\"), text.rfind(\"}\")\n        if 0 <= i < j:\n            try:\n                results = json.loads(text[i:j + 1]).get(\"results\") or []\n            except Exception:\n                results = []\n\n    for r in results:\n        n = r.get(\"issue\")\n        if not n or not r.get(\"ok\"):\n            continue\n        body = (\"<!-- issue-pipeline -->\\n<!-- duty:awaiting-accept -->\\n\"\n                \"## 开发完成，请外部验收\\n\\n**初验结论**：%s\\n\\n\" % (r.get(\"summary\") or \"\"))\n        if r.get(\"pr\"):\n            body += \"关联 PR：#%s\\n\\n\" % r.get(\"pr\")\n        body += (\"验收通过 → 回复 `/accept`\\n发现问题 → 回复 `/reject` + 描述\\n\\n\"\n                 \"（本回评由 issue-accept flow 自动发出）\")\n        actions.append({\"capability\": \"post_brief\", \"level\": \"autonomous\",\n                        \"summary\": \"初验通过，发待验收回评\", \"target\": \"#%s\" % n})\n        if DRY:\n            posted.append({\"issue\": n, \"dryrun\": True, \"summary\": r.get(\"summary\")})\n        else:\n            out = gh_comment(n, body)\n            posted.append({\"issue\": n, \"summary\": r.get(\"summary\"), \"resp\": out[:120]})\n\n    # ── 4b. /accept → 合并 PR + 关单致谢 ──\n    for it in to_close:\n        n = it.get(\"number\")\n        prs = sh(\"gh pr list --repo %s --state open --json number,headRefName,title\" % REPO)\n        try:\n            prlist = json.loads(prs)\n        except Exception:\n            prlist = []\n        pr = next((p for p in prlist if str(n) in (p.get(\"headRefName\") or \"\")\n                   or str(n) in (p.get(\"title\") or \"\")), None)\n        note = \"\"\n        if DRY:\n            actions.append({\"capability\": \"close_issue\", \"level\": \"authorized\",\n                            \"summary\": \"[dryrun] 将合并 PR 并关单\", \"target\": \"#%s\" % n})\n            merged.append({\"issue\": n, \"dryrun\": True})\n            continue\n        if pr:\n            mo = sh(\"gh pr merge %s --repo %s --merge\" % (pr.get(\"number\"), REPO), timeout=90)\n            note = \"已合并 PR #%s\" % pr.get(\"number\")\n            if \"not mergeable\" in mo.lower() or \"unable\" in mo.lower():\n                close_errors.append({\"issue\": n, \"why\": mo[:200]})\n                actions.append({\"capability\": \"close_issue\", \"level\": \"authorized\",\n                                \"summary\": \"PR 合并失败，未关单\", \"target\": \"#%s\" % n})\n                continue\n        else:\n            note = \"未发现 open PR（可能已直推 main）\"\n        gh_comment(n, (\"<!-- issue-pipeline -->\\n✅ 外部验收通过（%s）。%s。感谢验收，本单关闭。\\n\"\n                       \"（issue-accept flow 自动收尾）\" % ((it.get(\"accept\") or {}).get(\"by\", \"?\"), note)))\n        co = sh(\"gh issue close %s --repo %s\" % (n, REPO))\n        actions.append({\"capability\": \"close_issue\", \"level\": \"authorized\",\n                        \"summary\": \"外部 /accept → %s → 关单\" % note, \"target\": \"#%s\" % n})\n        merged.append({\"issue\": n, \"pr\": (pr or {}).get(\"number\"), \"closed\": True})\n\n    return {\"actions\": actions, \"posted\": posted, \"merged\": merged,\n            \"close_errors\": close_errors}\n",
+      "input": {
+        "repo": "$NODE.facts.repo",
+        "bot": "$NODE.facts.bot",
+        "to_close": "$NODE.triage.to_close",
+        "report": "$NODE.triage.report",
+        "verify_text": "$NODE.verify.text",
+        "dryrun": "$INPUT.dryrun"
+      },
+      "next": "finish",
+      "source_line": 167
+    },
+    {
+      "type": "code",
+      "id": "finish",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, time, pathlib, fcntl, tempfile\n\n    base = pathlib.Path(\"~/.issue-keeper/duty\").expanduser()\n    base.mkdir(parents=True, exist_ok=True)\n    role = input.get(\"role\") or \"issue-accept\"\n    now = time.strftime(\"%Y-%m-%dT%H:%M:%S+08:00\")\n    findings = input.get(\"findings\") or []\n    posted = input.get(\"posted\") or []\n    merged = input.get(\"merged\") or []\n\n    # 上一轮号（读 state 滚动窗口）\n    spath = base / (\"state-%s.json\" % role)\n    prev_round = 0\n    generation = 1\n    try:\n        prev = json.loads(spath.read_text())\n        prev_round = max([r.get(\"round\", 0) for r in (prev.get(\"rounds\") or [])] or [0])\n    except Exception:\n        pass\n    try:\n        generation = (json.loads((base / \"roster.json\").read_text()).get(\"generation\")) or 1\n    except Exception:\n        pass\n\n    status = \"ok\"\n    if input.get(\"close_errors\") or any(f.get(\"severity\") == \"critical\" for f in findings):\n        status = \"attention\"\n    elif findings:\n        status = \"attention\"\n\n    round_doc = {\n        \"schema_version\": \"duty/state@0\", \"role\": role, \"generation\": generation,\n        \"round\": prev_round + 1, \"started_at\": now, \"finished_at\": now,\n        \"status\": status,\n        \"actions\": input.get(\"actions\") or [],\n        \"findings\": findings,\n        \"narrative\": \"posted=%s merged=%s dryrun=%s\"\n                     % (len(posted), len(merged), bool(input.get(\"dryrun\"))),\n    }\n\n    def atomic(path, doc):\n        path.parent.mkdir(parents=True, exist_ok=True)\n        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=\".tmp-\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(json.dumps(doc, indent=2, ensure_ascii=False))\n        os.replace(tmp, path)\n\n    lock = spath.with_suffix(\".lock\")\n    with open(lock, \"w\") as lf:\n        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n        try:\n            doc = {\"schema_version\": \"duty/state@0\", \"role\": role, \"rounds\": []}\n            try:\n                doc = json.loads(spath.read_text())\n            except Exception:\n                pass\n            rounds = doc.setdefault(\"rounds\", [])\n            rounds.append(round_doc)\n            doc[\"rounds\"] = rounds[-20:]\n            doc[\"updated_at\"] = now\n            atomic(spath, doc)\n        finally:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n\n    hpath = base / \"handoffs\" / (\"%s-handoff-%s.json\" % (role, time.strftime(\"%Y%m%d-%H%M%S\")))\n    atomic(hpath, {\n        \"schema_version\": \"duty/handoff@0\", \"role\": role, \"generation\": generation,\n        \"round\": round_doc[\"round\"], \"written_at\": now,\n        \"in_flight\": [], \"todo\": [], \"watched\": [],\n        \"criteria\": [], \"environment\": {},\n        \"narrative\": round_doc[\"narrative\"],\n    })\n    try:\n        olds = sorted(base.glob(\"handoffs/%s-handoff-*.json\" % role))\n        for o in olds[:-20]:\n            o.unlink()\n    except Exception:\n        pass\n\n    with open(base / \"rounds.log\", \"a\") as fh:\n        fh.write(\"%s %s 轮次=%s 落地=posted(%s)/merged(%s) findings=%s status=%s\\n\"\n                 % (now, role, round_doc[\"round\"], len(posted), len(merged),\n                    len(findings), status))\n\n    return {\"round\": round_doc[\"round\"], \"status\": status, \"state\": str(spath)}\n",
+      "input": {
+        "role": "issue-accept",
+        "dryrun": "$INPUT.dryrun",
+        "actions": "$NODE.act.actions",
+        "posted": "$NODE.act.posted",
+        "merged": "$NODE.act.merged",
+        "close_errors": "$NODE.act.close_errors",
+        "findings": "$NODE.triage.findings"
+      },
+      "next": "_n1",
+      "source_line": 269
+    },
+    {
+      "type": "end",
+      "id": "_n1",
+      "output": {
+        "round": "$NODE.finish.round",
+        "status": "$NODE.finish.status",
+        "posted": "$NODE.act.posted",
+        "merged": "$NODE.act.merged"
+      },
+      "resultType": "success",
+      "name": "return {'round': NODE.finis…",
+      "desc": "return {'round': NODE.finish.round, 'status': NODE.finish.s…",
+      "source_line": 363
+    }
+  ]
+}
