@@ -91,8 +91,36 @@ dependabot PR 标题"bump @types/node from **20**.19.30"撞上 issue#20 的子�
 **ctrl-watch 首火（20:00）即立功**：抓到 B 班心跳超期 319min（16:40 GLM 1308
 失败链后 schedule 被 pause、无人 restart）→ 重新 enable + 手动补火。
 
-## 2026-10-08 夜临时调整（E2E 完毕恢复）
+## 22:3x 夜间事故两起（已处置，ctrl-watch/僵尸线兜底验证中）
 
+1. **schedule service 挂死（22:30:00）**：成功入队 22:30 两笔后扫描循环静默死亡
+   （systemd active 但零日志；症状属 plaita#48「Redis 读超时炸穿」族）。影响=全部
+   cron 调度停摆（A/主控/B 三班都无法醒），且 **ctrl-watch 自己也被它调度，无法自察**
+   ——「看门狗必须独立于被看护系统」的实锤。处置：22:34 kill 进程由 systemd 重拉，
+   22:34:05 新实例健康，22:40:00 准点触发 keeper-watch+issue-accept ✓。
+   **P1**：外置看门狗（Mac launchd 或另一台机，curl console 查各班心跳新鲜度 → 报警）。
+   **P1**：schedule trigger/cron 入队消息偶发消失（20:07、22:34 两例；22:40 cron 正常）
+   ——plaita#50 族的现场样本，已具足以提报。
+2. **v1.0.7 回退性发布（22:1x，自纠）**：从落后 origin/main 的检出编译发布 v1.0.7，
+   漏掉 `3c0a4ab8`（#148 kill-stale 互杀修复，同改 flow 源码+产物）。发现于 pull
+   冲突 → skip 被包含的自提交 → 以 3c0a4ab8 产物发 **v1.0.8** 纠正（逐字节核验 ✓）。
+   教训：**发布前必须 fetch + 确认检出 == origin/main**（compile_v2 的对账只对
+   「同源码」负责，不负责「源码是不是最新」）。
+
+## 二进制部署（22:2x，jeffkit 令「漂移今晚处理」）
+
+- Mac：`3c0a4ab8` 全量修复构建（增量 5m41s），双位置安装
+  `/opt/homebrew/bin/recursive`（原 Oct 2 旧货，已备份 /tmp）+ `~/.local/bin/recursive`
+  （恢复为实体文件）。两处均验证可执行。
+- ⚠️ **法证**：`~/.local/bin/recursive`（Oct 8 00:08 构建）在 21:30-22:30 间被未知
+  方式删除——嫌疑窗口内有 B 班看守轮的磁盘动作（21:22 轮自述红线检查全过且只动 VM）
+  与管线 run 清理；**删除者未明，P1 由 ctrl-watch/B 班追**。
+- VM：构建两次受阻——①旧产物检出（已对齐 3c0a4ab8）；②**工具链 1.75 < edition-2024
+  要求（1.85+），发行版 rustup 拒装工具链** → VM 二进制维持 0.8.3 可用态，升级需装
+  官方 rustup（会动 VM 全部 cargo 构建环境含 tunely rust 门，白天做）→ **P1**。
+- 部署可追溯：版本号未 bump（仍 0.8.3），以「部署时刻 + 源 SHA=3c0a4ab8」记录于本文件。
+
+## 当夜临时调整与恢复记录
 - ~~远端 config：`pipeline_max_in_flight` 4→5、priority +tunely、tunely 仓限 1→2~~
   **已全部恢复原状**（19:5x；为 #26 插队而设，#26 被 VM 磁盘守卫另行阻塞）。
 - keeper-watch schedule 由 paused → **enabled**（B 班复活，非临时改动）。
