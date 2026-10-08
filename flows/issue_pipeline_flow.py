@@ -239,7 +239,7 @@ def issue_pipeline(INPUT):
     )
     if wt_prep.ok == False:
         reply_prep_fail = AGENTRUN(
-            agent="deepseek-flash",
+            agent="glm53-flash",
             repo=INPUT.main_clone,
             timeout_secs=600,
             prompt=(
