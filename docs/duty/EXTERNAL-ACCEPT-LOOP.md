@@ -97,9 +97,13 @@ dependabot PR 标题"bump @types/node from **20**.19.30"撞上 issue#20 的子�
   **已全部恢复原状**（19:5x；为 #26 插队而设，#26 被 VM 磁盘守卫另行阻塞）。
 - keeper-watch schedule 由 paused → **enabled**（B 班复活，非临时改动）。
 - 取消了 ctrl 队列上的过期恢复专火（keeper-watch f123946a，其使命 17:09 恢复已完成）。
-- VM 磁盘回收：docker prune（926MB）+ 僵尸容器清理；**磁盘 16-19G 仍低于 20G 守线**，
-  新派发会被 retry-later 挡——#26 的派发等磁盘恢复（recursive 16G 陈旧 worktree
-  是最大可回收项，但 recursive#147 评论 agent 活跃于该克隆，今晚不动，留 B 班按域处置）。
+- VM 磁盘处置（20:1x，jeffkit 拍板「VM 不跑 rust，不需要 20G 红线，放开」）：
+  ①回收 recursive/.worktrees 两个陈旧 worktree（16G；issue-134 的 5 个未提交文件
+  已按 reaper 同款语义 wip 快照到分支 `fix/134-eval-batch-ptc` 后删除，成果零丢失；
+  issue-147 分支干净直删。两分支均保留）→ **VM 28G 可用**；
+  ②tunely `engine_env` 加 `RECURSIVE_MIN_FREE_DISK_GIB=8`（阈值机制在
+  self-improve-v2 preflight，默认 20；经 dispatch env 注入，下轮派发生效）。
+  至此 #26 的磁盘阻塞解除，等 tunely#3 释放仓配额后自然派发。
 
 ## 已知后续（P1/P2）
 
