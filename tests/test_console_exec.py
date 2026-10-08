@@ -342,6 +342,30 @@ class TestReapConsole:
         assert last["status"] == "done" and last["comment_posted"] is True
         assert last["flow_source"] == "v2-console"
 
+    def test_retry_later_lands_row_without_closing_comment(self, art, monkeypatch):
+        """D-0025：retry-later 是环境性 deferral（console_exec.py 语义表）——
+        台账行照落，但不回评（否则磁盘守卫风暴会给 issue 刷无意义收尾评论）。"""
+        defer = {"status": "completed",
+                 "context": {"$NODE": {"verdict": {"verdict": "retry-later",
+                                                   "stage": "preflight",
+                                                   "why": "disk 15.0GiB < min"}}}}
+        cfg, it, row, posted = self._reap(art, monkeypatch, FakeClient(defer))
+        assert row["status"] == "retry-later" and row["comment_posted"] is False
+        assert posted == []
+        ledger = (art.parent / "runs.jsonl").read_text().strip().splitlines()
+        last = json.loads(ledger[-1])
+        assert last["status"] == "retry-later" and last["comment_posted"] is False
+
+    def test_failed_preserved_still_posts_closing(self, art, monkeypatch):
+        """对照面：failed-preserved（内容性失败）仍出收尾回评——D-0025 只豁免 retry-later。"""
+        bad = {"status": "completed",
+               "context": {"$NODE": {"verdict": {"verdict": "failed-preserved",
+                                                 "stage": "review",
+                                                 "why": "review did not pass"}}}}
+        cfg, it, row, posted = self._reap(art, monkeypatch, FakeClient(bad))
+        assert row["status"] == "failed" and row["comment_posted"] is True
+        assert len(posted) == 1 and "failed" in posted[0]
+
     def _write_rec(self, art, age_secs):
         (art / K.CONSOLE_EXEC_RECORD).write_text(json.dumps({
             "execution_id": "exec-123", "flow_id": "self-improve-v2",

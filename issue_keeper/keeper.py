@@ -2169,9 +2169,12 @@ def _reap_console_execution(config, binding, it, key, label: str,
     else:
         row = _ce.map_verdict(_ce.verdict_from_execution(detail))
 
-    # 非 engine_error：keeper 出真实收尾回评（回评礼仪不变），并记入台账行。
+    # 回评守卫：engine_error（既有台账/升级语义）与 retry-later（环境性 deferral，
+    # console_exec.py 语义表——issue 状态未变、不消费，同 404 宽限族）都不出收尾
+    # 回评，只落台账行；其余结论（done/failed 等）keeper 照常出真实收尾回评。
     # void（#7 窗口内人工 reopen）：结论作废，两者都不留。
-    if not void and row["status"] != "engine_error" and not bool(row.get("comment_posted")):
+    if (not void and row["status"] not in ("engine_error", "retry-later")
+            and not bool(row.get("comment_posted"))):
         parts = [f"管线收尾（console 执行）：status={row['status']}"]
         if row.get("note"):
             parts.append(str(row["note"]))
