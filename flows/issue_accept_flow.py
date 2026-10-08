@@ -236,8 +236,14 @@ def run(input):
             prlist = json.loads(prs)
         except Exception:
             prlist = []
-        pr = next((p for p in prlist if str(n) in (p.get("headRefName") or "")
-                   or str(n) in (p.get("title") or "")), None)
+        # 2026-10-08 教训（#20 误合 dependabot#15）：标题子串匹配会撞版本号
+        # （"bump @types/node from 20.x" 含 "20"）——只认分支名精确后缀
+        # issue-<n> / pipeline/issue-<n> / <n>-*，永不匹配标题。
+        def _branch_matches(head):
+            h = (head or "").strip().lower()
+            return (h == "issue-%s" % n or h.endswith("/issue-%s" % n)
+                    or h.endswith("-%s" % n) or h.startswith("issue-%s-" % n))
+        pr = next((p for p in prlist if _branch_matches(p.get("headRefName"))), None)
         note = ""
         if DRY:
             actions.append({"capability": "close_issue", "level": "authorized",

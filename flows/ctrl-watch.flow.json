@@ -1,0 +1,86 @@
+{
+  "runtime": "python",
+  "flow_id": "ctrl-watch",
+  "inputType": {
+    "dataType": "object"
+  },
+  "desc": "【值守·主控】看门狗+升级路由（A/B/shadow 心跳；critical 才扰 jeffkit，60min 去重）；ctrl 队列 */30",
+  "nodes": [
+    {
+      "type": "start",
+      "id": "start",
+      "next": "facts"
+    },
+    {
+      "type": "code",
+      "id": "facts",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, subprocess, time\n\n    def sh(cmd, timeout=30):\n        try:\n            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)\n            return (r.stdout or \"\").strip()\n        except Exception:\n            return \"\"\n\n    now = time.time()\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    rlog = os.path.expanduser(input.get(\"rounds_log\")\n                              or \"~/.issue-keeper/pipeline/controller/rounds.log\")\n\n    # A 班心跳：duty state 滚动窗口最后一轮\n    a = None\n    try:\n        st = json.load(open(os.path.join(duty, \"state-issue-accept.json\")))\n        rs = st.get(\"rounds\") or []\n        if rs:\n            last = rs[-1]\n            a = {\"round\": last.get(\"round\"), \"at\": last.get(\"finished_at\"),\n                 \"status\": last.get(\"status\"),\n                 \"escalations\": [f for f in (last.get(\"findings\") or [])\n                                 if f.get(\"escalate\")]}\n    except Exception:\n        pass\n\n    # B 班心跳：rounds.log 最后一行 B-flow（keeper-watch finish 写入）\n    b = None\n    try:\n        for line in reversed(open(rlog, encoding=\"utf-8\").readlines()[-400:]):\n            if \" B-flow\" in line:\n                b = {\"line\": line.strip()[:160], \"at\": line[:16]}\n                break\n    except Exception:\n        pass\n\n    # shadow 派发链心跳（远端 latest.json mtime；keeper 每 5min 派 shadow 一轮）\n    shadow_age = None\n    mt = sh(\"ssh -o ConnectTimeout=8 tcloud_gz \"\n            \"'stat -c %Y ~/.issue-keeper/shadow/latest.json 2>/dev/null'\")\n    if mt.strip().isdigit():\n        shadow_age = max(0, now - int(mt.strip()))\n\n    def parse_hm(s):\n        try:\n            import calendar\n            t = time.strptime(s, \"%Y-%m-%d %H:%M\")\n            return calendar.timegm(t) - 8 * 3600  # 本机为 Asia/Shanghai（UTC+8）\n        except Exception:\n            return None\n\n    def parse_iso(s):\n        try:\n            from datetime import datetime\n            return datetime.fromisoformat(s).timestamp()\n        except Exception:\n            return None\n\n    return {\"now\": now, \"a\": a, \"a_ts\": parse_iso((a or {}).get(\"at\") or \"\"),\n            \"b\": b, \"b_ts\": parse_hm((b or {}).get(\"at\") or \"\"),\n            \"shadow_age\": shadow_age}\n",
+      "input": {
+        "duty_dir": "$INPUT.duty_dir",
+        "rounds_log": "$INPUT.rounds_log"
+      },
+      "next": "triage",
+      "source_line": 42
+    },
+    {
+      "type": "code",
+      "id": "triage",
+      "language": "python",
+      "code": "\ndef run(input):\n    now = float(input.get(\"now\") or 0)\n    f = []\n\n    a_stale = float(input.get(\"a_stale_min\") or 25) * 60\n    b_stale = float(input.get(\"b_stale_min\") or 180) * 60\n    s_stale = float(input.get(\"shadow_stale_min\") or 20) * 60\n\n    a, a_ts = input.get(\"a\"), input.get(\"a_ts\")\n    if not a or not a_ts:\n        f.append({\"severity\": \"critical\", \"summary\": \"A 班（issue-accept）心跳不可读——duty state 缺失或损坏\",\n                  \"escalate\": True})\n    elif now - a_ts > a_stale:\n        f.append({\"severity\": \"critical\",\n                  \"summary\": \"A 班心跳超期 %.0fmin（阈值 %.0fmin；轮=%s）——外部验收闭环停摆\"\n                             % ((now - a_ts) / 60, a_stale / 60, a.get(\"round\")),\n                  \"escalate\": True})\n    b, b_ts = input.get(\"b\"), input.get(\"b_ts\")\n    if not b or not b_ts:\n        f.append({\"severity\": \"warn\", \"summary\": \"B 班（keeper-watch）心跳不可读（rounds.log 无 B-flow 行）\"})\n    elif now - b_ts > b_stale:\n        f.append({\"severity\": \"warn\",\n                  \"summary\": \"B 班心跳超期 %.0fmin（阈值 %.0fmin）\" % ((now - b_ts) / 60, b_stale / 60),\n                  \"escalate\": True})\n    sa = input.get(\"shadow_age\")\n    if sa is None:\n        f.append({\"severity\": \"critical\", \"summary\": \"shadow 心跳不可读（ssh 失败/latest.json 缺失）——派发链存疑\",\n                  \"escalate\": True})\n    elif sa > s_stale:\n        f.append({\"severity\": \"critical\",\n                  \"summary\": \"shadow latest.json %0.0fmin 未更新（阈值 %.0fmin）——派发链可能停摆\"\n                             % (sa / 60, s_stale / 60),\n                  \"escalate\": True})\n\n    # A 班上轮的待升级 finding（issue-accept 自己报请的）并入路由\n    for e in (a or {}).get(\"escalations\") or []:\n        f.append({\"severity\": str(e.get(\"severity\") or \"warn\"),\n                  \"summary\": \"A 班轮%s 报请：%s\" % (a.get(\"round\"), str(e.get(\"summary\"))[:200]),\n                  \"escalate\": True})\n\n    need = any(x.get(\"escalate\") and x.get(\"severity\") == \"critical\" for x in f)\n    report = \"; \".join(x[\"summary\"] for x in f) if f else \"全线正常\"\n    return {\"findings\": f, \"need_escalate\": need, \"report\": report}\n",
+      "input": {
+        "now": "$NODE.facts.now",
+        "a": "$NODE.facts.a",
+        "a_ts": "$NODE.facts.a_ts",
+        "b": "$NODE.facts.b",
+        "b_ts": "$NODE.facts.b_ts",
+        "shadow_age": "$NODE.facts.shadow_age",
+        "a_stale_min": "$INPUT.a_stale_min",
+        "b_stale_min": "$INPUT.b_stale_min",
+        "shadow_stale_min": "$INPUT.shadow_stale_min"
+      },
+      "next": "act",
+      "source_line": 112
+    },
+    {
+      "type": "code",
+      "id": "act",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, subprocess, time\n\n    need = bool(input.get(\"need\"))\n    if not need:\n        return {\"posted\": False, \"why\": \"无需升级\"}\n\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    spath = os.path.join(duty, \"state-controller.json\")\n    now = time.time()\n    doc = {}\n    try:\n        doc = json.load(open(spath))\n    except Exception:\n        pass\n    meta = doc.get(\"meta\") or {}\n    last = float(meta.get(\"last_escalate_at\") or 0)\n    if now - last < 3600:\n        return {\"posted\": False,\n                \"why\": \"60min 内已升级过（%.0fmin 前），去重\" % ((now - last) / 60)}\n    if input.get(\"dryrun\"):\n        return {\"posted\": False, \"why\": \"dryrun\"}\n\n    body = (\"<!-- issue-keeper-bot -->\\n**[ctrl-watch] 值守看门狗升级（P1）**\\n\\n\"\n            \"%s\\n\\n—— 主控已 flow 化（ctrl-watch），本条为自动升级路由；\"\n            \"处理完了回一句即可，我不会重复刷屏（60min 去重）。\"\n            % str(input.get(\"report\") or \"\")[:1500])\n    import tempfile\n    fd, p = tempfile.mkstemp(suffix=\".md\")\n    with os.fdopen(fd, \"w\") as f:\n        f.write(body)\n    out = subprocess.run(\"gh issue comment 2 -R jeffkit/infra4agent --body-file \" + p,\n                         shell=True, capture_output=True, text=True, timeout=60)\n    os.unlink(p)\n    ok = out.returncode == 0\n    meta[\"last_escalate_at\"] = now\n    doc[\"meta\"] = meta\n    try:\n        import fcntl\n        with open(spath + \".lock\", \"w\") as lf:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n            json.dump(doc, open(spath + \".tmp\", \"w\"), ensure_ascii=False, indent=1)\n            os.replace(spath + \".tmp\", spath)\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n    except Exception:\n        pass\n    return {\"posted\": ok, \"why\": (out.stdout or out.stderr)[:160]}\n",
+      "input": {
+        "need": "$NODE.triage.need_escalate",
+        "report": "$NODE.triage.report",
+        "duty_dir": "$INPUT.duty_dir",
+        "dryrun": "$INPUT.dryrun"
+      },
+      "next": "finish",
+      "source_line": 164
+    },
+    {
+      "type": "code",
+      "id": "finish",
+      "language": "python",
+      "code": "\ndef run(input):\n    import fcntl, json, os, tempfile, time\n\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    os.makedirs(duty, exist_ok=True)\n    now = time.time()\n    ts = time.strftime(\"%Y-%m-%dT%H:%M:%S+08:00\")\n    findings = input.get(\"findings\") or []\n    status = \"attention\" if findings else \"ok\"\n    rd = now\n    try:\n        doc = json.load(open(os.path.join(duty, \"state-controller.json\")))\n        rd = max([r.get(\"round\", 0) for r in (doc.get(\"rounds\") or [])] or [0]) + 1\n    except Exception:\n        rd = 1\n    round_doc = {\n        \"schema_version\": \"duty/state@0\", \"role\": \"controller\", \"generation\": 2,\n        \"round\": rd, \"started_at\": ts, \"finished_at\": ts, \"status\": status,\n        \"findings\": findings,\n        \"narrative\": str(input.get(\"report\") or \"\")[:300]\n                     + (\" | 升级已发\" if input.get(\"posted\") else \"\"),\n    }\n\n    def atomic(path, d):\n        fd, tmp = tempfile.mkstemp(dir=str(os.path.dirname(path)), prefix=\".tmp-\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(json.dumps(d, indent=1, ensure_ascii=False))\n        os.replace(tmp, path)\n\n    spath = os.path.join(duty, \"state-controller.json\")\n    with open(spath + \".lock\", \"w\") as lf:\n        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n        try:\n            doc = {\"schema_version\": \"duty/state@0\", \"role\": \"controller\", \"rounds\": []}\n            try:\n                doc = json.load(open(spath))\n            except Exception:\n                pass\n            meta = doc.get(\"meta\") or {}\n            rounds = doc.get(\"rounds\") or []\n            rounds.append(round_doc)\n            doc.update({\"rounds\": rounds[-20:], \"meta\": meta, \"updated_at\": ts})\n            atomic(spath, doc)\n        finally:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n\n    with open(os.path.join(duty, \"rounds.log\"), \"a\") as fh:\n        fh.write(\"%s ctrl-watch 轮次=%s 状态=%s findings=%s 升级=%s 摘要=%s\\n\"\n                 % (ts, rd, status, len(findings),\n                    \"已发\" if input.get(\"posted\") else \"无\",\n                    str(input.get(\"report\") or \"\")[:120]))\n\n    return {\"round\": rd, \"status\": status, \"posted\": bool(input.get(\"posted\"))}\n",
+      "input": {
+        "findings": "$NODE.triage.findings",
+        "report": "$NODE.triage.report",
+        "posted": "$NODE.act.posted",
+        "duty_dir": "$INPUT.duty_dir"
+      },
+      "next": "_n1",
+      "source_line": 218
+    },
+    {
+      "type": "end",
+      "id": "_n1",
+      "output": {
+        "round": "$NODE.finish.round",
+        "status": "$NODE.finish.status"
+      },
+      "resultType": "success",
+      "name": "return {'round': NODE.finis…",
+      "desc": "return {'round': NODE.finish.round, 'status': NODE.finish.s…",
+      "source_line": 277
+    }
+  ]
+}
