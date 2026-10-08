@@ -23,6 +23,16 @@ v0.3.1（#13）建树幂等自愈：worktree 段不再是 `worktree add -b`（�
   失败 → `reply_prep_fail` 回评 partial 终态）；`setup` 对缺失 cwd 如实降级为
   `ok=False`（不再让 FileNotFoundError 逃逸成 engine_error 终态）。
 
+v0.3.2（#11，ilink-hub #39 实证）.github 禁改名单的显式人工通道：CI 类修复单
+  的修复对象就是 `.github/workflows/*`，硬拦会让「实现完成、测试全绿」的 run 以
+  guarded 收尾、只能值守手工落地（绕过三门评审，流程不对称）。通道是双闸门：
+  - 仓库契约 allow_github_paths：声明允许触碰的 .github 子路径前缀（声明权在
+    契约——`.github/` 其余部分仍拦）；
+  - issue 正文头部 `ci-fix: true`：单条 issue 显式 opt-in（触发权在 issue）。
+  两者齐备 guard 才放行（INPUT.allow_github_paths 非空），缺一照旧拦截——
+  注入者要么拿不到仓库契约，要么拿不到 issue 编辑权，改不了 CI 的攻击面不变。
+  plan/implement/review 提示词同步感知例外，避免实现对不上护栏。
+
 角色分离（10-01 拍板：全链 GLM-5.3-flash；10-08 12:08 GLM 周配额重置后回切）：
   - glm53-flash    全部段：triage / investigate / plan / implement / fix /
                      review / document / reply——review 同模型但提示词独立、
@@ -404,7 +414,9 @@ def issue_pipeline(INPUT):
             "你是实现规划员。读 {% $INPUT.artifact_dir %}/01-investigation.md，写 {% $INPUT.artifact_dir %}/02-plan.md："
             "1) 改哪些文件各改什么；2) 实施顺序；3) 验证命令（定向 + 是否需要 {% $INPUT.test_command %}）；"
             "4) 风险与回滚；5) 验收覆盖（{% $NODE.parsed.acceptance_str %}）。"
-            "计划涉及文件禁止包含 .github/** 与任何仓库外路径。"
+            "计划涉及文件禁止包含仓库外路径；禁止改 .github/**——例外："
+            "仅当本次 run 放行了 .github 例外通道（例外清单：{% $INPUT.allow_github_paths %}，"
+            "非空才有效）时，才允许计划清单内的该清单前缀下文件。"
             "最后一行必须是：COMMIT_MESSAGE: <conventional 消息，含 (#{% $INPUT.issue_number %})>。"
             "只做计划不改代码。完成后只回复一行：DONE <计划要点>"
         ),
@@ -455,7 +467,9 @@ def issue_pipeline(INPUT):
             "不要从零重写、更不要 revert 掉可用改动；只在确有必要时才重做某处，并在"
             "02-plan.md「## 实施记录」里写一句为什么。"
             "约束：只改计划内文件（计划有误可在允许范围内调整并追加到实施记录）；"
-            "禁止改动 .github/**；自验用**定向**测试（按本仓惯例，如 "
+            "禁止改动 .github/**——例外：本次 run 的 .github 例外清单是"
+            " {% $INPUT.allow_github_paths %}（非空才有效，只许该清单前缀下的文件）；"
+            "自验用**定向**测试（按本仓惯例，如 "
             "`cargo test -p <crate> --test <target>` / `pnpm --filter <pkg> test` / `pytest <path>`），"
             "**不要跑全量质量门**（管线有独立质量门会跑：{% $INPUT.test_command %}）；"
             "不要 git commit / git push。"
@@ -513,7 +527,9 @@ def issue_pipeline(INPUT):
             "**先读本仓 AGENTS.md / CLAUDE.md（若存在）**，按仓内质量门与禁止事项审查。"
             "本仓红线（per-repo 配置，最高优先级）：{% $INPUT.review_notes %}\n"
             "检查：计划符合度、边界条件、测试覆盖对齐验收（{% $NODE.parsed.acceptance_str %}）、"
-            "红线触发、是否夹带计划外改动（尤其 .github/** 与计划外新增文件）。\n"
+            "红线触发、是否夹带计划外改动（尤其 .github/** 与计划外新增文件——"
+            "例外：本次 run 的 .github 例外清单是 {% $INPUT.allow_github_paths %}，"
+            "非空时该清单前缀下的文件属计划内）。\n"
             "**不要重复跑全量质量门**：门紧接着会跑 {% $INPUT.test_command %}，"
             "你重复跑一遍既慢又和门重复。要验证行为就用相关用例"
             "（按本仓惯例选定向测试），单条命令预算 ≤5 分钟。\n"
@@ -652,6 +668,10 @@ def issue_pipeline(INPUT):
             return {"status": "partial", "posted": post_partial.posted}
 
     # ── 7. diff 护栏：敏感路径/超大 diff → 停机待人工，不进 deliver ──
+    # #11：.github/** 禁改名单带显式例外通道（双闸门：仓库契约 allow_github_paths
+    # 声明前缀 + issue 正文头部 ci-fix: true opt-in，keeper 侧合成进本 INPUT，
+    # 空 = 无例外照旧全拦）。例外只放宽 .github 子路径；.worktrees/、绝对路径、
+    # 目录穿越仍然一律拦截。
     guard = CODE.python(
         sandbox_backend="subprocess",
         code=(
@@ -660,8 +680,14 @@ def issue_pipeline(INPUT):
             "    r = subprocess.run(['git', 'diff', '--name-only', 'HEAD'], cwd=input['worktree_dir'],"
             " capture_output=True, text=True, timeout=60)\n"
             "    files = [f for f in r.stdout.splitlines() if f.strip()]\n"
-            "    bad = [f for f in files if f.startswith('.github/') or f.startswith('.worktrees/')"
-            " or '..' in f or f.startswith('/')]\n"
+            "    allowed = [p for p in (input.get('allow_github_paths') or []) if p]\n"
+            "    bad = []\n"
+            "    for f in files:\n"
+            "        if '..' in f or f.startswith('/') or f.startswith('.worktrees/'):\n"
+            "            bad.append(f)\n"
+            "        elif f.startswith('.github/'):\n"
+            "            if not any(f.startswith(p) for p in allowed):\n"
+            "                bad.append(f)\n"
             "    n = subprocess.run(['git', 'diff', '--shortstat', 'HEAD'], cwd=input['worktree_dir'],"
             " capture_output=True, text=True, timeout=60)\n"
             "    oversized = False\n"
@@ -670,9 +696,10 @@ def issue_pipeline(INPUT):
             "            oversized = int(n.stdout.split('insertion')[0].strip().split()[-1].replace('+','').replace(',','')) > 5000\n"
             "        except Exception:\n"
             "            oversized = False\n"
-            "    return {'ok': (not bad) and (not oversized), 'violations': bad, 'oversized': oversized}\n"
+            "    return {'ok': (not bad) and (not oversized), 'violations': bad, 'oversized': oversized,\n"
+            "            'github_allowed': bool(allowed)}\n"
         ),
-        input={"worktree_dir": INPUT.worktree_dir},
+        input={"worktree_dir": INPUT.worktree_dir, "allow_github_paths": INPUT.allow_github_paths},
     )
     if guard.ok != True:
         reply_guard = AGENTRUN(

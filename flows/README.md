@@ -40,6 +40,16 @@ review 结论「不能 cover 所有子仓」。改造后 flow 不再内嵌任何
   recursive 的 per-repo 配置；document 段不再假设「CHANGELOG.md Unreleased」
   （Changesets 制仓的正确动作是加 .changeset 文件）。各实施段提示词显式要求
   **先读目标仓 AGENTS.md / CLAUDE.md**。
+- **`.github` 禁改名单的显式通道（v0.3.2，#11）**：CI 修复单的修复对象就是
+  `.github/workflows/*`，硬拦曾让「实现完成、测试全绿」的 run 以 guarded
+  收尾（ilink-hub #39 实证），只能值守手工落地、绕过三门评审。现行双闸门：
+  仓库契约 `allow_github_paths`（声明允许的 `.github` 子路径前缀，声明权在
+  契约）× issue 正文头部 `ci-fix: true`（触发权在 issue），keeper 在派发时
+  合成进 `INPUT.allow_github_paths`（空 = 无例外）。guard 只对清单前缀内的
+  `.github/**` 放行；`.github/` 其余部分、`.worktrees/`、目录穿越、绝对路径
+  一律照拦——注入者要么拿不到契约要么拿不到 issue 编辑权，改 CI 绕门禁的
+  攻击面不变。plan/implement/review 提示词同步感知例外（例外清单为空时
+  措辞退化为原禁令）。
 - **交付策略**：git_publish（plaita-nodes 0.6.x）`merge_mode` 新增
   `pr`（推分支 + `gh pr create --base <base_branch>`，argusai 家族 PR 制）与
   `none`（只本地 commit 不 push）；`base_branch` 参数化 main 模式推送目标。

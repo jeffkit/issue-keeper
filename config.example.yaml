@@ -185,6 +185,14 @@ pipeline_repos:
   jeffkit/argusai-marketplace:
     mode: readonly
     triage_notes: "本仓是插件分发仓。改行为请去 jeffkit/argusai 仓；本仓只接受插件定义/文档更新，需人工核对面板工具名与参数一致性。"
+  # CI 修复单通道（#11，ilink-hub #39 实证）：guard 的 .github/** 禁改名单
+  # 默认拦下 CI 类修复——修复对象恰是 .github/workflows/*。在契约里声明允许
+  # 的 .github 子路径前缀（声明权在契约），再配合 issue 正文头部 `ci-fix: true`
+  # 显式 opt-in（触发权在 issue），两者齐备 guard 才放行该前缀下的文件；
+  # .github/ 其余部分、.worktrees/、目录穿越仍一律拦截。未声明的仓：任何
+  # .github 修改照旧 guarded。
+  # jeffkit/ilink-hub:
+  #   allow_github_paths: ['.github/workflows/**']
 
 # ─── 安全过滤层（screener）────────────────────────────────────────────
 # 在把内容投给主 agent 之前，先用一次纯 HTTP 的 LLM 调用检查是否含指令注入。

@@ -1897,6 +1897,20 @@ def _parse_depends_on(body: str) -> list[int]:
     return sorted({int(m) for m in _DEP_RE.findall(body or "")})
 
 
+_CI_FIX_RE = re.compile(r"^\s*ci-fix\s*:\s*(true|yes|on)\s*$", re.IGNORECASE | re.MULTILINE)
+
+
+def _declares_ci_fix(body: str) -> bool:
+    """正文头部是否显式声明 `ci-fix: true`（大小写不敏感）。
+
+    #11：CI/工作流类 issue 的修复对象恰是 `.github/workflows/*`（guard 禁改
+    名单默认拦截）。这是 issue 侧的显式 opt-in 通道——**还必须配合仓库契约
+    allow_github_paths 才放行**（声明权在契约、触发权在 issue，两者都有才开）。
+    只看头部 500 字符，正文深处出现同形字样不认（不可信正文不配当开关）。
+    """
+    return bool(_CI_FIX_RE.search((body or "")[:500]))
+
+
 def _dep_settled(config, repo_full: str, num: int) -> bool:
     """依赖 #N 是否已终态：state 里该 item 存在且 processed=True（管线已收尾）。
 
@@ -2332,6 +2346,9 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         "review_notes": pc.review_notes,
         "triage_notes": pc.triage_notes,
         "doc_notes": pc.doc_notes,
+        # #11：.github 禁改名单的显式例外——仓库契约声明允许的子路径 +
+        # issue 正文头部 `ci-fix: true` 双闸门，两者齐备才放行。
+        "allow_github_paths": pc.allow_github_paths if _declares_ci_fix(res.body) else [],
         "review_mode": pc.resolved_review_mode(config.pipeline_review_mode),
         "push_mode": pc.resolved_push_mode(config.pipeline_push_mode),
         "agent": pc.agent,

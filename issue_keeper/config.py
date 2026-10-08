@@ -123,6 +123,19 @@ class PipelineRepoConfig:
     review_notes: str = ""
     triage_notes: str = ""
     doc_notes: str = ""
+    # .github/** 禁改名单的显式例外（#11，ilink-hub #39 实证）：CI 修复单的
+    # 修复对象就是 .github/workflows/*，硬拦会让实现全绿却在 guard 被拦死。
+    # 这里声明允许触碰的 .github 子路径前缀（如 [".github/workflows/"]）；
+    # **只在 issue 带显式 opt-in 标签（ci-fix）时生效**——声明权在仓库契约，
+    # 触发权在单条 issue，注入者两者都拿不到就仍被拦。
+    allow_github_paths: list = field(default_factory=list)
+
+    def __post_init__(self):
+        # #11：前缀语义，剥掉 glob 星号——`'.github/workflows/**'` 与
+        # `'.github/workflows/'` 必须等价，否则 startswith 门槛两头对不上
+        self.allow_github_paths = [str(p).strip().rstrip("*")
+                                   for p in (self.allow_github_paths or [])
+                                   if str(p).strip()]
     # 段级预算覆盖（键：investigate/plan/implement/review/fix_review/fix_test/
     # document）；缺省用 flow 内置值（按 cargo 冷构建调优的那组）
     timeout_overrides: dict = field(default_factory=dict)
@@ -382,6 +395,9 @@ def _load_pipeline_repos(raw: Any) -> dict[str, PipelineRepoConfig]:
             review_notes=str(item.get("review_notes") or ""),
             triage_notes=str(item.get("triage_notes") or ""),
             doc_notes=str(item.get("doc_notes") or ""),
+            allow_github_paths=[str(p).strip().rstrip("*")
+                                for p in (item.get("allow_github_paths") or [])
+                                if str(p).strip()],
             timeout_overrides=timeout_overrides,
         )
     return out
