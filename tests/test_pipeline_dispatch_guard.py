@@ -892,6 +892,82 @@ def test_reopen_posts_status_comment(tmp_path):
                for (body,) in rows)
 
 
+# ── #11：.github 禁改名单的显式例外（ci-fix 双闸门）──────────────────
+
+def test_ci_fix_declaration_parsing():
+    from issue_keeper.keeper import _declares_ci_fix
+    assert _declares_ci_fix("fix CI\n\nci-fix: true\n") is True
+    assert _declares_ci_fix("CI-FIX: yes") is True
+    assert _declares_ci_fix("ci-fix:true") is True
+    assert _declares_ci_fix("ci-fix: false") is False
+    assert _declares_ci_fix("普通正文里提到 ci-fix: true 但不在头部") is False  # 500 字符外不认
+    assert _declares_ci_fix("") is False
+    deep = "x" * 600 + "\nci-fix: true\n"
+    assert _declares_ci_fix(deep) is False
+
+
+def test_dispatch_payload_ci_fix_gate(tmp_path, monkeypatch):
+    """#11 双闸门：契约 allow_github_paths × 正文 ci-fix 声明，缺一 allow 为空。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    bridge = tmp_path / "bridge.py"
+    bridge.write_text(
+        "import json, shutil, sys\n"
+        "shutil.copy(sys.argv[1], sys.argv[1] + '.seen.json')\n",
+        encoding="utf-8",
+    )
+    pc = PipelineRepoConfig(
+        test_command="pnpm test",
+        allow_github_paths=[".github/workflows/"],
+    )
+
+    def _dispatch(number: int, body: str) -> dict:
+        art = _art(tmp_path, number=number)
+        out = _dispatch_pipeline(
+            _pipeline_cfg(bridge, pipeline_claim_comment=False),
+            RepoBinding(repo="a/b", profile="p"),
+            _res(number=number, body=body), ItemState(),
+            f"a/b issue#{number}", pc=pc,
+        )
+        assert out["status"] == "dispatched"
+        return _await_seen(art, number)
+
+    # 契约声明 + issue 头部声明 → 放行清单透传
+    seen = _dispatch(21, "修 CI\n\nci-fix: true\n\n改 .github/workflows/ci.yml")
+    assert seen["allow_github_paths"] == [".github/workflows/"]
+    # 有契约声明、issue 未声明 → 不放行（正文深处出现同形字样也不算声明）
+    seen2 = _dispatch(22, "正文深处 ci-fix: true 不算声明")
+    assert seen2["allow_github_paths"] == []
+    # issue 声明了、契约没声明 → 也不放行
+    pc_no_allow = PipelineRepoConfig(test_command="pnpm test")
+    art3 = _art(tmp_path, number=23)
+    out3 = _dispatch_pipeline(
+        _pipeline_cfg(bridge, pipeline_claim_comment=False),
+        RepoBinding(repo="a/b", profile="p"),
+        _res(number=23, body="修 CI\nci-fix: true"), ItemState(),
+        "a/b issue#23", pc=pc_no_allow,
+    )
+    assert out3["status"] == "dispatched"
+    seen3 = _await_seen(art3, 23)
+    assert seen3["allow_github_paths"] == []
+
+
+def test_repo_cfg_parses_allow_github_paths(tmp_path):
+    cfg = Config(pipeline_repos={
+        "a/ci": PipelineRepoConfig(test_command="x",
+                                   allow_github_paths=[".github/workflows/**"]),
+    })
+    pc, _why = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/ci", profile="p"))
+    assert pc.allow_github_paths == [".github/workflows/"]
+    # 未登记的仓：不进管线（None = 门控拒绝）；登记但未配置 allow 的：空清单
+    pc2, why2 = _pipeline_repo_cfg(cfg, RepoBinding(repo="a/other", profile="p"))
+    assert pc2 is None and "无质量门" in why2
+    cfg2 = Config(pipeline_repos={
+        "a/plain": PipelineRepoConfig(test_command="y"),
+    })
+    pc4, _ = _pipeline_repo_cfg(cfg2, RepoBinding(repo="a/plain", profile="p"))
+    assert pc4.allow_github_paths == []
+
+
 # ── 派发优先级仓（跨仓饥饿治理，2026-10-05）────────────────────────
 def test_order_repos_priority_first_and_stable():
     """priority 名单内的仓排最前，组内稳定保序；空名单原序返回。"""
