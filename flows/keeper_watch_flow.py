@@ -98,10 +98,12 @@ def run(input):
     # ── ③ watch（AGENTRUN：glm53-flash 宿主直跑；值守动作权+红线写死提示词）───
     watch = AGENTRUN(agent="glm53-flash",
                      repo="/Users/kong/projects/infra4agent",
-                     timeout_secs=1500,
+                     timeout_secs=2700,
                      prompt=F.concat(
         "你是 infra4agent 大仓「B 值守」（keeper-watch flow 正班；jeffkit 委托授权，"
         "代表其做派发健康监督、磁盘守卫与卡单处置）。\n"
+        "**时间预算 45 分钟**：先做第 3-4 步的动作与简报、最后写第 5 步总结；"
+        "一切文件截读（handoff 只取最新一份、directives 只读 issued 段、facts 用给定的不重跑探测）。\n"
         "本轮步骤：\n"
         "1) 读磁盘上最新一份滚动交接：`ls -t ~/.issue-keeper/pipeline/controller/handoffs/B-handoff-*.md | head -1` 并读它"
         "（在途/退避/观察项/口径——你的上下文）。\n"
