@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infra4agent.local/duty/directives.schema.json",
+  "title": "duty:directives",
+  "description": "指令板 + 回执状态机。取代 directives.md。现役 D-0001..D-0027 的形态。",
+  "type": "object",
+  "required": ["schema_version", "updated_at", "directives"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "duty/directives@0" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "directives": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Directive" }
+    }
+  },
+  "$defs": {
+    "Directive": {
+      "type": "object",
+      "required": ["id", "status", "targets", "priority", "issued_at", "title", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^D-[0-9]{4,}$",
+          "description": "指令号，全局递增，**不删除历史条目**（改 status）——与现役纪律一致。"
+        },
+        "status": {
+          "enum": ["issued", "acked", "done", "failed", "expired"],
+          "description": "状态机：issued → acked → done|failed；issued 超时未回执 → expired。转换只允许向前。"
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["controller", "A", "B", "both", "sandbox"] },
+          "description": "投递目标。'both'=A 与 B 都要回执（现役语义）。"
+        },
+        "priority": {
+          "enum": ["P0", "P1", "P2", "P3"],
+          "description": "P0=立即处置（如全管线停摆）；P1=本轮内；P2=下轮内；P3=有空做。"
+        },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "issued_by": {
+          "type": "string",
+          "description": "'controller' / 'jeffkit' / 其他角色名。"
+        },
+        "title": { "type": "string", "maxLength": 200 },
+        "body": {
+          "type": "string",
+          "maxLength": 8000,
+          "description": "指令正文。**只给人读**——判定一律走结构化字段（如 deadline / targets / priority）。"
+        },
+        "deadline": {
+          "type": "string",
+          "format": "date-time",
+          "description": "要求回执的截止时刻。超过即 expired 并可告警。缺失 = 'issued 超 2 轮未回执'兜底规则。"
+        },
+        "max_rounds_unacked": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 2,
+          "description": "允许未回执的轮数上限（现役 playbook §2 第 3 条：超 2 轮 → 催办 + 简报升级）。"
+        },
+        "blocking": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否阻塞其他指令（P0 停摆类）。true 时主控不派发低优先级新指令。"
+        },
+        "acks": {
+          "type": "array",
+          "description": "回执行。append-only；每条含时间/角色/结果/证据。",
+          "items": { "$ref": "#/$defs/Ack" }
+        },
+        "supersedes": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^D-[0-9]{4,}$" },
+          "description": "被本指令取代的旧指令号（旧条目改 expired，不删）。"
+        },
+        "refs": {
+          "type": "object",
+          "description": "关联引用（issue 号 / execution id / 路径），便于追溯。",
+          "additionalProperties": true
+        }
+      }
+    },
+    "Ack": {
+      "type": "object",
+      "required": ["at", "role", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "role": { "enum": ["controller", "A", "B", "sandbox", "jeffkit"] },
+        "kind": {
+          "enum": ["ack", "done", "failed", "prog", "note"],
+          "description": "ack=已读将执行；prog=进展；done=完成；failed=失败（须带 reason）；note=旁注（不改状态）。"
+        },
+        "summary": { "type": "string", "maxLength": 500 },
+        "evidence": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "**done 必填**：可核验的证据（命令输出 / commit / issue 链接 / ID）。现役纪律'回执带时间与证据'的机器化。"
+        },
+        "reason": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "**failed 必填**：失败原因。"
+        },
+        "round": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "回执发生的轮次号（对账 state.round）。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "done" } }, "required": ["kind"] },
+          "then": { "required": ["evidence"] },
+          "description": "done 必须有证据——防止'口头完成'。"
+        },
+        {
+          "if": { "properties": { "kind": { "const": "failed" } }, "required": ["kind"] },
+          "then": { "required": ["reason"] },
+          "description": "failed 必须说明原因。"
+        }
+      ]
+    }
+  }
+}

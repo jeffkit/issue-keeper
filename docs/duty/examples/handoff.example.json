@@ -1,0 +1,128 @@
+{
+  "schema_version": "duty/handoff@0",
+  "role": "B",
+  "generation": 14,
+  "round": 36,
+  "written_at": "2026-10-08T16:07:00+08:00",
+  "supersedes": "B-handoff-20261008-1441.md",
+  "in_flight": [
+    {
+      "kind": "execution",
+      "ref": "56d2dc827fe54b249ee5b7ec12589ae6",
+      "repo": "jeffkit/plaita",
+      "issue_number": 23,
+      "state": "zombie",
+      "host": "vm",
+      "note": "沙箱单；impl 阶段；磁盘已 delete"
+    },
+    {
+      "kind": "execution",
+      "ref": "348a9015b44949a78024ab394d6fc677",
+      "repo": "jeffkit/plaita",
+      "issue_number": 24,
+      "state": "zombie",
+      "host": "vm",
+      "note": "本轮全灭需重跑"
+    },
+    {
+      "kind": "execution",
+      "ref": "61354d8e38bf4fde8663ca07beaa5f5e",
+      "repo": "jeffkit/plaita",
+      "issue_number": 25,
+      "state": "zombie",
+      "host": "vm",
+      "note": "本轮全灭需重跑"
+    },
+    {
+      "kind": "execution",
+      "ref": "42880276e3d143f49002e1abd1fcf7e9",
+      "repo": "jeffkit/plaita",
+      "issue_number": 27,
+      "state": "zombie",
+      "host": "vm",
+      "note": "13:51 reopen 后第二次；本轮全灭需重跑"
+    },
+    {
+      "kind": "execution",
+      "ref": "2966c4652f4b4d8db026e12f8387e4e8",
+      "repo": "jeffkit/recursive",
+      "issue_number": 88,
+      "state": "zombie",
+      "host": "mac",
+      "note": "impl 已完成，评审节点 rev1 被 429 打断——resume 应能从 rev1 续"
+    },
+    {
+      "kind": "execution",
+      "ref": "7d1a627a3391466ead5235763a8d23f8",
+      "repo": "jeffkit/agentproc",
+      "issue_number": 17,
+      "state": "zombie",
+      "host": "mac",
+      "note": "在 review_prompt 阶段"
+    }
+  ],
+  "todo": [
+    {
+      "summary": "按恢复预案处理 6 僵尸",
+      "trigger": "2026-10-08T17:09:01+08:00 额度重置后",
+      "priority": "P0",
+      "directive_id": "D-0027",
+      "command": "curl -s -X POST -H \"X-Admin-API-Key: $PLAITA_CONSOLE_ADMIN_API_KEY\" http://127.0.0.1:8323/api/executions/<eid>/resume -d '{\"resume_type\":\"retry\",\"data\":{}}'"
+    },
+    {
+      "summary": "确认 recovery 后 GLM 能跑通；若仍 1308 → 上报 jeffkit 换档",
+      "trigger": "2026-10-08T17:15:00+08:00",
+      "priority": "P0"
+    },
+    {
+      "summary": "清临时 schedule（17:15 恢复专火）",
+      "trigger": "恢复专火跑完后",
+      "priority": "P1"
+    }
+  ],
+  "watched": [
+    {
+      "summary": "额度再饱和风险：6/6×GLM 可能 ~3.5h 后再次烧穿",
+      "since": "2026-10-08T16:00:00+08:00",
+      "condition": "再遇 429 → 不要盲目重派，先看 code 1308 的 reset 时刻"
+    },
+    {
+      "summary": "recursive#148 互杀根因修复的顺位（recursive 队列第 6）",
+      "since": "2026-10-08T13:00:00+08:00",
+      "condition": "回退前提=#148 落地 且 新版 flow 已发布到 console；仅 land 不生效"
+    },
+    {
+      "summary": "D-0025 观测点仍未到（10:33 后无 retry-later）",
+      "since": "2026-10-08T10:33:00+08:00"
+    }
+  ],
+  "criteria": [
+    {
+      "summary": "僵尸停摆三判据：console 全 running + Redis plaita:execution:lease:* 0 条 + 三 worker tasks=0",
+      "domain": "shared",
+      "source": "2026-10-08 GLM 1308 停摆事件"
+    },
+    {
+      "summary": "「reopen 先行」配方：status=running / 无租约 / 不在 PEL / 无 worker → console cancel → keeper CLI reopen（写 manual_reopen_at）→ keeper 判终态作废，不落台账不升级",
+      "domain": "B",
+      "source": "2026-10-08"
+    },
+    {
+      "summary": "recursive 互杀根因 = flow preflight _kill_stale_agents 的 live 集在 v2 路径失效（recursive#148, P1）",
+      "domain": "B",
+      "source": "recursive#148"
+    }
+  ],
+  "environment": {
+    "disk_local_gib": 145,
+    "disk_remote_gib": 21,
+    "worker_tasks": 0,
+    "queue_dlq": 18,
+    "notes": [
+      "4 个 AGS 沙箱 paused（#23/#24/#25/#27），无泄漏，占配额不烧算力",
+      "13:55-15:45 期间零新落地（plaita origin/main 仍 ea53e46、recursive c392d3c1）"
+    ]
+  },
+  "narrative": "🚨 本份最重要：全管线停摆事件（GLM 5h 上限）。约 15:40:51–15:45:02，6 个在跑 run 的 agent 节点接连失败（executor 'recursive' exited 1）。全文=[1308][已达到 5 小时的使用上限。您的限额将在 2026-10-08 17:09:01 重置。]。\n\n现状：三台 worker 0 任务、4 个 AGS 沙箱 paused、6 个 execution 仍 status=running（等重投但 PEL=0/stream=0，载体已无 ⇒ 僵尸）。管线停摆至 17:09:01。\n\n本班处置：不清理这 6 个僵尸——它们的 in-flight 锚正好当背压，避免 17:09 前重派空烧额度。自动兜底：keeper 的 2h 僵尸线约 17:40-17:45 会自行 cancel+重派（engine_error 300s 退避）。\n\n归因/建议（需 jeffkit 拍板）：额度窗口 12:09→17:09 ⇒ 12:2x 回切 GLM 后，6/6 满载约 3.5h 烧穿 5h 限额。6 并发×GLM 不可持续；备选=降 max_in_flight 或回 DeepSeek 档。当前三台 worker 0 任务＝换档/重启成本最低窗口。\n\n纪律备忘：本机无 keeper（动作走 ssh tcloud_gz）；recursive 不进远端 VM；DLQ 勿动；B 域=D-0014①，plaita 验收=A 域。指令板 D-0014 保持 issued（prog 已续写）。#2 已报事件。",
+  "size_bytes": 5980
+}

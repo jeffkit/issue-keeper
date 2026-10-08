@@ -1,0 +1,117 @@
+{
+  "schema_version": "duty/directives@0",
+  "updated_at": "2026-10-08T16:00:00+08:00",
+  "directives": [
+    {
+      "id": "D-0027",
+      "status": "acked",
+      "targets": ["both"],
+      "priority": "P0",
+      "issued_at": "2026-10-08T15:51:00+08:00",
+      "issued_by": "controller",
+      "title": "GLM 1308 全管线停摆——17:09 前禁动作，17:09 后按恢复序",
+      "body": "15:40:51-15:45:02 全部 6 跑中 run 的 agent 节点撞 GLM 5h 上限（1308，17:09:01 重置）→ 6 exec 僵尸化。\n\n红线：17:09 前禁 reopen/重派/cancel（防空烧额度）。\n恢复序：① resume → ② 5 分钟不恢复则 cancel → 等 keeper 收尾 park → 远端 reopen → ③ 兜底=僵尸线。\n\n额度策略（降闸 vs 回 DeepSeek）待 jeffkit 拍板，拍板前勿自行改档。",
+      "deadline": "2026-10-08T17:30:00+08:00",
+      "max_rounds_unacked": 1,
+      "blocking": true,
+      "acks": [
+        {
+          "at": "2026-10-08T16:05:00+08:00",
+          "role": "A",
+          "kind": "ack",
+          "summary": "已读，本轮零动作（17:09 前禁 reopen/重派/cancel）",
+          "round": 109
+        },
+        {
+          "at": "2026-10-08T16:07:00+08:00",
+          "role": "B",
+          "kind": "prog",
+          "summary": "本班不清理 6 僵尸——in-flight 锚当背压；恢复预案已备（先 resume 后 cancel+reopen）",
+          "round": 36
+        }
+      ],
+      "refs": {
+        "issue_comment": "jeffkit/infra4agent#2 issuecomment-6055531290",
+        "exec_ids": [
+          "56d2dc827fe54b249ee5b7ec12589ae6",
+          "348a9015b44949a78024ab394d6fc677",
+          "61354d8e38bf4fde8663ca07beaa5f5e",
+          "42880276e3d143f49002e1abd1fcf7e9",
+          "2966c4652f4b4d8db026e12f8387e4e8",
+          "7d1a627a3391466ead5235763a8d23f8"
+        ]
+      }
+    },
+    {
+      "id": "D-0013",
+      "status": "issued",
+      "targets": ["A"],
+      "priority": "P1",
+      "issued_at": "2026-10-08T13:19:00+08:00",
+      "issued_by": "controller",
+      "title": "六单验收队列（13:19-13:37 到点）",
+      "body": "六单到点后按序验收。停摆期间保持 issued。",
+      "max_rounds_unacked": 4,
+      "blocking": false,
+      "acks": [
+        {
+          "at": "2026-10-08T15:05:00+08:00",
+          "role": "A",
+          "kind": "prog",
+          "summary": "六单停摆中（GLM 1308），已续 prog",
+          "round": 108
+        }
+      ]
+    },
+    {
+      "id": "D-0006",
+      "status": "done",
+      "targets": ["B"],
+      "priority": "P3",
+      "issued_at": "2026-10-07T08:20:00+08:00",
+      "issued_by": "controller",
+      "title": "新系统 stream 残留定性（复核 + 提报 plaita）",
+      "body": "plaita:flow:queue:v2 昨夜遗留 3 条（XLEN=3 但 pending=0/lag=0），污染「队列积压」读数。请复核定性并以 okguitar 提报 plaita issue（P3）。",
+      "max_rounds_unacked": 2,
+      "blocking": false,
+      "acks": [
+        {
+          "at": "2026-10-07T09:56:00+08:00",
+          "role": "B",
+          "kind": "done",
+          "summary": "已复核：残留来自 XACK 与 XDEL 之间崩溃/取消路径漏删，非系统性。已提报 plaita#43（P3）",
+          "evidence": "plaita#43；备份 backups/queue-residue-20261007-0812.json",
+          "round": 22
+        }
+      ]
+    },
+    {
+      "id": "D-0002",
+      "status": "failed",
+      "targets": ["B"],
+      "priority": "P2",
+      "issued_at": "2026-10-06T01:54:00+08:00",
+      "issued_by": "controller",
+      "title": "远端 worker 探活并入 B 班例行",
+      "body": "B 班请求：例行并入第 6 条「远端 worker（tcloud_gz 波1 九仓）探活」。",
+      "max_rounds_unacked": 2,
+      "blocking": false,
+      "acks": [
+        {
+          "at": "2026-10-06T01:52:00+08:00",
+          "role": "B",
+          "kind": "failed",
+          "summary": "维护轮实测 B-MAINT-NO-TOOL",
+          "reason": "注入回合 automationPort 未挂载，CronUpdate/CronList 均 Tool not found，B 未做任何修改",
+          "round": 3
+        },
+        {
+          "at": "2026-10-06T01:53:00+08:00",
+          "role": "controller",
+          "kind": "note",
+          "summary": "主控经直改存储执行（tasks-index.sqlite），回读校验 sha256 通过"
+        }
+      ]
+    }
+  ]
+}

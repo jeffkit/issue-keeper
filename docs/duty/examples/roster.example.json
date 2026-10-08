@@ -1,0 +1,144 @@
+{
+  "schema_version": "duty/roster@0",
+  "generation": 14,
+  "updated_at": "2026-10-08T16:00:00+08:00",
+  "updated_by": "controller",
+  "on_duty": {
+    "controller": {
+      "session_ref": "sess_4a3c291e-cf8c-48f4-b90e-276cffbf5e78",
+      "since": "2026-10-07T23:11:00+08:00",
+      "rounds_in_shift": 12,
+      "last_round_at": "2026-10-08T16:51:00+08:00",
+      "model_tier": "deepseek-flash"
+    },
+    "A": {
+      "session_ref": "sess_3a7fd820-7a91-4dc9-8e1e-9e08a7fcaa88",
+      "since": "2026-10-08T16:00:00+08:00",
+      "rounds_in_shift": 1,
+      "last_round_at": "2026-10-08T16:05:00+08:00",
+      "model_tier": "deepseek-flash"
+    },
+    "B": {
+      "session_ref": "sess_a8891441-5505-4f48-b97b-c21f60ad5a2e",
+      "since": "2026-10-08T12:53:00+08:00",
+      "rounds_in_shift": 2,
+      "last_round_at": "2026-10-08T16:07:00+08:00",
+      "model_tier": "deepseek-flash"
+    }
+  },
+  "reserve_pool": [
+    {
+      "role": "A",
+      "session_ref": "sess_51f28767-775e-46a7-8ac0-e34030e594ae",
+      "retired_at": "2026-10-08T15:51:00+08:00",
+      "reason": "rotation",
+      "note": "轮101-105，验收关闭 3 单 + 提报 plaita#50",
+      "advisory": true
+    },
+    {
+      "role": "B",
+      "session_ref": "sess_f6f67e88-51d2-4a2f-b26e-e71021e8b9d6",
+      "retired_at": "2026-10-08T12:53:00+08:00",
+      "reason": "rotation",
+      "note": "轮28-33，D-0019 路径亲和修复 + 拒跑名单激活",
+      "advisory": true
+    }
+  ],
+  "capabilities": {
+    "by_role": {
+      "controller": {
+        "read_ledger": "autonomous",
+        "post_brief": "autonomous",
+        "run_tests": "autonomous",
+        "write_core": "autonomous",
+        "restart_worker": "human-in-loop",
+        "restart_keeper": "human-in-loop",
+        "change_concurrency": "human-in-loop",
+        "change_model_tier": "human-in-loop",
+        "close_issue": "forbidden",
+        "reopen_issue": "forbidden",
+        "delete_cache": "forbidden",
+        "delete_target_dir": "forbidden",
+        "purge_dlq": "forbidden",
+        "push_others_commit": "forbidden",
+        "cancel_execution": "forbidden",
+        "resume_execution": "forbidden",
+        "modify_automation": "authorized",
+        "change_infrastructure": "human-in-loop"
+      },
+      "A": {
+        "read_ledger": "autonomous",
+        "run_tests": "autonomous",
+        "post_brief": "autonomous",
+        "write_core": "autonomous",
+        "close_issue": "authorized",
+        "reopen_issue": "authorized",
+        "cancel_execution": "authorized",
+        "resume_execution": "authorized",
+        "delete_cache": "forbidden",
+        "delete_target_dir": "forbidden",
+        "restart_worker": "human-in-loop",
+        "restart_keeper": "human-in-loop",
+        "change_concurrency": "human-in-loop",
+        "change_model_tier": "human-in-loop",
+        "push_others_commit": "forbidden",
+        "purge_dlq": "forbidden",
+        "modify_automation": "forbidden",
+        "change_infrastructure": "human-in-loop"
+      },
+      "B": {
+        "read_ledger": "autonomous",
+        "run_tests": "autonomous",
+        "post_brief": "autonomous",
+        "write_core": "autonomous",
+        "reopen_issue": "authorized",
+        "delete_cache": "authorized",
+        "delete_target_dir": "authorized",
+        "cancel_execution": "authorized",
+        "resume_execution": "authorized",
+        "close_issue": "forbidden",
+        "restart_worker": "human-in-loop",
+        "restart_keeper": "human-in-loop",
+        "change_concurrency": "human-in-loop",
+        "change_model_tier": "human-in-loop",
+        "push_others_commit": "forbidden",
+        "purge_dlq": "forbidden",
+        "modify_automation": "forbidden",
+        "change_infrastructure": "human-in-loop"
+      }
+    },
+    "path_rules": [
+      {
+        "id": "ios-simulator",
+        "pattern": "(CoreSimulator|DeviceSupport|/Simulator|Simulator\\.app)",
+        "verdict": "deny",
+        "rationale": "jeffkit 2026-10-06 指示：绝不动 iOS 模拟器相关。只报告不回收。"
+      },
+      {
+        "id": "live-worktree-target",
+        "pattern": "\\.worktrees/[^/]+/target",
+        "verdict": "deny",
+        "rationale": "live run 的 worktree target 不可删（会打断在跑 run）。"
+      },
+      {
+        "id": "cargo-registry",
+        "pattern": "^.*/\\.cargo/registry",
+        "verdict": "deny",
+        "rationale": "共享依赖缓存，重建成本高且影响所有仓。"
+      },
+      {
+        "id": "target-dir-symlink",
+        "pattern": "(^|/)target/?$",
+        "verdict": "require-evidence",
+        "requires": [
+          "symlink_check"
+        ],
+        "rationale": "2026-10-08 事故：B 回收 ~/recursive-src/target 连带打断 ~/.local/bin/recursive 软链，致 VM 全 impl 失败 13 分钟。删前必查 PATH 软链指向。"
+      }
+    ]
+  },
+  "notes": [
+    "A 班巡检自 2026-10-08 16:00 起降频为 2h（原 1h）——保护 zcode 侧 GLM key 桶，与管线桶不同。",
+    "B 班 zcode 值守已降为每日抽查（B-flow 接管动作权，Phase 2）。"
+  ]
+}

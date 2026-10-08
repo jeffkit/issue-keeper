@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://infra4agent.local/duty/roster.schema.json",
+  "title": "duty:roster",
+  "description": "值班表。取代 ~/.issue-keeper/pipeline/controller/roster.md。当班/后备/世代 + 角色能力表。换班 = 更新 generation 与当班项，不再有 rotate_shift.sh。",
+  "type": "object",
+  "required": ["schema_version", "generation", "updated_at", "on_duty", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "duty/roster@0",
+      "description": "schema 标识。变更字段语义时递增主版本。"
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "世代号。每次换班 +1。轮报/handoff 引用它做对账（'本班第 N 代'）。"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC3339。任何写入都必须刷新。"
+    },
+    "updated_by": {
+      "type": "string",
+      "description": "写入者标识：角色名（controller/A/B）或 'jeffkit' 或 'manual'。用于审计人机边界。"
+    },
+    "on_duty": {
+      "type": "object",
+      "description": "当班项，按角色索引。缺某角色 = 该班缺位（降级链触发条件之一）。",
+      "propertyNames": {
+        "enum": ["controller", "A", "B", "sandbox"]
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/DutySlot"
+      }
+    },
+    "reserve_pool": {
+      "type": "array",
+      "description": "后备池。应急时从这里挑人接手；保留最近 N 代即可（建议 ≤20）。",
+      "items": {
+        "type": "object",
+        "required": ["role", "session_ref", "retired_at"],
+        "additionalProperties": false,
+        "properties": {
+          "role": { "$ref": "#/$defs/Role" },
+          "session_ref": {
+            "type": "string",
+            "description": "会话/执行的标识。zcode 形态为 sess_xxx；flow 形态为 execution_id。仅作追溯，不再被调度引用。"
+          },
+          "retired_at": { "type": "string", "format": "date-time" },
+          "reason": {
+            "enum": ["rotation", "shift_end", "crash", "frozen", "manual"],
+            "description": "退役原因。crash 需附 note。"
+          },
+          "note": { "type": "string", "maxLength": 2000 },
+          "advisory": {
+            "type": "boolean",
+            "default": true,
+            "description": "是否可作应急咨询（不恢复权限，仅可问询）。"
+          }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "§5 人机边界的机器可读形态：角色 × 能力 → 档位。GATE 节点读取本表做授权判定；缺项 = 拒绝（fail-closed）。",
+      "required": ["by_role", "path_rules"],
+      "additionalProperties": false,
+      "properties": {
+        "by_role": {
+          "type": "object",
+          "description": "role → { capability: level }。capability 命名见 $defs/Capability。",
+          "propertyNames": { "enum": ["controller", "A", "B", "sandbox"] },
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": { "$ref": "#/$defs/Capability" },
+            "additionalProperties": { "$ref": "#/$defs/Level" }
+          }
+        },
+        "path_rules": {
+          "type": "array",
+          "description": "路径级恒定规则。先于 by_role 判定；命中 deny 即拒绝，任何角色/档位都不能覆盖。",
+          "items": {
+            "type": "object",
+            "required": ["id", "pattern", "verdict"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "规则标识，用于告警与审计引用（如 'ios-simulator'）。"
+              },
+              "pattern": {
+                "type": "string",
+                "description": "路径正则（POSIX ERE，匹配绝对路径）。"
+              },
+              "verdict": {
+                "enum": ["deny", "require-evidence"],
+                "description": "deny=恒定拒绝；require-evidence=需 intent.evidence 提供指定证据才放行。"
+              },
+              "requires": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "verdict=require-evidence 时必填：要求的证据键名（如 'symlink_check'）。"
+              },
+              "rationale": {
+                "type": "string",
+                "maxLength": 500,
+                "description": "为什么设这条规则。建议附事故引用（日期 + 后果）。"
+              }
+            }
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 500 },
+      "description": "给人看的备注。不参与判定。"
+    }
+  },
+  "$defs": {
+    "Role": { "enum": ["controller", "A", "B", "sandbox"] },
+    "Level": {
+      "enum": ["autonomous", "authorized", "human-in-loop", "forbidden"],
+      "description": "autonomous=自主；authorized=角色授权（GATE 判定）；human-in-loop=需人 resume；forbidden=任何情况禁止。"
+    },
+    "Capability": {
+      "enum": [
+        "read_ledger",
+        "run_tests",
+        "post_brief",
+        "write_core",
+        "close_issue",
+        "reopen_issue",
+        "cancel_execution",
+        "resume_execution",
+        "delete_cache",
+        "delete_target_dir",
+        "restart_worker",
+        "restart_keeper",
+        "change_concurrency",
+        "change_model_tier",
+        "push_others_commit",
+        "purge_dlq",
+        "modify_automation",
+        "change_infrastructure"
+      ],
+      "description": "能力枚举。新增能力必须同时更新本 enum 与 §5 能力矩阵文档，防止'写在提示词里的隐形能力'。change_infrastructure = 移动/启停调度服务、改部署拓扑这类比'改配置'更重的变更。"
+    },
+    "DutySlot": {
+      "type": "object",
+      "required": ["session_ref", "since", "rounds_in_shift"],
+      "additionalProperties": false,
+      "properties": {
+        "session_ref": {
+          "type": "string",
+          "description": "当前当班的会话/执行标识。仅作追溯与告警展示——调度不再依赖它。"
+        },
+        "since": {
+          "type": "string",
+          "format": "date-time",
+          "description": "本班起算时刻。班龄兜底判据用。"
+        },
+        "rounds_in_shift": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "本班已跑轮数。原'轮数 ≥4 换班'判据的输入。"
+        },
+        "last_round_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "本班末轮时刻。判活用（超 1.5 周期未推进 → 掉班告警）。"
+        },
+        "model_tier": {
+          "type": "string",
+          "description": "本班使用的模型档（如 deepseek-flash / glm53-flash）。换档需 human-in-loop。"
+        }
+      }
+    }
+  }
+}

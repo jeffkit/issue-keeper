@@ -15,7 +15,7 @@
    "type": "code",
    "id": "facts",
    "language": "python",
-   "code": "\ndef run(input):\n    import json, os, subprocess, time\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    # ---- keeper 配置（pipeline_repos / 闸门参数）\n    try:\n        import yaml\n        cfg = yaml.safe_load(open(os.path.join(IK, \"config.yaml\"), encoding=\"utf-8\")) or {}\n    except Exception as e:\n        return {\"error\": \"config 读取失败: %s\" % e, \"items\": [], \"errors\": [],\n                \"generated_at\": int(time.time()), \"g_inflight\": 0, \"g_max\": 0, \"repos_scanned\": 0}\n    repos = {k: v for k, v in (cfg.get(\"pipeline_repos\") or {}).items()\n             if (v or {}).get(\"mode\") != \"readonly\"}\n    g_max = int(cfg.get(\"pipeline_max_in_flight\") or 0)\n    r_limits = {str(k): int(v) for k, v in (cfg.get(\"pipeline_repo_limits\") or {}).items()}\n    issue_daily = int(cfg.get(\"pipeline_issue_daily_limit\") or 0)\n    author_daily = int(cfg.get(\"author_daily_limit\") or 0)\n    exempt = {str(a).lower() for a in (cfg.get(\"author_daily_limit_exempt\") or [])}\n    allow = {str(a).lower() for a in (cfg.get(\"author_allowlist\") or [])}\n    optout = [str(x) for x in (cfg.get(\"opt_out_labels\") or [\"keeper-ignore\"])]\n    # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）\n    try:\n        st = json.load(open(os.path.join(IK, \"state.json\"), encoding=\"utf-8\"))\n    except Exception:\n        st = {\"repos\": {}}\n    srepos = st.get(\"repos\") or {}\n    # ---- 在途计数（镜像 keeper _count_in_flight：全网 in_flight_since 逐仓累计）\n    g_inflight = 0\n    r_inflight = {}\n    for slug, rv in srepos.items():\n        for _num, it in (((rv or {}).get(\"items\")) or {}).items():\n            if it.get(\"in_flight_since\"):\n                g_inflight += 1\n                r_inflight[slug] = r_inflight.get(slug, 0) + 1\n    # ---- 台账 runs.jsonl：今日有效 run 计数（与 keeper 同口径：非终态类才计额度）\n    NON_QUOTA = (\"retry-later\", \"failed\", \"guarded\", \"partial\")\n    today = time.strftime(\"%Y-%m-%d\")\n    issue_today, author_today = {}, {}\n    try:\n        with open(os.path.join(IK, \"pipeline\", \"runs.jsonl\"), encoding=\"utf-8\") as fh:\n            for line in fh:\n                line = line.strip()\n                if not line:\n                    continue\n                try:\n                    rec = json.loads(line)\n                except Exception:\n                    continue\n                if not str(rec.get(\"ts\", \"\")).startswith(today):\n                    continue\n                if rec.get(\"status\") in NON_QUOTA:\n                    continue\n                key = \"%s#%s\" % (rec.get(\"repo\"), rec.get(\"issue\"))\n                issue_today[key] = issue_today.get(key, 0) + 1\n                au = (rec.get(\"author\") or \"\").lower()\n                if au:\n                    author_today[au] = author_today.get(au, 0) + 1\n    except Exception:\n        pass\n    # ---- 扫单（gh，按仓并行——sandbox 墙钟默认 10s，串行 14 仓必超）\n    now_ts = time.time()\n    items, errors = [], []\n    def _scan(repo_full):\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"list\", \"--repo\", repo_full, \"--state\", \"open\",\n                                \"--limit\", \"100\",\n                                \"--json\", \"number,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            if p.returncode != 0:\n                return repo_full, None, \"gh exit=%s %s\" % (p.returncode, (p.stderr or \"\").strip()[:160])\n            return repo_full, json.loads(p.stdout or \"[]\"), None\n        except Exception as e:\n            return repo_full, None, str(e)[:160]\n    import concurrent.futures as _cf\n    with _cf.ThreadPoolExecutor(max_workers=6) as ex:\n        scanned = list(ex.map(_scan, sorted(repos)))\n    for repo_full, issues, err in scanned:\n        if err is not None:\n            errors.append(\"%s: %s\" % (repo_full, err))\n            continue\n        slug = repo_full.replace(\"/\", \"-\")\n        for iss in issues:\n            num = iss.get(\"number\")\n            it = (((srepos.get(slug) or {}).get(\"items\") or {}).get(str(num))) or {}\n            author = ((iss.get(\"author\") or {}).get(\"login\") or \"\")\n            labels = [l.get(\"name\") for l in (iss.get(\"labels\") or []) if isinstance(l, dict)]\n            items.append({\n                \"repo\": repo_full, \"number\": num,\n                \"title\": (iss.get(\"title\") or \"\")[:120],\n                \"author\": author, \"labels\": labels,\n                \"created_at\": iss.get(\"createdAt\") or \"\",\n                \"updated_at\": iss.get(\"updatedAt\") or \"\",\n                \"opt_out\": any(l in optout for l in labels),\n                \"allow_ok\": (not allow) or (author.lower() in allow),\n                \"has_state\": bool(it),\n                \"st_processed\": bool(it.get(\"processed\")),\n                \"st_blocked\": bool(it.get(\"blocked\")),\n                \"st_inflight\": bool(it.get(\"in_flight_since\")),\n                \"st_retry_after\": float(it.get(\"retry_after\") or 0),\n                \"st_screener_streak\": int(it.get(\"screener_retry_streak\") or 0),\n                \"wakeup_deps\": list(it.get(\"wakeup_deps\") or []),\n                \"issue_today\": issue_today.get(\"%s#%s\" % (repo_full, num), 0),\n                \"author_today\": author_today.get(author.lower(), 0),\n                \"author_exempt\": author.lower() in exempt,\n                \"g_inflight\": g_inflight, \"g_max\": g_max,\n                \"r_inflight\": r_inflight.get(slug, 0),\n                \"r_limit\": r_limits.get(repo_full, -1),\n                \"issue_daily\": issue_daily, \"author_daily\": author_daily,\n                \"now_ts\": now_ts,\n            })\n    return {\"items\": items, \"errors\": errors, \"generated_at\": now_ts,\n            \"g_inflight\": g_inflight, \"g_max\": g_max, \"repos_scanned\": len(repos)}\n",
+   "code": "\ndef run(input):\n    import json, os, subprocess, time\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    # ---- keeper 配置（pipeline_repos / 闸门参数）\n    try:\n        import yaml\n        cfg = yaml.safe_load(open(os.path.join(IK, \"config.yaml\"), encoding=\"utf-8\")) or {}\n    except Exception as e:\n        return {\"error\": \"config 读取失败: %s\" % e, \"items\": [], \"errors\": [],\n                \"generated_at\": int(time.time()), \"g_inflight\": 0, \"g_max\": 0, \"repos_scanned\": 0}\n    repos = {k: v for k, v in (cfg.get(\"pipeline_repos\") or {}).items()\n             if (v or {}).get(\"mode\") != \"readonly\"}\n    g_max = int(cfg.get(\"pipeline_max_in_flight\") or 0)\n    r_limits = {str(k): int(v) for k, v in (cfg.get(\"pipeline_repo_limits\") or {}).items()}\n    issue_daily = int(cfg.get(\"pipeline_issue_daily_limit\") or 0)\n    author_daily = int(cfg.get(\"author_daily_limit\") or 0)\n    exempt = {str(a).lower() for a in (cfg.get(\"author_daily_limit_exempt\") or [])}\n    allow = {str(a).lower() for a in (cfg.get(\"author_allowlist\") or [])}\n    # 2026-10-08 外部验收闭环（jeffkit 拍板）：external_authors = 不在 allowlist 的\n    # 外部作者，其 issue 同样接单开发（screener 照走；验收由 issue-accept flow 承接）。\n    external = {str(a).lower() for a in (cfg.get(\"external_authors\") or [])}\n    optout = [str(x) for x in (cfg.get(\"opt_out_labels\") or [\"keeper-ignore\"])]\n    # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）\n    try:\n        st = json.load(open(os.path.join(IK, \"state.json\"), encoding=\"utf-8\"))\n    except Exception:\n        st = {\"repos\": {}}\n    srepos = st.get(\"repos\") or {}\n    # ---- 在途计数（镜像 keeper _count_in_flight：全网 in_flight_since 逐仓累计）\n    g_inflight = 0\n    r_inflight = {}\n    for slug, rv in srepos.items():\n        for _num, it in (((rv or {}).get(\"items\")) or {}).items():\n            if it.get(\"in_flight_since\"):\n                g_inflight += 1\n                r_inflight[slug] = r_inflight.get(slug, 0) + 1\n    # ---- 台账 runs.jsonl：今日有效 run 计数（与 keeper 同口径：非终态类才计额度）\n    NON_QUOTA = (\"retry-later\", \"failed\", \"guarded\", \"partial\")\n    today = time.strftime(\"%Y-%m-%d\")\n    issue_today, author_today = {}, {}\n    try:\n        with open(os.path.join(IK, \"pipeline\", \"runs.jsonl\"), encoding=\"utf-8\") as fh:\n            for line in fh:\n                line = line.strip()\n                if not line:\n                    continue\n                try:\n                    rec = json.loads(line)\n                except Exception:\n                    continue\n                if not str(rec.get(\"ts\", \"\")).startswith(today):\n                    continue\n                if rec.get(\"status\") in NON_QUOTA:\n                    continue\n                key = \"%s#%s\" % (rec.get(\"repo\"), rec.get(\"issue\"))\n                issue_today[key] = issue_today.get(key, 0) + 1\n                au = (rec.get(\"author\") or \"\").lower()\n                if au:\n                    author_today[au] = author_today.get(au, 0) + 1\n    except Exception:\n        pass\n    # ---- 扫单（gh，按仓并行——sandbox 墙钟默认 10s，串行 14 仓必超）\n    now_ts = time.time()\n    items, errors = [], []\n    def _scan(repo_full):\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"list\", \"--repo\", repo_full, \"--state\", \"open\",\n                                \"--limit\", \"100\",\n                                \"--json\", \"number,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            if p.returncode != 0:\n                return repo_full, None, \"gh exit=%s %s\" % (p.returncode, (p.stderr or \"\").strip()[:160])\n            return repo_full, json.loads(p.stdout or \"[]\"), None\n        except Exception as e:\n            return repo_full, None, str(e)[:160]\n    import concurrent.futures as _cf\n    with _cf.ThreadPoolExecutor(max_workers=6) as ex:\n        scanned = list(ex.map(_scan, sorted(repos)))\n    for repo_full, issues, err in scanned:\n        if err is not None:\n            errors.append(\"%s: %s\" % (repo_full, err))\n            continue\n        slug = repo_full.replace(\"/\", \"-\")\n        for iss in issues:\n            num = iss.get(\"number\")\n            it = (((srepos.get(slug) or {}).get(\"items\") or {}).get(str(num))) or {}\n            author = ((iss.get(\"author\") or {}).get(\"login\") or \"\")\n            labels = [l.get(\"name\") for l in (iss.get(\"labels\") or []) if isinstance(l, dict)]\n            items.append({\n                \"repo\": repo_full, \"number\": num,\n                \"title\": (iss.get(\"title\") or \"\")[:120],\n                \"author\": author, \"labels\": labels,\n                \"created_at\": iss.get(\"createdAt\") or \"\",\n                \"updated_at\": iss.get(\"updatedAt\") or \"\",\n                \"opt_out\": any(l in optout for l in labels),\n                \"allow_ok\": (not allow) or (author.lower() in allow),\n                \"external_ok\": author.lower() in external,\n                \"has_state\": bool(it),\n                \"st_processed\": bool(it.get(\"processed\")),\n                \"st_blocked\": bool(it.get(\"blocked\")),\n                \"st_inflight\": bool(it.get(\"in_flight_since\")),\n                \"st_retry_after\": float(it.get(\"retry_after\") or 0),\n                \"st_screener_streak\": int(it.get(\"screener_retry_streak\") or 0),\n                \"wakeup_deps\": list(it.get(\"wakeup_deps\") or []),\n                \"issue_today\": issue_today.get(\"%s#%s\" % (repo_full, num), 0),\n                \"author_today\": author_today.get(author.lower(), 0),\n                \"author_exempt\": author.lower() in exempt,\n                \"g_inflight\": g_inflight, \"g_max\": g_max,\n                \"r_inflight\": r_inflight.get(slug, 0),\n                \"r_limit\": r_limits.get(repo_full, -1),\n                \"issue_daily\": issue_daily, \"author_daily\": author_daily,\n                \"now_ts\": now_ts,\n            })\n    return {\"items\": items, \"errors\": errors, \"generated_at\": now_ts,\n            \"g_inflight\": g_inflight, \"g_max\": g_max, \"repos_scanned\": len(repos)}\n",
    "input": {
     "ik_home": "$INPUT.ik_home"
    },
@@ -34,7 +34,7 @@
     "repo_root": "$INPUT.repo_root"
    },
    "next": "rep",
-   "source_line": 206
+   "source_line": 210
   },
   {
    "type": "code",
@@ -50,7 +50,7 @@
     "dispatch_repos": "$INPUT.dispatch_repos"
    },
    "next": "ret_rep",
-   "source_line": 352
+   "source_line": 356
   },
   {
    "type": "end",
@@ -58,8 +58,8 @@
    "output": "$NODE.rep",
    "resultType": "success",
    "name": "return rep",
-   "desc": "return rep（第 392 行）",
-   "source_line": 392
+   "desc": "return rep（第 396 行）",
+   "source_line": 396
   },
   {
    "type": "map",
@@ -85,8 +85,8 @@
        "value": true
       },
       "name": "x.st_processed == True?",
-      "desc": "if x.st_processed == True（第 155 行）",
-      "source_line": 155,
+      "desc": "if x.st_processed == True（第 159 行）",
+      "source_line": 159,
       "next": "_n14",
       "else_next": "opt_out_eq_true"
      },
@@ -99,8 +99,8 @@
        "value": true
       },
       "name": "x.opt_out == True?",
-      "desc": "if x.opt_out == True（第 158 行）",
-      "source_line": 158,
+      "desc": "if x.opt_out == True（第 162 行）",
+      "source_line": 162,
       "next": "_n13",
       "else_next": "st_inflight_eq_true"
      },
@@ -113,8 +113,8 @@
        "value": true
       },
       "name": "x.st_inflight == True?",
-      "desc": "if x.st_inflight == True（第 161 行）",
-      "source_line": 161,
+      "desc": "if x.st_inflight == True（第 165 行）",
+      "source_line": 165,
       "next": "_n12",
       "else_next": "st_retry_after_gt_now_ts"
      },
@@ -127,22 +127,32 @@
        "value": "$INPUT.item.now_ts"
       },
       "name": "x.st_retry_after > x.now_ts?",
-      "desc": "if x.st_retry_after > x.now_ts（第 164 行）",
-      "source_line": 164,
+      "desc": "if x.st_retry_after > x.now_ts（第 168 行）",
+      "source_line": 168,
       "next": "_n11",
-      "else_next": "allow_ok_ne_true"
+      "else_next": "allow_ok_ne_true_and_ext"
      },
      {
       "type": "if",
-      "id": "allow_ok_ne_true",
+      "id": "allow_ok_ne_true_and_ext",
       "condition": {
-       "field": "$INPUT.item.allow_ok",
-       "operator": "ne",
-       "value": true
+       "relation": "and",
+       "conditions": [
+        {
+         "field": "$INPUT.item.allow_ok",
+         "operator": "ne",
+         "value": true
+        },
+        {
+         "field": "$INPUT.item.external_ok",
+         "operator": "ne",
+         "value": true
+        }
+       ]
       },
-      "name": "x.allow_ok != True?",
-      "desc": "if x.allow_ok != True（第 167 行）",
-      "source_line": 167,
+      "name": "x.allow_ok != True and x.ex…",
+      "desc": "if x.allow_ok != True and x.external_ok != True（第 171 行）",
+      "source_line": 171,
       "next": "_n10",
       "else_next": "author_exempt_ne_true_an"
      },
@@ -171,7 +181,7 @@
       },
       "name": "x.author_exempt != True and…",
       "desc": "if x.author_exempt != True and x.author_daily > 0 and (x.author_today >= x.auth…",
-      "source_line": 170,
+      "source_line": 174,
       "next": "_n9",
       "else_next": "issue_daily_gt_0_and_iss"
      },
@@ -194,8 +204,8 @@
        ]
       },
       "name": "x.issue_daily > 0 and x.iss…",
-      "desc": "if x.issue_daily > 0 and x.issue_today >= x.issue_daily（第 173 行）",
-      "source_line": 173,
+      "desc": "if x.issue_daily > 0 and x.issue_today >= x.issue_daily（第 177 行）",
+      "source_line": 177,
       "next": "_n8",
       "else_next": "st_blocked_eq_true"
      },
@@ -208,8 +218,8 @@
        "value": true
       },
       "name": "x.st_blocked == True?",
-      "desc": "if x.st_blocked == True（第 176 行）",
-      "source_line": 176,
+      "desc": "if x.st_blocked == True（第 180 行）",
+      "source_line": 180,
       "next": "_n7",
       "else_next": "st_screener_streak_gt_0"
      },
@@ -222,8 +232,8 @@
        "value": 0
       },
       "name": "x.st_screener_streak > 0?",
-      "desc": "if x.st_screener_streak > 0（第 179 行）",
-      "source_line": 179,
+      "desc": "if x.st_screener_streak > 0（第 183 行）",
+      "source_line": 183,
       "next": "_n6",
       "else_next": "g_max_gt_0_and_g_infligh"
      },
@@ -246,8 +256,8 @@
        ]
       },
       "name": "x.g_max > 0 and x.g_infligh…",
-      "desc": "if x.g_max > 0 and x.g_inflight >= x.g_max（第 182 行）",
-      "source_line": 182,
+      "desc": "if x.g_max > 0 and x.g_inflight >= x.g_max（第 186 行）",
+      "source_line": 186,
       "next": "_n5",
       "else_next": "r_limit_eq_0"
      },
@@ -260,8 +270,8 @@
        "value": 0
       },
       "name": "x.r_limit == 0?",
-      "desc": "if x.r_limit == 0（第 186 行）",
-      "source_line": 186,
+      "desc": "if x.r_limit == 0（第 190 行）",
+      "source_line": 190,
       "next": "_n4",
       "else_next": "r_limit_gt_0_and_r_infli"
      },
@@ -284,8 +294,8 @@
        ]
       },
       "name": "x.r_limit > 0 and x.r_infli…",
-      "desc": "if x.r_limit > 0 and x.r_inflight >= x.r_limit（第 189 行）",
-      "source_line": 189,
+      "desc": "if x.r_limit > 0 and x.r_inflight >= x.r_limit（第 193 行）",
+      "source_line": 193,
       "next": "_n3",
       "else_next": "has_state_eq_true"
      },
@@ -298,8 +308,8 @@
        "value": true
       },
       "name": "x.has_state == True?",
-      "desc": "if x.has_state == True（第 193 行）",
-      "source_line": 193,
+      "desc": "if x.has_state == True（第 197 行）",
+      "source_line": 197,
       "next": "_n2",
       "else_next": "_n1"
      },
@@ -318,7 +328,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 196
+      "source_line": 200
      },
      {
       "type": "end",
@@ -335,7 +345,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 194
+      "source_line": 198
      },
      {
       "type": "end",
@@ -353,7 +363,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 190
+      "source_line": 194
      },
      {
       "type": "end",
@@ -369,7 +379,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 187
+      "source_line": 191
      },
      {
       "type": "end",
@@ -387,7 +397,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 183
+      "source_line": 187
      },
      {
       "type": "end",
@@ -404,7 +414,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 180
+      "source_line": 184
      },
      {
       "type": "end",
@@ -421,7 +431,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 177
+      "source_line": 181
      },
      {
       "type": "end",
@@ -438,7 +448,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 174
+      "source_line": 178
      },
      {
       "type": "end",
@@ -455,7 +465,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 171
+      "source_line": 175
      },
      {
       "type": "end",
@@ -466,12 +476,12 @@
        "title": "$INPUT.item.title",
        "author": "$INPUT.item.author",
        "decision": "skip",
-       "reason": "作者不在 allowlist"
+       "reason": "作者不在 allowlist/external_authors"
       },
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 168
+      "source_line": 172
      },
      {
       "type": "end",
@@ -487,7 +497,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 165
+      "source_line": 169
      },
      {
       "type": "end",
@@ -503,7 +513,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 162
+      "source_line": 166
      },
      {
       "type": "end",
@@ -519,7 +529,7 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 159
+      "source_line": 163
      },
      {
       "type": "end",
@@ -535,12 +545,12 @@
       "resultType": "success",
       "name": "return {'repo': x.repo, 'nu…",
       "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 156
+      "source_line": 160
      }
     ]
    },
    "next": "disp",
-   "source_line": 154
+   "source_line": 158
   }
  ]
 }
