@@ -2063,8 +2063,8 @@ def _dispatch_shadow_execution(config, binding, res, label: str,
         "repo": binding.cwd,
         "run_id": run_id,
         "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
-        "agent": pc.agent or "deepseek-flash",
-        "reviewer": pc.reviewer or "deepseek-flash",
+        "agent": pc.agent or "glm53-flash",
+        "reviewer": pc.reviewer or "glm53-flash",
         "shadow": True,          # 供 flow/worker 侧识别并强制不落地（阶段 1a 后启用）
     }
     try:

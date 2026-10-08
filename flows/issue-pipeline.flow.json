@@ -761,7 +761,7 @@
   {
    "type": "agentrun",
    "id": "reply_prep_fail",
-   "agent": "deepseek-flash",
+   "agent": "glm53-flash",
    "repo": "$INPUT.main_clone",
    "timeout_secs": 600,
    "prompt": "为 GitHub issue 写评论（直接给正文）：工作目录准备失败，自动处理停止。失败信息：{% $NODE.wt_prep.note %}；输出尾部：{% $NODE.wt_prep.error %}。请维护者检查该仓 `.worktrees/issue-N` 是否被外部回收、或管线分支是否被占用。纯文本 3-5 句，不要出现任何本机路径或凭据信息。",
