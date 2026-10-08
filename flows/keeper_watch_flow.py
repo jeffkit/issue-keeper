@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""keeper-watch —— B 值守 flow（影子期 v0.1；ctrl 队列专用）。
+"""keeper-watch —— B 值守 flow（值守版 v0.2；ctrl 队列专用）。
 
-jeffkit 2026-10-08 拍板「值守 flow 化 + 事件分类分队列」的第一件：
-B 班巡检以 flow 形态跑在 `plaita:flow:queue:ctrl`（Mac 专用 worker-ctrl-1），
-与管线 v2 队列完全隔离。影子期 = 只读观察（不碰 GitHub/state/磁盘/服务），
-产出落 controller 台账（rounds.log + 滚动 handoff），与现役 zcode B 并行对账。
+jeffkit 2026-10-08 拍板「值守 flow 化 + 事件分类分队列」；影子对账当日 5/5 一致后
+提前进 Phase 2（jeffkit：「一天下来已经好多次了，基本够了」）——本版接管 B 班
+动作权：巡检 + **按权限行动**（磁盘回收/reopen/回评/指令板处置/简报发帖），
+zcode B 降为每日抽查。跑在 `plaita:flow:queue:ctrl`（Mac worker-ctrl-1），
+与管线 v2 队列完全隔离。
 
 图结构（引擎逻辑在图里；CODE 只做 IO 叶子）：
   facts（CODE：远端 keeper/队列/磁盘 + shadow 快照，全 ssh 只读）
     → triage（CODE：纯规则判定 → findings + report JSON 字符串）
     → watch（AGENTRUN：glm53-flash，repo=大仓根；读最新滚动 handoff + 内嵌 facts，
-             产出本轮简报；影子期禁止一切变更动作）
-    → finish（CODE：简报落 rounds.log 一行 + 新滚动 handoff 文件）
+             执行值守动作【红线内】+ 简报发 #3）
+    → finish（CODE：总结落 rounds.log 一行 + 新滚动 handoff 文件）
 
-运行前提：Mac worker（~/.plaita/agents.json 有 glm53-flash；env.sh 有 GLM key；
-ssh tcloud_gz 免密）。发布三步配方见 controller/duty-as-flow-proposal-20261008.md。
+红线（写死在 agent 提示词）：iOS 模拟器绝不动；删 */target 前必查 ~/.local/bin
+软链；live run target 与 ~/.cargo/registry 不可删；不重启任何 worker/keeper
+（重启=升级 #2 报请）；不代推他人提交；重大拍板 → #2 留言不擅动。
+
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
         python3 flows/build_keeper_watch.py
 """
@@ -26,7 +29,7 @@ from plaita.node import register_code_node
 register_code_node(default_backend="subprocess")
 
 
-@flow("keeper-watch", desc="【值守·B 班影子】ctrl 队列只读巡检：facts→triage→agent 简报→rounds+滚动 handoff")
+@flow("keeper-watch", desc="【值守·B 班】ctrl 队列巡检+动作（红线内）：facts→triage→agent 值守轮→rounds+滚动 handoff")
 def keeper_watch(INPUT):
     # ── ① facts（IO 叶子：全只读；每条命令独立超时，失败置 None 不炸节点）─────
     facts = CODE(id="facts", lang="python", input={}, code="""
@@ -70,45 +73,51 @@ def run(input):
     findings = []
 
     df = str(f.get("df_remote") or "")
-    m = re.search(r"(\\d+)%?\\s+/$", df)
     m2 = re.search(r"(\\d+(?:\\.\\d+)?)G\\s+\\d+%?\\s*$", df) or re.search(r"\\s(\\d+(?:\\.\\d+)?)G\\s", df)
     if df:
         try:
             avail = float(m2.group(1)) if m2 else None
             if avail is not None and avail < 20:
-                findings.append(f"远端磁盘可用 {avail}G < 20G 守线")
+                findings.append(f"远端磁盘可用 {avail}G < 20G 守线 → 按 playbook 红线回收可再生层")
         except Exception:
             pass
 
     errs = str(f.get("keeper_err_tail") or "")
     n_err = len([l for l in errs.splitlines() if "ERROR" in l])
     if n_err:
-        findings.append(f"keeper 日志近尾有 {n_err} 条 ERROR（见 facts）")
+        findings.append(f"keeper 日志近尾有 {n_err} 条 ERROR（见 facts，需判读）")
 
     sd = f.get("shadow_dispatch") or {}
     if sd.get("would_dispatch") is None:
-        findings.append("shadow latest.json 不可读或缺失（派发环可能停摆）")
+        findings.append("shadow latest.json 不可读或缺失（派发环可能停摆）→ 查 sched/timer 与 keeper 日志")
 
     report = json.dumps({"facts": f, "findings": findings}, ensure_ascii=False)
     return {"findings": findings, "report": report}
 """)
 
-    # ── ③ watch（AGENTRUN：glm53-flash 宿主直跑；影子期只读纪律写进提示词）────
+    # ── ③ watch（AGENTRUN：glm53-flash 宿主直跑；值守动作权+红线写死提示词）───
     watch = AGENTRUN(agent="glm53-flash",
                      repo="/Users/kong/projects/infra4agent",
-                     timeout_secs=1200,
+                     timeout_secs=1500,
                      prompt=F.concat(
-        "你是 infra4agent 大仓「B 值守」的影子轮（keeper-watch flow；只读观察）。\n"
-        "任务：产出本轮巡检简报。步骤：\n"
-        "1) 读磁盘上最新一份滚动交接：`ls -t ~/.issue-keeper/pipeline/controller/handoffs/B-handoff-*.md | head -1` 然后读它"
-        "（这是你的上下文：在途/退避/观察项/口径）。\n"
-        "2) 结合下面这份实时 facts JSON（远端 keeper/队列/磁盘 + 规则 findings）：\n<<<FACTS>>>\n"
-        "3) 产出 markdown 简报，≤40 行，三段：**盘面**（一两行）/ **异常与观察**（对照 handoff 的观察项，"
-        "无异常就写「无新增」）/ **建议**（给主控/值守的动作建议；影子期只建议不执行）。\n"
-        "铁律：禁止一切变更动作——不 reopen、不删文件、不重启服务、不发 GitHub 评论、不改 state；"
-        "你的唯一产出就是这份简报文本。\n", NODE.triage.report, "\n<<<END FACTS>>>\n"))
+        "你是 infra4agent 大仓「B 值守」（keeper-watch flow 正班；jeffkit 委托授权，"
+        "代表其做派发健康监督、磁盘守卫与卡单处置）。\n"
+        "本轮步骤：\n"
+        "1) 读磁盘上最新一份滚动交接：`ls -t ~/.issue-keeper/pipeline/controller/handoffs/B-handoff-*.md | head -1` 并读它"
+        "（在途/退避/观察项/口径——你的上下文）。\n"
+        "2) 读 `~/.issue-keeper/pipeline/controller/directives.md`：所有 status=issued 且 target 含 B 的条目 →"
+        " 执行并在条目下追加回执行（ack:/done:/prog:，带时间与证据）。\n"
+        "3) 结合实时 facts JSON（<<<FACTS>>>)：按 playbook（~/.issue-keeper/pipeline/controller/playbook.md）"
+        "执行必要动作——磁盘回收（红线内可再生层）、卡单 reopen（ssh 配方见 handoff）、明显卡死的派发环处置。\n"
+        "4) 简报发帖：把本轮简报（盘面/动作/异常与观察/建议，≤40 行 markdown）写到 /tmp/kw-brief.md 后"
+        " `gh issue comment 3 -R jeffkit/infra4agent --body-file /tmp/kw-brief.md`；"
+        "需 jeffkit 拍板的事项发 #2（`gh issue comment 2 -R jeffkit/infra4agent`）报请，不擅动。\n"
+        "5) 你的最终输出=本轮总结（做了什么/发现什么/移交下一轮什么，≤30 行）。\n"
+        "红线（违反=事故）：iOS 模拟器相关绝不动；删任何 */target 或缓存目录前必查 `~/.local/bin` 软链指向；"
+        "live run 的 worktree target 与 `~/.cargo/registry` 不可删；不重启任何 worker/keeper/调度服务"
+        "（需要重启 → #2 报请）；不代推他人提交；不动 A 班与主控的 automation；DLQ 只记不清。\n", NODE.triage.report, "\n<<<END FACTS>>>\n"))
 
-    # ── ④ finish（IO 叶子：简报落 rounds.log 一行 + 新滚动 handoff）──────────
+    # ── ④ finish（IO 叶子：总结落 rounds.log 一行 + 新滚动 handoff）──────────
     finish = CODE(id="finish",
                   lang="python",
                   input={"text": NODE.watch.text, "report": NODE.triage.report},
@@ -126,15 +135,15 @@ def run(input):
         pass
 
     one = " ".join(text.strip().splitlines()[0:1])[:160]
-    line = (f"{ts} B-flow 轮次=keeper-watch（影子） "
-            f"落地=简报落 handoffs/B-handoff-{stamp}.md "
+    line = (f"{ts} B-flow 轮次=keeper-watch（值守） "
+            f"落地=简报发 #3 + handoffs/B-handoff-{stamp}.md "
             f"findings={len(findings)} 摘要={one}\\n")
     with open(base / "rounds.log", "a", encoding="utf-8") as fh:
         fh.write(line)
 
-    hd = (f"# B 班滚动交接（keeper-watch 影子轮 {ts} 自动生成）\\n\\n"
+    hd = (f"# B 班滚动交接（keeper-watch 值守轮 {ts} 自动生成）\\n\\n"
           f"**findings**：{json.dumps(findings, ensure_ascii=False)}\\n\\n"
-          f"**简报**：\\n\\n{text}\\n\\n"
+          f"**本轮总结**：\\n\\n{text}\\n\\n"
           f"---\\n（本文件由 keeper-watch flow 生成；下一轮开机读最新 B-handoff-*.md）\\n")
     out = base / "handoffs" / f"B-handoff-{stamp}.md"
     out.write_text(hd, encoding="utf-8")
