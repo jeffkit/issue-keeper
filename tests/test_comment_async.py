@@ -149,7 +149,8 @@ class TestSpawnAndCollect:
 
 class TestCapAndSerial:
     def test_global_cap_blocks_dispatch(self, tmp_path, monkeypatch):
-        state = _state_with_tasks(3)
+        # #19 后计数只算存活 pid：用 pid=1（恒存在）模拟 3 条真实在途任务
+        state = _state_with_tasks(3, pid=1)
         assert _count_comment_tasks(state) == 3
         comments = [_comment("c9")]
         dispatched = []

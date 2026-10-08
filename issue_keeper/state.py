@@ -206,6 +206,39 @@ _REOPEN_OWNED_FIELDS = ("processed", "blocked", "wakeup_deps", "retry_after",
                         "manual_reopen_at")
 
 
+def drop_orphan_comment_tasks(state: State, open_keys: set[str],
+                              skip_slugs: set[str] | None = None) -> int:
+    """清掉所有 closed 资源上的评论任务记录（#19 永久孤儿）。
+
+    评论任务只靠 _process_resource 收尸，而它只看 open 资源——issue 一旦关闭，
+    记录就永远没人收，最终占满 comment_max_in_flight 全局闸（3 条陈尸 →
+    全仓评论停摆 4 天）。open_keys = 本轮扫描到的 open 资源 key 集合
+    （"<repo_slug>:<resource_key>"，跨仓去重，与 ItemState 索引同构）；
+    不在集合里的 comment_tasks 记录视为孤儿，只清记录不回评——进程早死且
+    issue 已关，回评发在关闭单上无意义。
+
+    skip_slugs：本轮列表调用失败的 repo_slug。「不在 open_keys」有两种成因——
+    真关闭，或这一轮压根没列出来（gh/网络抖动）。后者删记录等于删掉还活着的
+    在途任务的收尸凭据（属主同轮也被同一故障挡住，没人收；下轮记录没了，
+    输出文件成孤儿，回评永远发不出）。列表没成功的仓整仓跳过，真孤儿下轮再清。
+
+    返回清除的记录数。
+    """
+    skip = skip_slugs or set()
+    n = 0
+    for slug, rs in state.repos.items():
+        if slug in skip:
+            continue
+        for key, it in rs.items.items():
+            if not it.comment_tasks:
+                continue
+            if f"{slug}:{key}" in open_keys:
+                continue
+            n += len(it.comment_tasks)
+            it.comment_tasks = {}
+    return n
+
+
 def save_state_merged(path: Path, state: State, base: State) -> None:
     """轮尾合并写：持锁重读盘上状态，只把 `state` 相对 `base` 变过的字段写回。
 

@@ -31,7 +31,7 @@ from .profile import (
 from .reply import polish
 from .screener import ScreenerConfig, Verdict, screen as screen_text
 from .sources import IssueSource, Resource, make_source
-from .state import ItemState, State, load_state, save_state_item, save_state_merged
+from .state import ItemState, State, drop_orphan_comment_tasks, load_state, save_state_item, save_state_merged
 
 log = logging.getLogger("issue-keeper")
 
@@ -735,7 +735,9 @@ def _process_resource(
             _safe_move(src, binding, res, "doing", actor=c.author,
                        actor_type="human", comment=f"收到新评论，重新打开")
 
-        # 全局并发上限（跨仓评论 agent；保护 GLM 配额——2026-10-01 配额爆量教训）
+        # 全局并发上限（跨仓评论 agent；保护 GLM 配额——2026-10-01 配额爆量教训）。
+        # #19：账本口径≠容量口径——陈尸记录（进程已死）不计入，闸门不会被
+        # 永久占满；记录本身的清除仍由收尸/轮末孤儿清扫负责（不在这儿删）。
         if _count_comment_tasks(state) >= max(1, config.comment_max_in_flight):
             log.info("[%s] 评论 agent 并发已达上限 (%d)，本轮不派发新评论",
                      label, config.comment_max_in_flight)
@@ -828,6 +830,8 @@ def run_once(config: Config) -> int:
     total = _reap_pipelines(config, state, config.repos)
     profile_cache: dict[str, ProfileEntry] = {}
     source_cache: dict[str, IssueSource] = {}
+    open_keys: set[str] = set()  # #19：本轮扫到的 open 资源（repo_slug:resource_key）
+    list_failed_slugs: set[str] = set()  # #19：列表失败的仓——本轮孤儿清扫整仓跳过
     for binding in config.repos:
         kinds = ["issue"] + (["pr"] if binding.monitor_prs else [])
         log.info(
@@ -836,6 +840,26 @@ def run_once(config: Config) -> int:
             _agent_label(binding, config), kinds,
         )
         total += process_repo(binding, config, state, profile_cache, source_cache)
+        for kind in kinds:
+            try:
+                src = _ensure_source(binding, source_cache)
+                open_keys.update(f"{binding.repo_slug}:{r.resource_key}"
+                                 for r in src.list_open(binding.repo, [kind],
+                                                        binding.labels if kind == "issue" else None))
+            except Exception as e:
+                list_failed_slugs.add(binding.repo_slug)
+                log.warning("[%s] 列 open 资源失败（#19 孤儿收尸本轮跳过）: %s",
+                            binding.repo, e)
+    # #19：收掉 closed 资源上的孤儿评论任务记录（_process_resource 只见 open，
+    # closed 资源的 comment_tasks 永远没人收 → 占满全局并发闸）。
+    # 列表失败的仓必须排除：「不在 open_keys」≠「已关闭」——这轮压根没列出来，
+    # 在途任务（pid 活着、回评还没发）的记录被删就永远没人收尸发布了。
+    n_orphan = drop_orphan_comment_tasks(state, open_keys,
+                                         skip_slugs=list_failed_slugs)
+    if n_orphan:
+        log.info("#19 孤儿评论任务：清除 %d 条记录（对应 issue 已关闭）", n_orphan)
+    if list_failed_slugs:
+        log.info("#19 孤儿收尸本轮跳过仓库: %s", ", ".join(sorted(list_failed_slugs)))
     # keeper 巡检：代人类 review / 主动分诊（按 interval_cycles 节流）
     total += keeper_patrol(config, state, profile_cache, source_cache)
     save_state_merged(config.state_path, state, base)
@@ -1574,11 +1598,15 @@ def _comment_proc_alive(pid, popen) -> bool:
 
 
 def _count_comment_tasks(state) -> int:
-    """全局在途评论任务数（跨仓；按任务记录计数——死任务由收尸清除）。"""
+    """全局在途评论任务数（跨仓）。只计**存活**任务：pid 已死的记录可能只是
+    「agent 跑完、还没轮到属主收尸发布」，不能算容量，更不能在这儿删——
+    删了属主就读不到输出、回评丢了（#19：3 条死记录曾恒占满闸门）。"""
     n = 0
     for rs in state.repos.values():
         for it in rs.items.values():
-            n += len(getattr(it, "comment_tasks", None) or {})
+            for task in (getattr(it, "comment_tasks", None) or {}).values():
+                if _comment_proc_alive(int(task.get("pid") or 0), None):
+                    n += 1
     return n
 
 
