@@ -187,13 +187,18 @@ def run(input):
         pa = it.get("progress_age_min")
         age = it.get("in_flight_min") or 0
         if st in TERMINAL:
-            # keeper 收尸是轮询制（轮间隔数分钟），刚终态就报=噪声——2026-10-09
-            # 实测 plaita#31 终态后 3 分钟即被 keeper 落账，1 分钟时报警属误报。
-            if age >= lag_min:
+            # keeper 收尸是轮询制（轮间隔数分钟）。⚠️ 判据必须用**终态以来的时长**，
+            # 而不是总在途时长——后者会让任何跑过 lag_min 的 run 一完成就误报
+            # （2026-10-09 18:59 实测：recursive#148 刚落地推送 main，即被报成
+            #  「已终态但 keeper 仍算在途 137 分钟」，而 keeper 只是还没轮到收尸）。
+            lag = it.get("progress_age_min")
+            if lag is None:
+                lag = it.get("last_node_ended_age_min")
+            if lag is not None and lag >= lag_min:
                 terminal_lag.append(it)
                 findings.append({"severity": "critical",
-                                 "summary": "%s 执行已终态（%s）但 keeper 仍算在途 %.0f 分钟——收尸滞后"
-                                            % (label, st, age), "escalate": True})
+                                 "summary": "%s 执行已终态（%s）已 %.0f 分钟未收账（在途共 %.0f 分钟）——收尸滞后"
+                                            % (label, st, lag, age), "escalate": True})
             continue
         # ① 末节点结束已久：**先分清长节点与卡死**——impl 类节点单跑 60-120 分钟且
         # 中途不写状态，所以「末节点结束 60 分钟」本身正常（2026-10-09 实测：据此
