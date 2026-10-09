@@ -4,11 +4,16 @@
 > `issue_pipeline_flow.py`（@flow 源码），JSON 是编译产物不要手改**：
 >
 > ```bash
-> python3 flows/build_issue_pipeline.py     # 需 PYTHONPATH 含 plaita 与 plaita-nodes/src
+> python3 flows/build_flows.py issue-pipeline   # 需 PYTHONPATH 含 plaita 与 plaita-nodes/src
 > ```
 >
 > 已验证：codeflow 编译 ✓、plaita `validate_flow_ir` ✓（v0.3 重建后 69 节点）。
 > 未做端到端真跑。
+>
+> **2026-10-09 编译收敛**：六个 per-flow `build_*.py` 样板脚本收敛为
+> `build_flows.py`（plaita CLI 薄壳）；产物格式统一切 plaita canonical
+> （console 正典形态，与旧 compile_source 直出 IR parse 等价，bridge 两种
+> 都吃）。重建后六产物与旧版节点集/类型零差异、`validate_flow_ir` 全绿。
 
 ## v0.3（2026-09-30）：per-repo 契约化——通用 flow 剥离单仓形状
 
@@ -342,7 +347,7 @@ console 侧 cancel 不杀进程树（本地档纯改状态、队列档只在节�
 - **定义源**：`payload.console` 有 url+api_key 时拉 console 已发布定义（semver
   最高），TTL 内用缓存；console 不可达退 stale 缓存；缓存也没有退仓内
   `issue-pipeline.flow.json`。台账记 `flow_source`/`flow_version`。
-  改 flow 的发布环：`build_issue_pipeline.py` 重编译 → console 建/存/发布新
+  改 flow 的发布环：`build_flows.py issue-pipeline` 重编译 → console 建/存/发布新
   semver（`POST /api/flows`、`PUT /api/flows/{id}/versions/{v}`、
   `POST /api/flows/{id}/publish`）；当前已发布 **v2.1.2**（2.1.2：`wt_prep` 幂等建树 +
   setup 缺 cwd 降级回评，#13；1.0.1：review/fix_review 600→1800s；1.0.2：code 节点显式

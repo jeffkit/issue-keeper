@@ -1,556 +1,556 @@
 {
- "runtime": "python",
- "flow_id": "keeper-shadow",
- "inputType": {
-  "dataType": "object"
- },
- "desc": "【生产·在用】keeper 派发决策 + intake 承接（screener+派发）——Phase 3 起为派发权持有者；dispatch_repos 空=只读对账；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）",
- "nodes": [
-  {
-   "type": "start",
-   "id": "start",
-   "next": "facts"
+  "runtime": "python",
+  "flow_id": "keeper-shadow",
+  "inputType": {
+    "dataType": "object"
   },
-  {
-   "type": "code",
-   "id": "facts",
-   "language": "python",
-   "code": "\ndef run(input):\n    import json, os, subprocess, time\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    # ---- keeper 配置（pipeline_repos / 闸门参数）\n    try:\n        import yaml\n        cfg = yaml.safe_load(open(os.path.join(IK, \"config.yaml\"), encoding=\"utf-8\")) or {}\n    except Exception as e:\n        return {\"error\": \"config 读取失败: %s\" % e, \"items\": [], \"errors\": [],\n                \"generated_at\": int(time.time()), \"g_inflight\": 0, \"g_max\": 0, \"repos_scanned\": 0}\n    repos = {k: v for k, v in (cfg.get(\"pipeline_repos\") or {}).items()\n             if (v or {}).get(\"mode\") != \"readonly\"}\n    g_max = int(cfg.get(\"pipeline_max_in_flight\") or 0)\n    r_limits = {str(k): int(v) for k, v in (cfg.get(\"pipeline_repo_limits\") or {}).items()}\n    issue_daily = int(cfg.get(\"pipeline_issue_daily_limit\") or 0)\n    author_daily = int(cfg.get(\"author_daily_limit\") or 0)\n    exempt = {str(a).lower() for a in (cfg.get(\"author_daily_limit_exempt\") or [])}\n    allow = {str(a).lower() for a in (cfg.get(\"author_allowlist\") or [])}\n    # 2026-10-08 外部验收闭环（jeffkit 拍板）：external_authors = 不在 allowlist 的\n    # 外部作者，其 issue 同样接单开发（screener 照走；验收由 issue-accept flow 承接）。\n    external = {str(a).lower() for a in (cfg.get(\"external_authors\") or [])}\n    # 2026-10-09：按单插队（config pipeline_priority_issues: [\"owner/repo#123\", ...]）\n    # 用途=平台级 P0/P1 缺陷（如 plaita#48 调度器炸穿）优先占用下一个空槽\n    prio_issues = {str(x).strip().lower() for x in (cfg.get(\"pipeline_priority_issues\") or [])}\n    optout = [str(x) for x in (cfg.get(\"opt_out_labels\") or [\"keeper-ignore\"])]\n    # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）\n    try:\n        st = json.load(open(os.path.join(IK, \"state.json\"), encoding=\"utf-8\"))\n    except Exception:\n        st = {\"repos\": {}}\n    srepos = st.get(\"repos\") or {}\n    # ---- 在途计数（镜像 keeper _count_in_flight：全网 in_flight_since 逐仓累计）\n    g_inflight = 0\n    r_inflight = {}\n    for slug, rv in srepos.items():\n        for _num, it in (((rv or {}).get(\"items\")) or {}).items():\n            if it.get(\"in_flight_since\"):\n                g_inflight += 1\n                r_inflight[slug] = r_inflight.get(slug, 0) + 1\n    # ---- 台账 runs.jsonl：今日有效 run 计数（与 keeper 同口径：非终态类才计额度）\n    NON_QUOTA = (\"retry-later\", \"failed\", \"guarded\", \"partial\")\n    today = time.strftime(\"%Y-%m-%d\")\n    issue_today, author_today = {}, {}\n    try:\n        with open(os.path.join(IK, \"pipeline\", \"runs.jsonl\"), encoding=\"utf-8\") as fh:\n            for line in fh:\n                line = line.strip()\n                if not line:\n                    continue\n                try:\n                    rec = json.loads(line)\n                except Exception:\n                    continue\n                if not str(rec.get(\"ts\", \"\")).startswith(today):\n                    continue\n                if rec.get(\"status\") in NON_QUOTA:\n                    continue\n                key = \"%s#%s\" % (rec.get(\"repo\"), rec.get(\"issue\"))\n                issue_today[key] = issue_today.get(key, 0) + 1\n                au = (rec.get(\"author\") or \"\").lower()\n                if au:\n                    author_today[au] = author_today.get(au, 0) + 1\n    except Exception:\n        pass\n    # ---- 扫单（gh，按仓并行——sandbox 墙钟默认 10s，串行 14 仓必超）\n    now_ts = time.time()\n    items, errors = [], []\n    def _scan(repo_full):\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"list\", \"--repo\", repo_full, \"--state\", \"open\",\n                                \"--limit\", \"100\",\n                                \"--json\", \"number,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            if p.returncode != 0:\n                return repo_full, None, \"gh exit=%s %s\" % (p.returncode, (p.stderr or \"\").strip()[:160])\n            return repo_full, json.loads(p.stdout or \"[]\"), None\n        except Exception as e:\n            return repo_full, None, str(e)[:160]\n    import concurrent.futures as _cf\n    with _cf.ThreadPoolExecutor(max_workers=6) as ex:\n        scanned = list(ex.map(_scan, sorted(repos)))\n    for repo_full, issues, err in scanned:\n        if err is not None:\n            errors.append(\"%s: %s\" % (repo_full, err))\n            continue\n        slug = repo_full.replace(\"/\", \"-\")\n        for iss in issues:\n            num = iss.get(\"number\")\n            it = (((srepos.get(slug) or {}).get(\"items\") or {}).get(str(num))) or {}\n            author = ((iss.get(\"author\") or {}).get(\"login\") or \"\")\n            labels = [l.get(\"name\") for l in (iss.get(\"labels\") or []) if isinstance(l, dict)]\n            items.append({\n                \"repo\": repo_full, \"number\": num,\n                \"title\": (iss.get(\"title\") or \"\")[:120],\n                \"author\": author, \"labels\": labels,\n                \"created_at\": iss.get(\"createdAt\") or \"\",\n                \"updated_at\": iss.get(\"updatedAt\") or \"\",\n                \"opt_out\": any(l in optout for l in labels),\n                \"allow_ok\": (not allow) or (author.lower() in allow),\n                \"external_ok\": author.lower() in external,\n                \"prio_issue\": (repo_full + \"#\" + str(num)).lower() in prio_issues,\n                \"has_state\": bool(it),\n                \"st_processed\": bool(it.get(\"processed\")),\n                \"st_blocked\": bool(it.get(\"blocked\")),\n                \"st_inflight\": bool(it.get(\"in_flight_since\")),\n                \"st_retry_after\": float(it.get(\"retry_after\") or 0),\n                \"st_screener_streak\": int(it.get(\"screener_retry_streak\") or 0),\n                \"wakeup_deps\": list(it.get(\"wakeup_deps\") or []),\n                \"issue_today\": issue_today.get(\"%s#%s\" % (repo_full, num), 0),\n                \"author_today\": author_today.get(author.lower(), 0),\n                \"author_exempt\": author.lower() in exempt,\n                \"g_inflight\": g_inflight, \"g_max\": g_max,\n                \"r_inflight\": r_inflight.get(slug, 0),\n                \"r_limit\": r_limits.get(repo_full, -1),\n                \"issue_daily\": issue_daily, \"author_daily\": author_daily,\n                \"now_ts\": now_ts,\n            })\n    return {\"items\": items, \"errors\": errors, \"generated_at\": now_ts,\n            \"g_inflight\": g_inflight, \"g_max\": g_max, \"repos_scanned\": len(repos)}\n",
-   "input": {
-    "ik_home": "$INPUT.ik_home"
-   },
-   "next": "gate",
-   "source_line": 37
-  },
-  {
-   "type": "code",
-   "id": "disp",
-   "language": "python",
-   "code": "\ndef run(input):\n    import json, os, re, sys, time\n    allow_raw = [str(x) for x in (input.get(\"dispatch_repos\") or [])]\n    if not allow_raw:\n        return {\"mode\": \"shadow\", \"dispatched\": [], \"note\": \"dispatch_repos 空：纯影子，零写入\"}\n    allow_all = \"*\" in allow_raw\n    allow = set(x for x in allow_raw if x != \"*\")\n    ik = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    root = os.path.expanduser(input.get(\"repo_root\") or \"\")\n    if root and root not in sys.path:\n        sys.path.insert(0, root)\n    # worker 进程 env 不含 keeper 的 env.sh（DEEPSEEK_API_KEY 等）——手工注入，\n    # 否则 screener 的 ${DEEPSEEK_API_KEY} 展开为空、LLM 调用必失败。\n    try:\n        envf = os.path.join(ik, \"env.sh\")\n        for line in open(envf, encoding=\"utf-8\"):\n            m = re.match(r\"[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)=(.+)\", line.strip())\n            if m and m.group(1) not in os.environ:\n                v = m.group(2).split(\" #\", 1)[0].strip()   # 剥行内注释（env.sh 实有）\n                os.environ[m.group(1)] = v.strip('\"').strip(\"'\")\n    except OSError:\n        pass\n    from issue_keeper.config import load_config\n    from issue_keeper.sources import Resource\n    from issue_keeper.state import load_state, save_state_item\n    from issue_keeper import keeper as K\n    cfg = load_config(os.path.join(ik, \"config.yaml\"))\n    st = load_state(cfg.state_path)\n    inflight = sum(1 for rs in st.repos.values()\n                   for it in rs.items.values() if it.in_flight_since)\n    budget = max(0, int(cfg.pipeline_max_in_flight or 0) - inflight)\n    bindings = {b.repo: b for b in cfg.repos}\n    src_cache = {}\n    out = {\"mode\": \"canary\", \"allow\": \"*\" if allow_all else sorted(allow),\n           \"budget_left\": budget, \"screened\": [], \"dispatched\": [], \"skipped\": []}\n\n    def _persist_fields(slug, num, it):\n        def _mut(x):\n            x.blocked = it.blocked\n            x.screener_retry_streak = it.screener_retry_streak\n            x.retry_after = it.retry_after\n            x.in_flight_since = it.in_flight_since\n        save_state_item(cfg.state_path, slug, str(num), _mut)\n\n    # 派发次序对齐 keeper：priority_repos 优先，其次按仓/单号（槽位竞争的公平性）\n    prio = set(cfg.pipeline_priority_repos or [])\n    rows = sorted(input.get(\"rows\") or [],\n                  key=lambda r: (0 if r.get(\"prio_issue\") else 1,\n                                 0 if r.get(\"repo\") in prio else 1,\n                                 r.get(\"repo\") or \"\", int(r.get(\"num\") or 0)))\n    for r in rows:\n        repo, num = r.get(\"repo\"), r.get(\"num\")\n        if r.get(\"decision\") != \"would_dispatch\":\n            continue\n        if not (allow_all or repo in allow):\n            continue\n        if budget <= 0:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"预算用尽（在途到闸）\"})\n            continue\n        b = bindings.get(repo)\n        if b is None:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"无绑定\"})\n            continue\n        # state 的 repo 键约定 = repo 全名 replace(\"/\",\"-\")（keeper 同款；\n        # 用裸仓名会创建幽灵键，reaper 看不到 → run 永不收尾）\n        slug = repo.replace(\"/\", \"-\")\n        it = st.repo(slug).item(str(num))\n        if it.in_flight_since:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"状态已在途（并发窗口）\"})\n            continue\n        pc = cfg.pipeline_repo_cfg(repo)\n        import subprocess\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"view\", str(num), \"--repo\", repo,\n                                \"--json\", \"body,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            d = json.loads(p.stdout or \"{}\") if p.returncode == 0 else {}\n        except Exception:\n            d = {}\n        res = Resource(kind=\"issue\", number=int(num),\n                       title=d.get(\"title\") or r.get(\"title\") or \"\",\n                       body=d.get(\"body\") or \"\",\n                       author=(d.get(\"author\") or {}).get(\"login\") or r.get(\"author\") or \"\",\n                       labels=[l.get(\"name\") for l in (d.get(\"labels\") or []) if isinstance(l, dict)],\n                       state=\"open\", created_at=d.get(\"createdAt\") or r.get(\"created_at\") or \"\",\n                       updated_at=d.get(\"updatedAt\") or r.get(\"updated_at\") or \"\",\n                       status=\"\", actor_type=\"agent\")\n        label = \"%s issue#%s\" % (repo, num)\n        # ── intake 承接：未过筛的单由 flow 走 screener（keeper 库同款语义）──\n        if not r.get(\"has_state\"):\n            try:\n                sc = cfg.screener\n                src = K._ensure_source(b, src_cache)\n                vp = K._visible_prefix(b, cfg)\n                if sc.enabled and K._author_trusted_by_screener(cfg, res.author):\n                    out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"trusted-pass\"})\n                elif sc.enabled:\n                    msg = K._compose_new_message(b, res, src, K._agent_label(b, cfg), cfg)\n                    verdict = K._screen_or_block(msg, sc, label + \" body\")\n                    vd = K._screener_disposition(verdict, sc)\n                    if vd == \"block\":\n                        it.blocked = True\n                        it.screener_retry_streak = 0\n                        if sc.on_unsafe == \"comment\":\n                            K._post_unsafe_notice(src, b, res, cfg.bot_marker, vp,\n                                                  reason=verdict.reason)\n                        _persist_fields(slug, num, it)\n                        out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"block\"})\n                        continue\n                    if vd != \"pass\":\n                        K._hold_for_screener(src, b, cfg, res, sc, it, verdict,\n                                             visible_prefix=vp, label=label)\n                        _persist_fields(slug, num, it)\n                        out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": vd})\n                        continue\n                    out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"pass\"})\n            except Exception as e:\n                out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                       \"why\": \"screener 异常: %s\" % str(e)[:140]})\n                continue\n        # ── 派发（keeper 库同款：payload/产物/锚 一字不差）──\n        try:\n            pres = K._dispatch_pipeline(cfg, b, res, it, label, pc=pc)\n        except Exception as e:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                   \"why\": \"派发异常: %s\" % str(e)[:140]})\n            continue\n        if it.in_flight_since:\n            anchor = it.in_flight_since\n            save_state_item(cfg.state_path, slug, str(num),\n                            lambda x, a=anchor: setattr(x, \"in_flight_since\", a))\n            out[\"dispatched\"].append({\"repo\": repo, \"num\": num,\n                                      \"status\": pres.get(\"status\"), \"label\": label,\n                                      \"anchor\": anchor})\n            budget -= 1\n            out[\"budget_left\"] = budget\n        else:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                   \"why\": \"dispatch 未落锚: %s\" % pres.get(\"status\")})\n    return out\n",
-   "input": {
-    "rows": "$NODE.gate",
-    "dispatch_repos": "$INPUT.dispatch_repos",
-    "ik_home": "$INPUT.ik_home",
-    "repo_root": "$INPUT.repo_root"
-   },
-   "next": "rep",
-   "source_line": 214
-  },
-  {
-   "type": "code",
-   "id": "rep",
-   "language": "python",
-   "code": "\ndef run(input):\n    import json, os, time\n    rows = input.get(\"rows\") or []\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    outdir = os.path.join(IK, \"shadow\")\n    os.makedirs(outdir, exist_ok=True)\n    would = [r for r in rows if r.get(\"decision\") == \"would_dispatch\"]\n    skips = {}\n    for r in rows:\n        if r.get(\"decision\") != \"would_dispatch\":\n            skips[r.get(\"reason\")] = skips.get(r.get(\"reason\"), 0) + 1\n    doc = {\n        \"generated_at\": time.strftime(\"%Y-%m-%d %H:%M:%S\"),\n        \"source\": \"keeper-shadow flow（决策影子 + 可选 canary 派发；对照物=现役 keeper 的 keeper.log 决策）\",\n        \"repos_scanned\": len({r.get(\"repo\") for r in rows}),\n        \"total_open_matched\": len(rows),\n        \"would_dispatch\": len(would),\n        \"skip_by_reason\": skips,\n        \"facts_errors\": input.get(\"facts_errors\") or [],\n        \"dispatch\": input.get(\"dispatch_result\") or {},\n        \"rows\": rows,\n    }\n    stamp = time.strftime(\"%Y%m%d-%H%M%S\")\n    path = os.path.join(outdir, \"decisions-%s.json\" % stamp)\n    for p in (path, os.path.join(outdir, \"latest.json\")):\n        with open(p, \"w\", encoding=\"utf-8\") as fh:\n            json.dump(doc, fh, ensure_ascii=False, indent=2)\n    dres = doc[\"dispatch\"] or {}\n    summary = \"keeper-shadow: open=%d would_dispatch=%d dispatched=%d skips=%s mode=%s\" % (\n        len(rows), len(would), len(dres.get(\"dispatched\") or []),\n        json.dumps(skips, ensure_ascii=False), dres.get(\"mode\") or \"-\")\n    return {\"summary\": summary, \"path\": path, \"would_dispatch\": len(would),\n            \"dispatched\": len(dres.get(\"dispatched\") or []),\n            \"facts_errors\": doc[\"facts_errors\"], \"doc\": doc}\n",
-   "input": {
-    "rows": "$NODE.gate",
-    "ik_home": "$INPUT.ik_home",
-    "facts_errors": "$NODE.facts.errors",
-    "generated_at": "$NODE.facts.generated_at",
-    "dispatch_result": "$NODE.disp",
-    "dispatch_repos": "$INPUT.dispatch_repos"
-   },
-   "next": "ret_rep",
-   "source_line": 361
-  },
-  {
-   "type": "end",
-   "id": "ret_rep",
-   "output": "$NODE.rep",
-   "resultType": "success",
-   "name": "return rep",
-   "desc": "return rep（第 401 行）",
-   "source_line": 401
-  },
-  {
-   "type": "map",
-   "id": "gate",
-   "collection": "$NODE.facts.items",
-   "childFlow": {
-    "runtime": "python",
-    "inputType": {
-     "dataType": "object"
-    },
-    "nodes": [
-     {
+  "desc": "【生产·在用】keeper 派发决策 + intake 承接（screener+派发）——Phase 3 起为派发权持有者；dispatch_repos 空=只读对账；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）",
+  "nodes": [
+    {
       "type": "start",
       "id": "start",
-      "next": "st_processed_eq_true"
-     },
-     {
-      "type": "if",
-      "id": "st_processed_eq_true",
-      "condition": {
-       "field": "$INPUT.item.st_processed",
-       "operator": "eq",
-       "value": true
+      "next": "facts"
+    },
+    {
+      "type": "code",
+      "id": "facts",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, subprocess, time\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    # ---- keeper 配置（pipeline_repos / 闸门参数）\n    try:\n        import yaml\n        cfg = yaml.safe_load(open(os.path.join(IK, \"config.yaml\"), encoding=\"utf-8\")) or {}\n    except Exception as e:\n        return {\"error\": \"config 读取失败: %s\" % e, \"items\": [], \"errors\": [],\n                \"generated_at\": int(time.time()), \"g_inflight\": 0, \"g_max\": 0, \"repos_scanned\": 0}\n    repos = {k: v for k, v in (cfg.get(\"pipeline_repos\") or {}).items()\n             if (v or {}).get(\"mode\") != \"readonly\"}\n    g_max = int(cfg.get(\"pipeline_max_in_flight\") or 0)\n    r_limits = {str(k): int(v) for k, v in (cfg.get(\"pipeline_repo_limits\") or {}).items()}\n    issue_daily = int(cfg.get(\"pipeline_issue_daily_limit\") or 0)\n    author_daily = int(cfg.get(\"author_daily_limit\") or 0)\n    exempt = {str(a).lower() for a in (cfg.get(\"author_daily_limit_exempt\") or [])}\n    allow = {str(a).lower() for a in (cfg.get(\"author_allowlist\") or [])}\n    # 2026-10-08 外部验收闭环（jeffkit 拍板）：external_authors = 不在 allowlist 的\n    # 外部作者，其 issue 同样接单开发（screener 照走；验收由 issue-accept flow 承接）。\n    external = {str(a).lower() for a in (cfg.get(\"external_authors\") or [])}\n    # 2026-10-09：按单插队（config pipeline_priority_issues: [\"owner/repo#123\", ...]）\n    # 用途=平台级 P0/P1 缺陷（如 plaita#48 调度器炸穿）优先占用下一个空槽\n    prio_issues = {str(x).strip().lower() for x in (cfg.get(\"pipeline_priority_issues\") or [])}\n    optout = [str(x) for x in (cfg.get(\"opt_out_labels\") or [\"keeper-ignore\"])]\n    # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）\n    try:\n        st = json.load(open(os.path.join(IK, \"state.json\"), encoding=\"utf-8\"))\n    except Exception:\n        st = {\"repos\": {}}\n    srepos = st.get(\"repos\") or {}\n    # ---- 在途计数（镜像 keeper _count_in_flight：全网 in_flight_since 逐仓累计）\n    g_inflight = 0\n    r_inflight = {}\n    for slug, rv in srepos.items():\n        for _num, it in (((rv or {}).get(\"items\")) or {}).items():\n            if it.get(\"in_flight_since\"):\n                g_inflight += 1\n                r_inflight[slug] = r_inflight.get(slug, 0) + 1\n    # ---- 台账 runs.jsonl：今日有效 run 计数（与 keeper 同口径：非终态类才计额度）\n    NON_QUOTA = (\"retry-later\", \"failed\", \"guarded\", \"partial\")\n    today = time.strftime(\"%Y-%m-%d\")\n    issue_today, author_today = {}, {}\n    try:\n        with open(os.path.join(IK, \"pipeline\", \"runs.jsonl\"), encoding=\"utf-8\") as fh:\n            for line in fh:\n                line = line.strip()\n                if not line:\n                    continue\n                try:\n                    rec = json.loads(line)\n                except Exception:\n                    continue\n                if not str(rec.get(\"ts\", \"\")).startswith(today):\n                    continue\n                if rec.get(\"status\") in NON_QUOTA:\n                    continue\n                key = \"%s#%s\" % (rec.get(\"repo\"), rec.get(\"issue\"))\n                issue_today[key] = issue_today.get(key, 0) + 1\n                au = (rec.get(\"author\") or \"\").lower()\n                if au:\n                    author_today[au] = author_today.get(au, 0) + 1\n    except Exception:\n        pass\n    # ---- 扫单（gh，按仓并行——sandbox 墙钟默认 10s，串行 14 仓必超）\n    now_ts = time.time()\n    items, errors = [], []\n    def _scan(repo_full):\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"list\", \"--repo\", repo_full, \"--state\", \"open\",\n                                \"--limit\", \"100\",\n                                \"--json\", \"number,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            if p.returncode != 0:\n                return repo_full, None, \"gh exit=%s %s\" % (p.returncode, (p.stderr or \"\").strip()[:160])\n            return repo_full, json.loads(p.stdout or \"[]\"), None\n        except Exception as e:\n            return repo_full, None, str(e)[:160]\n    import concurrent.futures as _cf\n    with _cf.ThreadPoolExecutor(max_workers=6) as ex:\n        scanned = list(ex.map(_scan, sorted(repos)))\n    for repo_full, issues, err in scanned:\n        if err is not None:\n            errors.append(\"%s: %s\" % (repo_full, err))\n            continue\n        slug = repo_full.replace(\"/\", \"-\")\n        for iss in issues:\n            num = iss.get(\"number\")\n            it = (((srepos.get(slug) or {}).get(\"items\") or {}).get(str(num))) or {}\n            author = ((iss.get(\"author\") or {}).get(\"login\") or \"\")\n            labels = [l.get(\"name\") for l in (iss.get(\"labels\") or []) if isinstance(l, dict)]\n            items.append({\n                \"repo\": repo_full, \"number\": num,\n                \"title\": (iss.get(\"title\") or \"\")[:120],\n                \"author\": author, \"labels\": labels,\n                \"created_at\": iss.get(\"createdAt\") or \"\",\n                \"updated_at\": iss.get(\"updatedAt\") or \"\",\n                \"opt_out\": any(l in optout for l in labels),\n                \"allow_ok\": (not allow) or (author.lower() in allow),\n                \"external_ok\": author.lower() in external,\n                \"prio_issue\": (repo_full + \"#\" + str(num)).lower() in prio_issues,\n                \"has_state\": bool(it),\n                \"st_processed\": bool(it.get(\"processed\")),\n                \"st_blocked\": bool(it.get(\"blocked\")),\n                \"st_inflight\": bool(it.get(\"in_flight_since\")),\n                \"st_retry_after\": float(it.get(\"retry_after\") or 0),\n                \"st_screener_streak\": int(it.get(\"screener_retry_streak\") or 0),\n                \"wakeup_deps\": list(it.get(\"wakeup_deps\") or []),\n                \"issue_today\": issue_today.get(\"%s#%s\" % (repo_full, num), 0),\n                \"author_today\": author_today.get(author.lower(), 0),\n                \"author_exempt\": author.lower() in exempt,\n                \"g_inflight\": g_inflight, \"g_max\": g_max,\n                \"r_inflight\": r_inflight.get(slug, 0),\n                \"r_limit\": r_limits.get(repo_full, -1),\n                \"issue_daily\": issue_daily, \"author_daily\": author_daily,\n                \"now_ts\": now_ts,\n            })\n    return {\"items\": items, \"errors\": errors, \"generated_at\": now_ts,\n            \"g_inflight\": g_inflight, \"g_max\": g_max, \"repos_scanned\": len(repos)}\n",
+      "input": {
+        "ik_home": "$INPUT.ik_home"
       },
-      "name": "x.st_processed == True?",
-      "desc": "if x.st_processed == True（第 163 行）",
-      "source_line": 163,
-      "next": "_n14",
-      "else_next": "opt_out_eq_true"
-     },
-     {
-      "type": "if",
-      "id": "opt_out_eq_true",
-      "condition": {
-       "field": "$INPUT.item.opt_out",
-       "operator": "eq",
-       "value": true
+      "next": "gate",
+      "source_line": 37
+    },
+    {
+      "type": "code",
+      "id": "disp",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, re, sys, time\n    allow_raw = [str(x) for x in (input.get(\"dispatch_repos\") or [])]\n    if not allow_raw:\n        return {\"mode\": \"shadow\", \"dispatched\": [], \"note\": \"dispatch_repos 空：纯影子，零写入\"}\n    allow_all = \"*\" in allow_raw\n    allow = set(x for x in allow_raw if x != \"*\")\n    ik = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    root = os.path.expanduser(input.get(\"repo_root\") or \"\")\n    if root and root not in sys.path:\n        sys.path.insert(0, root)\n    # worker 进程 env 不含 keeper 的 env.sh（DEEPSEEK_API_KEY 等）——手工注入，\n    # 否则 screener 的 ${DEEPSEEK_API_KEY} 展开为空、LLM 调用必失败。\n    try:\n        envf = os.path.join(ik, \"env.sh\")\n        for line in open(envf, encoding=\"utf-8\"):\n            m = re.match(r\"[ \t]*(?:export[ \t]+)?([A-Z_][A-Z0-9_]*)=(.+)\", line.strip())\n            if m and m.group(1) not in os.environ:\n                v = m.group(2).split(\" #\", 1)[0].strip()   # 剥行内注释（env.sh 实有）\n                os.environ[m.group(1)] = v.strip('\"').strip(\"'\")\n    except OSError:\n        pass\n    from issue_keeper.config import load_config\n    from issue_keeper.sources import Resource\n    from issue_keeper.state import load_state, save_state_item\n    from issue_keeper import keeper as K\n    cfg = load_config(os.path.join(ik, \"config.yaml\"))\n    st = load_state(cfg.state_path)\n    inflight = sum(1 for rs in st.repos.values()\n                   for it in rs.items.values() if it.in_flight_since)\n    budget = max(0, int(cfg.pipeline_max_in_flight or 0) - inflight)\n    bindings = {b.repo: b for b in cfg.repos}\n    src_cache = {}\n    out = {\"mode\": \"canary\", \"allow\": \"*\" if allow_all else sorted(allow),\n           \"budget_left\": budget, \"screened\": [], \"dispatched\": [], \"skipped\": []}\n\n    def _persist_fields(slug, num, it):\n        def _mut(x):\n            x.blocked = it.blocked\n            x.screener_retry_streak = it.screener_retry_streak\n            x.retry_after = it.retry_after\n            x.in_flight_since = it.in_flight_since\n        save_state_item(cfg.state_path, slug, str(num), _mut)\n\n    # 派发次序对齐 keeper：priority_repos 优先，其次按仓/单号（槽位竞争的公平性）\n    prio = set(cfg.pipeline_priority_repos or [])\n    rows = sorted(input.get(\"rows\") or [],\n                  key=lambda r: (0 if r.get(\"prio_issue\") else 1,\n                                 0 if r.get(\"repo\") in prio else 1,\n                                 r.get(\"repo\") or \"\", int(r.get(\"num\") or 0)))\n    for r in rows:\n        repo, num = r.get(\"repo\"), r.get(\"num\")\n        if r.get(\"decision\") != \"would_dispatch\":\n            continue\n        if not (allow_all or repo in allow):\n            continue\n        if budget <= 0:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"预算用尽（在途到闸）\"})\n            continue\n        b = bindings.get(repo)\n        if b is None:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"无绑定\"})\n            continue\n        # state 的 repo 键约定 = repo 全名 replace(\"/\",\"-\")（keeper 同款；\n        # 用裸仓名会创建幽灵键，reaper 看不到 → run 永不收尾）\n        slug = repo.replace(\"/\", \"-\")\n        it = st.repo(slug).item(str(num))\n        if it.in_flight_since:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num, \"why\": \"状态已在途（并发窗口）\"})\n            continue\n        pc = cfg.pipeline_repo_cfg(repo)\n        import subprocess\n        try:\n            p = subprocess.run([\"gh\", \"issue\", \"view\", str(num), \"--repo\", repo,\n                                \"--json\", \"body,title,author,labels,createdAt,updatedAt\"],\n                               capture_output=True, text=True, timeout=8)\n            d = json.loads(p.stdout or \"{}\") if p.returncode == 0 else {}\n        except Exception:\n            d = {}\n        res = Resource(kind=\"issue\", number=int(num),\n                       title=d.get(\"title\") or r.get(\"title\") or \"\",\n                       body=d.get(\"body\") or \"\",\n                       author=(d.get(\"author\") or {}).get(\"login\") or r.get(\"author\") or \"\",\n                       labels=[l.get(\"name\") for l in (d.get(\"labels\") or []) if isinstance(l, dict)],\n                       state=\"open\", created_at=d.get(\"createdAt\") or r.get(\"created_at\") or \"\",\n                       updated_at=d.get(\"updatedAt\") or r.get(\"updated_at\") or \"\",\n                       status=\"\", actor_type=\"agent\")\n        label = \"%s issue#%s\" % (repo, num)\n        # ── intake 承接：未过筛的单由 flow 走 screener（keeper 库同款语义）──\n        if not r.get(\"has_state\"):\n            try:\n                sc = cfg.screener\n                src = K._ensure_source(b, src_cache)\n                vp = K._visible_prefix(b, cfg)\n                if sc.enabled and K._author_trusted_by_screener(cfg, res.author):\n                    out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"trusted-pass\"})\n                elif sc.enabled:\n                    msg = K._compose_new_message(b, res, src, K._agent_label(b, cfg), cfg)\n                    verdict = K._screen_or_block(msg, sc, label + \" body\")\n                    vd = K._screener_disposition(verdict, sc)\n                    if vd == \"block\":\n                        it.blocked = True\n                        it.screener_retry_streak = 0\n                        if sc.on_unsafe == \"comment\":\n                            K._post_unsafe_notice(src, b, res, cfg.bot_marker, vp,\n                                                  reason=verdict.reason)\n                        _persist_fields(slug, num, it)\n                        out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"block\"})\n                        continue\n                    if vd != \"pass\":\n                        K._hold_for_screener(src, b, cfg, res, sc, it, verdict,\n                                             visible_prefix=vp, label=label)\n                        _persist_fields(slug, num, it)\n                        out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": vd})\n                        continue\n                    out[\"screened\"].append({\"repo\": repo, \"num\": num, \"verdict\": \"pass\"})\n            except Exception as e:\n                out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                       \"why\": \"screener 异常: %s\" % str(e)[:140]})\n                continue\n        # ── 派发（keeper 库同款：payload/产物/锚 一字不差）──\n        try:\n            pres = K._dispatch_pipeline(cfg, b, res, it, label, pc=pc)\n        except Exception as e:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                   \"why\": \"派发异常: %s\" % str(e)[:140]})\n            continue\n        if it.in_flight_since:\n            anchor = it.in_flight_since\n            save_state_item(cfg.state_path, slug, str(num),\n                            lambda x, a=anchor: setattr(x, \"in_flight_since\", a))\n            out[\"dispatched\"].append({\"repo\": repo, \"num\": num,\n                                      \"status\": pres.get(\"status\"), \"label\": label,\n                                      \"anchor\": anchor})\n            budget -= 1\n            out[\"budget_left\"] = budget\n        else:\n            out[\"skipped\"].append({\"repo\": repo, \"num\": num,\n                                   \"why\": \"dispatch 未落锚: %s\" % pres.get(\"status\")})\n    return out\n",
+      "input": {
+        "rows": "$NODE.gate",
+        "dispatch_repos": "$INPUT.dispatch_repos",
+        "ik_home": "$INPUT.ik_home",
+        "repo_root": "$INPUT.repo_root"
       },
-      "name": "x.opt_out == True?",
-      "desc": "if x.opt_out == True（第 166 行）",
-      "source_line": 166,
-      "next": "_n13",
-      "else_next": "st_inflight_eq_true"
-     },
-     {
-      "type": "if",
-      "id": "st_inflight_eq_true",
-      "condition": {
-       "field": "$INPUT.item.st_inflight",
-       "operator": "eq",
-       "value": true
+      "next": "rep",
+      "source_line": 214
+    },
+    {
+      "type": "code",
+      "id": "rep",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, os, time\n    rows = input.get(\"rows\") or []\n    IK = os.path.expanduser(input.get(\"ik_home\") or \"~/.issue-keeper\")\n    outdir = os.path.join(IK, \"shadow\")\n    os.makedirs(outdir, exist_ok=True)\n    would = [r for r in rows if r.get(\"decision\") == \"would_dispatch\"]\n    skips = {}\n    for r in rows:\n        if r.get(\"decision\") != \"would_dispatch\":\n            skips[r.get(\"reason\")] = skips.get(r.get(\"reason\"), 0) + 1\n    doc = {\n        \"generated_at\": time.strftime(\"%Y-%m-%d %H:%M:%S\"),\n        \"source\": \"keeper-shadow flow（决策影子 + 可选 canary 派发；对照物=现役 keeper 的 keeper.log 决策）\",\n        \"repos_scanned\": len({r.get(\"repo\") for r in rows}),\n        \"total_open_matched\": len(rows),\n        \"would_dispatch\": len(would),\n        \"skip_by_reason\": skips,\n        \"facts_errors\": input.get(\"facts_errors\") or [],\n        \"dispatch\": input.get(\"dispatch_result\") or {},\n        \"rows\": rows,\n    }\n    stamp = time.strftime(\"%Y%m%d-%H%M%S\")\n    path = os.path.join(outdir, \"decisions-%s.json\" % stamp)\n    for p in (path, os.path.join(outdir, \"latest.json\")):\n        with open(p, \"w\", encoding=\"utf-8\") as fh:\n            json.dump(doc, fh, ensure_ascii=False, indent=2)\n    dres = doc[\"dispatch\"] or {}\n    summary = \"keeper-shadow: open=%d would_dispatch=%d dispatched=%d skips=%s mode=%s\" % (\n        len(rows), len(would), len(dres.get(\"dispatched\") or []),\n        json.dumps(skips, ensure_ascii=False), dres.get(\"mode\") or \"-\")\n    return {\"summary\": summary, \"path\": path, \"would_dispatch\": len(would),\n            \"dispatched\": len(dres.get(\"dispatched\") or []),\n            \"facts_errors\": doc[\"facts_errors\"], \"doc\": doc}\n",
+      "input": {
+        "rows": "$NODE.gate",
+        "ik_home": "$INPUT.ik_home",
+        "facts_errors": "$NODE.facts.errors",
+        "generated_at": "$NODE.facts.generated_at",
+        "dispatch_result": "$NODE.disp",
+        "dispatch_repos": "$INPUT.dispatch_repos"
       },
-      "name": "x.st_inflight == True?",
-      "desc": "if x.st_inflight == True（第 169 行）",
-      "source_line": 169,
-      "next": "_n12",
-      "else_next": "st_retry_after_gt_now_ts"
-     },
-     {
-      "type": "if",
-      "id": "st_retry_after_gt_now_ts",
-      "condition": {
-       "field": "$INPUT.item.st_retry_after",
-       "operator": "gt",
-       "value": "$INPUT.item.now_ts"
-      },
-      "name": "x.st_retry_after > x.now_ts?",
-      "desc": "if x.st_retry_after > x.now_ts（第 172 行）",
-      "source_line": 172,
-      "next": "_n11",
-      "else_next": "allow_ok_ne_true_and_ext"
-     },
-     {
-      "type": "if",
-      "id": "allow_ok_ne_true_and_ext",
-      "condition": {
-       "relation": "and",
-       "conditions": [
-        {
-         "field": "$INPUT.item.allow_ok",
-         "operator": "ne",
-         "value": true
+      "next": "ret_rep",
+      "source_line": 361
+    },
+    {
+      "type": "end",
+      "id": "ret_rep",
+      "output": "$NODE.rep",
+      "resultType": "success",
+      "name": "return rep",
+      "desc": "return rep（第 401 行）",
+      "source_line": 401
+    },
+    {
+      "type": "map",
+      "id": "gate",
+      "collection": "$NODE.facts.items",
+      "childFlow": {
+        "runtime": "python",
+        "inputType": {
+          "dataType": "object"
         },
-        {
-         "field": "$INPUT.item.external_ok",
-         "operator": "ne",
-         "value": true
-        }
-       ]
+        "nodes": [
+          {
+            "type": "start",
+            "id": "start",
+            "next": "st_processed_eq_true"
+          },
+          {
+            "type": "if",
+            "id": "st_processed_eq_true",
+            "condition": {
+              "field": "$INPUT.item.st_processed",
+              "operator": "eq",
+              "value": true
+            },
+            "name": "x.st_processed == True?",
+            "desc": "if x.st_processed == True（第 163 行）",
+            "source_line": 163,
+            "next": "_n14",
+            "else_next": "opt_out_eq_true"
+          },
+          {
+            "type": "if",
+            "id": "opt_out_eq_true",
+            "condition": {
+              "field": "$INPUT.item.opt_out",
+              "operator": "eq",
+              "value": true
+            },
+            "name": "x.opt_out == True?",
+            "desc": "if x.opt_out == True（第 166 行）",
+            "source_line": 166,
+            "next": "_n13",
+            "else_next": "st_inflight_eq_true"
+          },
+          {
+            "type": "if",
+            "id": "st_inflight_eq_true",
+            "condition": {
+              "field": "$INPUT.item.st_inflight",
+              "operator": "eq",
+              "value": true
+            },
+            "name": "x.st_inflight == True?",
+            "desc": "if x.st_inflight == True（第 169 行）",
+            "source_line": 169,
+            "next": "_n12",
+            "else_next": "st_retry_after_gt_now_ts"
+          },
+          {
+            "type": "if",
+            "id": "st_retry_after_gt_now_ts",
+            "condition": {
+              "field": "$INPUT.item.st_retry_after",
+              "operator": "gt",
+              "value": "$INPUT.item.now_ts"
+            },
+            "name": "x.st_retry_after > x.now_ts?",
+            "desc": "if x.st_retry_after > x.now_ts（第 172 行）",
+            "source_line": 172,
+            "next": "_n11",
+            "else_next": "allow_ok_ne_true_and_ext"
+          },
+          {
+            "type": "if",
+            "id": "allow_ok_ne_true_and_ext",
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.item.allow_ok",
+                  "operator": "ne",
+                  "value": true
+                },
+                {
+                  "field": "$INPUT.item.external_ok",
+                  "operator": "ne",
+                  "value": true
+                }
+              ]
+            },
+            "name": "x.allow_ok != True and x.ex…",
+            "desc": "if x.allow_ok != True and x.external_ok != True（第 175 行）",
+            "source_line": 175,
+            "next": "_n10",
+            "else_next": "author_exempt_ne_true_an"
+          },
+          {
+            "type": "if",
+            "id": "author_exempt_ne_true_an",
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.item.author_exempt",
+                  "operator": "ne",
+                  "value": true
+                },
+                {
+                  "field": "$INPUT.item.author_daily",
+                  "operator": "gt",
+                  "value": 0
+                },
+                {
+                  "field": "$INPUT.item.author_today",
+                  "operator": "gte",
+                  "value": "$INPUT.item.author_daily"
+                }
+              ]
+            },
+            "name": "x.author_exempt != True and…",
+            "desc": "if x.author_exempt != True and x.author_daily > 0 and (x.author_today >= x.auth…",
+            "source_line": 178,
+            "next": "_n9",
+            "else_next": "issue_daily_gt_0_and_iss"
+          },
+          {
+            "type": "if",
+            "id": "issue_daily_gt_0_and_iss",
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.item.issue_daily",
+                  "operator": "gt",
+                  "value": 0
+                },
+                {
+                  "field": "$INPUT.item.issue_today",
+                  "operator": "gte",
+                  "value": "$INPUT.item.issue_daily"
+                }
+              ]
+            },
+            "name": "x.issue_daily > 0 and x.iss…",
+            "desc": "if x.issue_daily > 0 and x.issue_today >= x.issue_daily（第 181 行）",
+            "source_line": 181,
+            "next": "_n8",
+            "else_next": "st_blocked_eq_true"
+          },
+          {
+            "type": "if",
+            "id": "st_blocked_eq_true",
+            "condition": {
+              "field": "$INPUT.item.st_blocked",
+              "operator": "eq",
+              "value": true
+            },
+            "name": "x.st_blocked == True?",
+            "desc": "if x.st_blocked == True（第 184 行）",
+            "source_line": 184,
+            "next": "_n7",
+            "else_next": "st_screener_streak_gt_0"
+          },
+          {
+            "type": "if",
+            "id": "st_screener_streak_gt_0",
+            "condition": {
+              "field": "$INPUT.item.st_screener_streak",
+              "operator": "gt",
+              "value": 0
+            },
+            "name": "x.st_screener_streak > 0?",
+            "desc": "if x.st_screener_streak > 0（第 187 行）",
+            "source_line": 187,
+            "next": "_n6",
+            "else_next": "g_max_gt_0_and_g_infligh"
+          },
+          {
+            "type": "if",
+            "id": "g_max_gt_0_and_g_infligh",
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.item.g_max",
+                  "operator": "gt",
+                  "value": 0
+                },
+                {
+                  "field": "$INPUT.item.g_inflight",
+                  "operator": "gte",
+                  "value": "$INPUT.item.g_max"
+                }
+              ]
+            },
+            "name": "x.g_max > 0 and x.g_infligh…",
+            "desc": "if x.g_max > 0 and x.g_inflight >= x.g_max（第 190 行）",
+            "source_line": 190,
+            "next": "_n5",
+            "else_next": "r_limit_eq_0"
+          },
+          {
+            "type": "if",
+            "id": "r_limit_eq_0",
+            "condition": {
+              "field": "$INPUT.item.r_limit",
+              "operator": "eq",
+              "value": 0
+            },
+            "name": "x.r_limit == 0?",
+            "desc": "if x.r_limit == 0（第 194 行）",
+            "source_line": 194,
+            "next": "_n4",
+            "else_next": "r_limit_gt_0_and_r_infli"
+          },
+          {
+            "type": "if",
+            "id": "r_limit_gt_0_and_r_infli",
+            "condition": {
+              "relation": "and",
+              "conditions": [
+                {
+                  "field": "$INPUT.item.r_limit",
+                  "operator": "gt",
+                  "value": 0
+                },
+                {
+                  "field": "$INPUT.item.r_inflight",
+                  "operator": "gte",
+                  "value": "$INPUT.item.r_limit"
+                }
+              ]
+            },
+            "name": "x.r_limit > 0 and x.r_infli…",
+            "desc": "if x.r_limit > 0 and x.r_inflight >= x.r_limit（第 197 行）",
+            "source_line": 197,
+            "next": "_n3",
+            "else_next": "has_state_eq_true"
+          },
+          {
+            "type": "if",
+            "id": "has_state_eq_true",
+            "condition": {
+              "field": "$INPUT.item.has_state",
+              "operator": "eq",
+              "value": true
+            },
+            "name": "x.has_state == True?",
+            "desc": "if x.has_state == True（第 201 行）",
+            "source_line": 201,
+            "next": "_n2",
+            "else_next": "_n1"
+          },
+          {
+            "type": "end",
+            "id": "_n1",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "would_dispatch",
+              "reason": "可派发（需先过 screener：keeper 无该 issue 状态）",
+              "has_state": false
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 204
+          },
+          {
+            "type": "end",
+            "id": "_n2",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "would_dispatch",
+              "reason": "可派发",
+              "has_state": true
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 202
+          },
+          {
+            "type": "end",
+            "id": "_n3",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "本仓配额满",
+              "r_inflight": "$INPUT.item.r_inflight",
+              "r_limit": "$INPUT.item.r_limit"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 198
+          },
+          {
+            "type": "end",
+            "id": "_n4",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "本仓停派（配额=0）"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 195
+          },
+          {
+            "type": "end",
+            "id": "_n5",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "全局背压满（在途到闸）",
+              "g_inflight": "$INPUT.item.g_inflight",
+              "g_max": "$INPUT.item.g_max"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 191
+          },
+          {
+            "type": "end",
+            "id": "_n6",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "screener 未判定退避中",
+              "streak": "$INPUT.item.st_screener_streak"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 188
+          },
+          {
+            "type": "end",
+            "id": "_n7",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "blocked（依赖/screener 判定）",
+              "deps": "$INPUT.item.wakeup_deps"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 185
+          },
+          {
+            "type": "end",
+            "id": "_n8",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "本 issue 当日 run 达上限",
+              "issue_today": "$INPUT.item.issue_today"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 182
+          },
+          {
+            "type": "end",
+            "id": "_n9",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "作者当日 run 达上限",
+              "author_today": "$INPUT.item.author_today"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 179
+          },
+          {
+            "type": "end",
+            "id": "_n10",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "作者不在 allowlist/external_authors"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 176
+          },
+          {
+            "type": "end",
+            "id": "_n11",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "retry-later 退避中"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 173
+          },
+          {
+            "type": "end",
+            "id": "_n12",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "已在途（同 issue run 在跑）"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 170
+          },
+          {
+            "type": "end",
+            "id": "_n13",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "opt-out 标签"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 167
+          },
+          {
+            "type": "end",
+            "id": "_n14",
+            "output": {
+              "repo": "$INPUT.item.repo",
+              "num": "$INPUT.item.number",
+              "title": "$INPUT.item.title",
+              "author": "$INPUT.item.author",
+              "decision": "skip",
+              "reason": "已处理（processed）"
+            },
+            "resultType": "success",
+            "name": "return {'repo': x.repo, 'nu…",
+            "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
+            "source_line": 164
+          }
+        ]
       },
-      "name": "x.allow_ok != True and x.ex…",
-      "desc": "if x.allow_ok != True and x.external_ok != True（第 175 行）",
-      "source_line": 175,
-      "next": "_n10",
-      "else_next": "author_exempt_ne_true_an"
-     },
-     {
-      "type": "if",
-      "id": "author_exempt_ne_true_an",
-      "condition": {
-       "relation": "and",
-       "conditions": [
-        {
-         "field": "$INPUT.item.author_exempt",
-         "operator": "ne",
-         "value": true
-        },
-        {
-         "field": "$INPUT.item.author_daily",
-         "operator": "gt",
-         "value": 0
-        },
-        {
-         "field": "$INPUT.item.author_today",
-         "operator": "gte",
-         "value": "$INPUT.item.author_daily"
-        }
-       ]
-      },
-      "name": "x.author_exempt != True and…",
-      "desc": "if x.author_exempt != True and x.author_daily > 0 and (x.author_today >= x.auth…",
-      "source_line": 178,
-      "next": "_n9",
-      "else_next": "issue_daily_gt_0_and_iss"
-     },
-     {
-      "type": "if",
-      "id": "issue_daily_gt_0_and_iss",
-      "condition": {
-       "relation": "and",
-       "conditions": [
-        {
-         "field": "$INPUT.item.issue_daily",
-         "operator": "gt",
-         "value": 0
-        },
-        {
-         "field": "$INPUT.item.issue_today",
-         "operator": "gte",
-         "value": "$INPUT.item.issue_daily"
-        }
-       ]
-      },
-      "name": "x.issue_daily > 0 and x.iss…",
-      "desc": "if x.issue_daily > 0 and x.issue_today >= x.issue_daily（第 181 行）",
-      "source_line": 181,
-      "next": "_n8",
-      "else_next": "st_blocked_eq_true"
-     },
-     {
-      "type": "if",
-      "id": "st_blocked_eq_true",
-      "condition": {
-       "field": "$INPUT.item.st_blocked",
-       "operator": "eq",
-       "value": true
-      },
-      "name": "x.st_blocked == True?",
-      "desc": "if x.st_blocked == True（第 184 行）",
-      "source_line": 184,
-      "next": "_n7",
-      "else_next": "st_screener_streak_gt_0"
-     },
-     {
-      "type": "if",
-      "id": "st_screener_streak_gt_0",
-      "condition": {
-       "field": "$INPUT.item.st_screener_streak",
-       "operator": "gt",
-       "value": 0
-      },
-      "name": "x.st_screener_streak > 0?",
-      "desc": "if x.st_screener_streak > 0（第 187 行）",
-      "source_line": 187,
-      "next": "_n6",
-      "else_next": "g_max_gt_0_and_g_infligh"
-     },
-     {
-      "type": "if",
-      "id": "g_max_gt_0_and_g_infligh",
-      "condition": {
-       "relation": "and",
-       "conditions": [
-        {
-         "field": "$INPUT.item.g_max",
-         "operator": "gt",
-         "value": 0
-        },
-        {
-         "field": "$INPUT.item.g_inflight",
-         "operator": "gte",
-         "value": "$INPUT.item.g_max"
-        }
-       ]
-      },
-      "name": "x.g_max > 0 and x.g_infligh…",
-      "desc": "if x.g_max > 0 and x.g_inflight >= x.g_max（第 190 行）",
-      "source_line": 190,
-      "next": "_n5",
-      "else_next": "r_limit_eq_0"
-     },
-     {
-      "type": "if",
-      "id": "r_limit_eq_0",
-      "condition": {
-       "field": "$INPUT.item.r_limit",
-       "operator": "eq",
-       "value": 0
-      },
-      "name": "x.r_limit == 0?",
-      "desc": "if x.r_limit == 0（第 194 行）",
-      "source_line": 194,
-      "next": "_n4",
-      "else_next": "r_limit_gt_0_and_r_infli"
-     },
-     {
-      "type": "if",
-      "id": "r_limit_gt_0_and_r_infli",
-      "condition": {
-       "relation": "and",
-       "conditions": [
-        {
-         "field": "$INPUT.item.r_limit",
-         "operator": "gt",
-         "value": 0
-        },
-        {
-         "field": "$INPUT.item.r_inflight",
-         "operator": "gte",
-         "value": "$INPUT.item.r_limit"
-        }
-       ]
-      },
-      "name": "x.r_limit > 0 and x.r_infli…",
-      "desc": "if x.r_limit > 0 and x.r_inflight >= x.r_limit（第 197 行）",
-      "source_line": 197,
-      "next": "_n3",
-      "else_next": "has_state_eq_true"
-     },
-     {
-      "type": "if",
-      "id": "has_state_eq_true",
-      "condition": {
-       "field": "$INPUT.item.has_state",
-       "operator": "eq",
-       "value": true
-      },
-      "name": "x.has_state == True?",
-      "desc": "if x.has_state == True（第 201 行）",
-      "source_line": 201,
-      "next": "_n2",
-      "else_next": "_n1"
-     },
-     {
-      "type": "end",
-      "id": "_n1",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "would_dispatch",
-       "reason": "可派发（需先过 screener：keeper 无该 issue 状态）",
-       "has_state": false
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 204
-     },
-     {
-      "type": "end",
-      "id": "_n2",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "would_dispatch",
-       "reason": "可派发",
-       "has_state": true
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 202
-     },
-     {
-      "type": "end",
-      "id": "_n3",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "本仓配额满",
-       "r_inflight": "$INPUT.item.r_inflight",
-       "r_limit": "$INPUT.item.r_limit"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 198
-     },
-     {
-      "type": "end",
-      "id": "_n4",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "本仓停派（配额=0）"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 195
-     },
-     {
-      "type": "end",
-      "id": "_n5",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "全局背压满（在途到闸）",
-       "g_inflight": "$INPUT.item.g_inflight",
-       "g_max": "$INPUT.item.g_max"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 191
-     },
-     {
-      "type": "end",
-      "id": "_n6",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "screener 未判定退避中",
-       "streak": "$INPUT.item.st_screener_streak"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 188
-     },
-     {
-      "type": "end",
-      "id": "_n7",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "blocked（依赖/screener 判定）",
-       "deps": "$INPUT.item.wakeup_deps"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 185
-     },
-     {
-      "type": "end",
-      "id": "_n8",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "本 issue 当日 run 达上限",
-       "issue_today": "$INPUT.item.issue_today"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 182
-     },
-     {
-      "type": "end",
-      "id": "_n9",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "作者当日 run 达上限",
-       "author_today": "$INPUT.item.author_today"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 179
-     },
-     {
-      "type": "end",
-      "id": "_n10",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "作者不在 allowlist/external_authors"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 176
-     },
-     {
-      "type": "end",
-      "id": "_n11",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "retry-later 退避中"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 173
-     },
-     {
-      "type": "end",
-      "id": "_n12",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "已在途（同 issue run 在跑）"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 170
-     },
-     {
-      "type": "end",
-      "id": "_n13",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "opt-out 标签"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 167
-     },
-     {
-      "type": "end",
-      "id": "_n14",
-      "output": {
-       "repo": "$INPUT.item.repo",
-       "num": "$INPUT.item.number",
-       "title": "$INPUT.item.title",
-       "author": "$INPUT.item.author",
-       "decision": "skip",
-       "reason": "已处理（processed）"
-      },
-      "resultType": "success",
-      "name": "return {'repo': x.repo, 'nu…",
-      "desc": "return {'repo': x.repo, 'num': x.number, 'title': x.title, …",
-      "source_line": 164
-     }
-    ]
-   },
-   "next": "disp",
-   "source_line": 162
-  }
- ]
+      "next": "disp",
+      "source_line": 162
+    }
+  ]
 }

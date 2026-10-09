@@ -372,4 +372,4 @@ def run(input):
 
 
 if __name__ == "__main__":
-    print("issue-accept flow 源码（编译见 build_issue_accept.py）")
+    print("issue-accept flow 源码（编译见 build_flows.py issue-accept）")

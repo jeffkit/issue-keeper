@@ -156,4 +156,4 @@ def run(input):
 
 
 if __name__ == "__main__":
-    print("keeper_watch flow 源码（编译见 build_keeper_watch.py）")
+    print("keeper_watch flow 源码（编译见 build_flows.py keeper-watch）")

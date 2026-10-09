@@ -20,7 +20,7 @@
 交接给远端机（Mac worker 判路径不存在 → TaskNotForThisWorker 交接）。
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_keeper_shadow.py
+        python3 flows/build_flows.py keeper-shadow
 （code= 不能引用模块常量——codeflow 实锤坑；下列 code 一律写完整字面量。）
 """
 from __future__ import annotations
