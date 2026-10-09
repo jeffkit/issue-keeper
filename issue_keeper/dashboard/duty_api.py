@@ -1,0 +1,323 @@
+"""值守总览 API（/api/duty/*）——业务级协同的可视化数据源。
+
+三个只读端点（公开可访问，无副作用）：
+- GET /api/duty/overview   三班心跳 + roster 当班 + 调度健康 + 队列/在途 + GLM 计数
+- GET /api/duty/stats      沙箱 24h 用量（实例小时按状态）+ 管线吞吐 + DLQ
+- GET /api/duty/topology   工作流拓扑（节点/边 + live 状态），前端画图用
+
+数据源（多源、全防御、带缓存——任何一路失败降级为 null 字段而非 500）：
+- 本机 duty 内核 ~/.issue-keeper/duty/（A/C 心跳、roster、rounds 计数）
+- plaita console 127.0.0.1:8323（经隧道；执行记录/沙箱 run）
+- AGS 云沙箱 list（经 plaita/.venv 子进程——e2b SDK 只装在那）
+- 远端 VM 经 ssh（keeper state、schedule service、队列/DLQ、shadow 对账）
+- controller/pipeline_stats.py（gh 提报/关闭吞吐，自带缓存）
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api")
+
+DUTY_DIR = Path("~/.issue-keeper/duty").expanduser()
+CONTROLLER_DIR = Path("~/.issue-keeper/pipeline/controller").expanduser()
+PLAITA_VENV_PY = "/Users/kong/projects/infra4agent/plaita/.venv/bin/python"
+CONSOLE = "http://127.0.0.1:8323/api"
+CONSOLE_KEY = "b4b5042ee7d1b937633c08f3f50d4c8efbca88d33ece8a03"
+E2B_ENV = {
+    "E2B_DOMAIN": "ap-guangzhou.tencentags.com",
+    "E2B_API_KEY": "e2b_725235357335be8d27367c596c9e3199cf3c5eeb",
+}
+
+_CACHE: dict[str, tuple[float, Any]] = {}
+
+
+def _cached(key: str, ttl: float, fn):
+    """简单 TTL 缓存——远端/慢源专用；失败返回上次成功值。"""
+    now = time.time()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    try:
+        val = fn()
+        _CACHE[key] = (now, val)
+        return val
+    except Exception as exc:  # 降级：旧值或 None
+        if hit:
+            return hit[1]
+        return {"error": str(exc)[:160]}
+
+
+def _sh(cmd: str, timeout: int = 25) -> str:
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _console(path: str) -> Any:
+    import urllib.request
+    req = urllib.request.Request(
+        f"{CONSOLE}{path}", headers={"X-Admin-API-Key": CONSOLE_KEY})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+# ---------- overview ----------
+
+def _read_duty_state(role: str) -> dict:
+    try:
+        doc = json.loads((DUTY_DIR / f"state-{role}.json").read_text())
+        rounds = doc.get("rounds") or []
+        if not rounds:
+            return {}
+        from datetime import datetime
+        last = rounds[-1]
+        age = int(time.time() - datetime.fromisoformat(last["finished_at"]).timestamp())
+        return {"round": last.get("round"), "status": last.get("status"),
+                "finished_at": last.get("finished_at"), "age_sec": age,
+                "narrative": (last.get("narrative") or "")[:160]}
+    except Exception:
+        return {}
+
+
+def _roster() -> dict:
+    try:
+        r = json.loads((DUTY_DIR / "roster.json").read_text())
+        return {"generation": r.get("generation"),
+                "on_duty": {k: {"session_ref": v.get("session_ref"),
+                                "since": v.get("since"),
+                                "model_tier": v.get("model_tier")}
+                            for k, v in (r.get("on_duty") or {}).items()}}
+    except Exception:
+        return {}
+
+
+def _vm_facts() -> dict:
+    """远端控制面事实（ssh，聚合一次）。"""
+    out = _sh(
+        "ssh -o ConnectTimeout=8 tcloud_gz '"
+        "echo SCHED=$(systemctl is-active plaita-schedule-service 2>/dev/null);"
+        "echo KEEPER=$(systemctl is-active issue-keeper-worker 2>/dev/null);"
+        "echo DISK=$(df -h / | tail -1 | awk \"{print \\$4}\");"
+        "docker exec langfuse-v4-redis-1 redis-cli -a 6ace3bde72955c70b9f264e24f57b343 "
+        "-n 1 --no-auth-warning XLEN plaita:flow:queue:ctrl:dlq 2>/dev/null | xargs echo DLQ;"
+        "'",
+        timeout=30,
+    )
+    facts: dict[str, Any] = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, _, v = line.strip().partition("=")
+            facts[k.strip().lower()] = v.strip()
+    return facts or {"error": "ssh 不可达"}
+
+
+def _inflight() -> list[dict]:
+    out = _sh(
+        "ssh -o ConnectTimeout=8 tcloud_gz "
+        "'python3 ~/.issue-keeper/inflight_query.py 2>/dev/null'",
+        timeout=30,
+    )
+    try:
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def _shadow() -> dict:
+    out = _sh("ssh -o ConnectTimeout=8 tcloud_gz 'cat ~/.issue-keeper/shadow/latest.json 2>/dev/null'",
+              timeout=20)
+    try:
+        d = json.loads(out)
+        disp = d.get("dispatch") or {}
+        return {"generated_at": d.get("generated_at"),
+                "budget_left": disp.get("budget_left"),
+                "would_dispatch": d.get("would_dispatch"),
+                "skip": d.get("skip_by_reason") or {}}
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
+def overview() -> dict:
+    roles = {}
+    for role in ("issue-accept", "controller"):
+        roles[role] = _read_duty_state(role)
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "roster": _roster(),
+        "a_shift": roles["issue-accept"],
+        "controller": roles["controller"],
+        "b_shift": _cached("b_round", 120, lambda: {
+            "last_line": (_sh(f"grep ' B-flow' {CONTROLLER_DIR}/rounds.log 2>/dev/null | tail -1"))[:150]}),
+        "vm": _cached("vm_facts", 60, _vm_facts),
+        "inflight": _cached("inflight", 60, _inflight),
+        "shadow": _cached("shadow", 120, _shadow),
+    }
+
+
+# ---------- stats ----------
+
+def _sandbox_inventory() -> dict:
+    """经 plaita venv 子进程调 e2b SDK 列活实例。"""
+    code = (
+        "from e2b import Sandbox\n"
+        "from e2b.sandbox.sandbox_api import SandboxQuery\n"
+        "import datetime, json\n"
+        "pag = Sandbox.list(SandboxQuery(metadata={}))\n"
+        "items = pag.next_items() if hasattr(pag, 'next_items') else list(pag)\n"
+        "now = datetime.datetime.now(datetime.timezone.utc)\n"
+        "rows = []\n"
+        "for it in (items or []):\n"
+        "    m = getattr(it, 'metadata', {}) or {}\n"
+        "    st = getattr(it, 'started_at', None)\n"
+        "    age = None\n"
+        "    try:\n"
+        "        st = st if isinstance(st, datetime.datetime) else datetime.datetime.fromisoformat(str(st).replace('Z','+00:00'))\n"
+        "        if st.tzinfo is None: st = st.replace(tzinfo=datetime.timezone.utc)\n"
+        "        age = round((now - st).total_seconds()/3600, 2)\n"
+        "    except Exception: pass\n"
+        "    rows.append({'id': str(getattr(it, 'sandbox_id', ''))[:14], 'age_h': age,\n"
+        "                 'exec': str((m.get('plaita_execution') or '?'))[:10]})\n"
+        "print(json.dumps(rows))\n"
+    )
+    out = _sh(f"E2B_DOMAIN={E2B_ENV['E2B_DOMAIN']} E2B_API_KEY={E2B_ENV['E2B_API_KEY']} "
+              f"{PLAITA_VENV_PY} -c \"{code}\"", timeout=45)
+    try:
+        return {"instances": json.loads(out)}
+    except Exception:
+        return {"instances": [], "error": (out or "e2b 查询失败")[:120]}
+
+
+def _sandbox_stats() -> dict:
+    import datetime
+    KEYT = CONSOLE_KEY
+    out = _sh(
+        f"curl -s 'http://127.0.0.1:8323/api/executions?flow_id=self-improve-v2-sbx&limit=30' "
+        f"-H 'X-Admin-API-Key: {KEYT}'", timeout=15)
+    now = datetime.datetime.now()
+    runs = []
+    try:
+        for e in (json.loads(out).get("executions") or []):
+            st = e.get("start_time", "")[:19]
+            en = (e.get("end_time") or "")[:19]
+            s = datetime.datetime.fromisoformat(st)
+            en_dt = datetime.datetime.fromisoformat(en) if en else None
+            hrs = ((en_dt or now) - s).total_seconds() / 3600
+            runs.append({"status": e.get("status"), "hrs": round(hrs, 2),
+                         "start": st[:16]})
+    except Exception:
+        pass
+    total = sum(r["hrs"] for r in runs)
+    by: dict[str, float] = {}
+    for r in runs:
+        by[r["status"]] = round(by.get(r["status"], 0) + r["hrs"], 2)
+    return {"window_hours": 24, "runs": len(runs), "instance_hours": round(total, 2),
+            "by_status": by, "runs_detail": runs[:12]}
+
+
+def _throughput() -> dict:
+    out = _sh(
+        "python3 ~/.issue-keeper/pipeline/controller/pipeline_stats.py --days 7 --json 2>/dev/null",
+        timeout=60)
+    try:
+        return {"days": 7, "data": json.loads(out)}
+    except Exception:
+        return {"days": 7, "data": None, "error": (out or "pipeline_stats 失败")[:120]}
+
+
+def stats() -> dict:
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "sandbox": _cached("sbx_stats", 300, _sandbox_stats),
+        "sandbox_live": _cached("sbx_live", 120, _sandbox_inventory),
+        "throughput": _cached("throughput", 600, _throughput),
+    }
+
+
+# ---------- topology ----------
+
+def topology() -> dict:
+    ov = _cached("ov_topo", 60, overview)
+    sbx = _cached("sbx_live", 120, _sandbox_inventory)
+    inflight = ov.get("inflight") or []
+    vm = ov.get("vm") or {}
+    a = ov.get("a_shift") or {}
+    shadow = ov.get("shadow") or {}
+
+    def node(nid: str, label: str, kind: str, state: str, detail: str = "",
+             meta: dict | None = None) -> dict:
+        return {"id": nid, "label": label, "kind": kind, "state": state,
+                "detail": detail, **(meta or {})}
+
+    sbx_n = len((sbx.get("instances") or []))
+    nodes = [
+        node("external", "外部用户 / jeffkit", "actor",
+             "healthy", "提 issue · /accept 验收"),
+        node("github", "GitHub Issues", "store", "healthy",
+             "tunely 仓 + 各子仓", {"repo": "jeffkit/*"}),
+        node("shadow", "keeper-shadow 派发", "flow",
+             "healthy" if shadow.get("generated_at") else "stalled",
+             f"对账 {str(shadow.get('generated_at', ''))[5:16]} · budget={shadow.get('budget_left')}"),
+        node("improve", "self-improve-v2 开发", "flow", "healthy",
+             f"主版：本机 recursive；在途 {len(inflight)}"),
+        node("sbx", "沙箱版 sbx（灰度）", "flow",
+             "healthy" if sbx_n else "idle",
+             f"AGS 实例 ×{sbx_n}"),
+        node("reaper", "reaper 收尾回评", "flow", "healthy", "status=done → 回评"),
+        node("accept", "A 班 issue-accept 验收", "flow",
+             ("healthy" if (a.get("age_sec") or 9999) < 1800 else "stalled"),
+             f"轮{a.get('round')} · {a.get('age_sec', 0)//60}min 前"),
+        node("external_check", "外部验收 /accept", "gate",
+             "healthy", "验收通过 → 合并/关单"),
+        node("bwatch", "B 班 keeper-watch", "flow", "healthy",
+             str((ov.get("b_shift") or {}).get("last_line", ""))[:60]),
+        node("ctrl", "主控 ctrl-watch", "flow", "healthy", "看门狗 + 升级路由"),
+        node("duty", "duty 内核（状态权威）", "store",
+             "healthy", f"roster gen={(ov.get('roster') or {}).get('generation')}"),
+        node("core", "plaita 内核 + console", "infra",
+             "healthy" if vm.get("sched") == "active" else "degraded",
+             f"sched={vm.get('sched')} keeper={vm.get('keeper')}"),
+    ]
+    edges = [
+        {"from": "external", "to": "github", "label": "提 issue"},
+        {"from": "github", "to": "shadow", "label": "轮询扫单"},
+        {"from": "shadow", "to": "improve", "label": "派发（主版）"},
+        {"from": "shadow", "to": "sbx", "label": "派发（灰度）"},
+        {"from": "improve", "to": "reaper", "label": "终态"},
+        {"from": "sbx", "to": "reaper", "label": "终态"},
+        {"from": "reaper", "to": "accept", "label": "done 回评"},
+        {"from": "accept", "to": "external_check", "label": "请验收"},
+        {"from": "external_check", "to": "github", "label": "/accept"},
+        {"from": "github", "to": "accept", "label": "验收信号", "dash": True},
+        {"from": "accept", "to": "github", "label": "关单致谢"},
+        {"from": "bwatch", "to": "duty", "label": "轮报/handoff"},
+        {"from": "ctrl", "to": "duty", "label": "看门狗"},
+        {"from": "accept", "to": "duty", "label": "轮报/handoff"},
+        {"from": "duty", "to": "core", "label": "状态权威", "dash": True},
+    ]
+    return {"nodes": nodes, "edges": edges, "ts": time.strftime("%H:%M:%S")}
+
+
+# ---------- 路由 ----------
+
+@router.get("/duty/overview")
+def duty_overview() -> dict:
+    return _cached("duty_overview", 45, overview)
+
+
+@router.get("/duty/stats")
+def duty_stats() -> dict:
+    return _cached("duty_stats", 120, stats)
+
+
+@router.get("/duty/topology")
+def duty_topology() -> dict:
+    return _cached("duty_topology", 45, topology)

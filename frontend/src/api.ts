@@ -169,3 +169,39 @@ export function benchmarksList(): Promise<BenchmarkInfo[]> {
 export function workbench(days: number): Promise<WorkbenchData> {
   return j(fetch(`${BASE}/workbench?days=${days}`));
 }
+
+// ---------- 值守总览（duty）----------
+
+export interface DutyOverview {
+  ts: string;
+  roster: { generation?: number; on_duty?: Record<string, { session_ref?: string; since?: string; model_tier?: string }> };
+  a_shift: { round?: number; status?: string; finished_at?: string; age_sec?: number; narrative?: string };
+  controller: { round?: number; status?: string; finished_at?: string; age_sec?: number };
+  b_shift: { last_line?: string };
+  vm: { sched?: string; keeper?: string; disk?: string; dlq?: string; error?: string };
+  inflight: { repo: string; issue: string; minutes: number }[];
+  shadow: { generated_at?: string; budget_left?: number; would_dispatch?: number; skip?: Record<string, number>; error?: string };
+}
+
+export interface DutyStats {
+  ts: string;
+  sandbox: { window_hours: number; runs: number; instance_hours: number; by_status: Record<string, number>; runs_detail: { status: string; hrs: number; start: string }[] };
+  sandbox_live: { instances: { id: string; age_h: number | null; exec: string }[]; error?: string };
+  throughput: { days: number; data: { created_by_day?: Record<string, number>; [k: string]: unknown } | null; error?: string };
+}
+
+export interface DutyTopology {
+  nodes: { id: string; label: string; kind: string; state: string; detail: string }[];
+  edges: { from: string; to: string; label: string; dash?: boolean }[];
+  ts: string;
+}
+
+export function dutyOverview(): Promise<DutyOverview> {
+  return j(fetch(`${BASE}/duty/overview`));
+}
+export function dutyStats(): Promise<DutyStats> {
+  return j(fetch(`${BASE}/duty/stats`));
+}
+export function dutyTopology(): Promise<DutyTopology> {
+  return j(fetch(`${BASE}/duty/topology`));
+}
