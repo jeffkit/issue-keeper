@@ -738,6 +738,11 @@ def load_config(path: str | os.PathLike) -> Config:
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
         pipeline_max_in_flight=max(1, int(raw.get("pipeline_max_in_flight", 2))),
+        # 管线档位全局层（2026-10-10）：**必须显式读取**——本 dataclass 的
+        # yaml 装配是逐字段白名单式（同款「死旋钮」陷阱见上方 max_in_flight
+        # / daily_limit 两处注释），漏读则恒为 dataclass 默认值，切档静默失效。
+        pipeline_default_agent=(raw.get("pipeline_default_agent") or "").strip(),
+        pipeline_default_reviewer=(raw.get("pipeline_default_reviewer") or "").strip(),
         pipeline_priority_repos=pipeline_priority_repos,
         pipeline_repo_limits=pipeline_repo_limits,
         comment_max_in_flight=max(1, int(raw.get("comment_max_in_flight", 3))),
