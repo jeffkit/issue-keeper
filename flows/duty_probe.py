@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""duty_probe.py —— 值守轮次的**确定性体检探针**：一次跑完，输出一条 VERDICT。
+
+背景（2026-10-09 教训，jeffkit 点名）：
+- 磁盘守卫在 Mac(17.2G)/VM(19.2G) 双双跌破 20G，16:14-16:41 间 8 次派发全部
+  `pre.ok=False → retry-later`——管线**产出为零**，但 8 个 flow 轮报全绿。
+- disk-hygiene **确实**递了 critical 工单（标题含「挡单 5」），但值守那一轮没跑
+  「读收件箱」，信号躺在 inbox 里没人看。
+- 孤儿沙箱（paused + 执行已终态）无工单路径，只有跑 sweep 才看得见。
+
+结论：**活着 ≠ 出活**。探针把「工单 / 产出 / 磁盘 / 沙箱浪费」四路信号收敛成一条
+判决，作为每轮值守的第一步（无例外）。任何一路 DEGRADED/BLOCKED 都必须当场处置。
+
+用法：
+  python3 duty_probe.py                 # 人读摘要
+  python3 duty_probe.py --json          # 机器读
+  python3 duty_probe.py --window-min 90
+退出码：0=OK，1=DEGRADED，2=BLOCKED（便于 flow/脚本判级）
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.request
+
+CONSOLE = "http://127.0.0.1:8323"
+KEY = os.environ.get("PLAITA_CONSOLE_ADMIN_API_KEY") or "b4b5042ee7d1b937633c08f3f50d4c8efbca88d33ece8a03"
+REQ_DIR = pathlib.Path("~/.issue-keeper/duty/requests").expanduser()
+IK = pathlib.Path("~/projects/infra4agent/issue-keeper").expanduser()
+FLOWS = ("self-improve-v2", "self-improve-v2-sbx")
+# 终态标志：落到基线的成功路径 vs 被 preflight 挡回
+LANDED_MARK = ("ok_eq_true", "_n14")
+BLOCKED_MARK = "contains_str_why_or_disk"
+
+
+def _get(path: str, timeout: int = 10) -> dict:
+    req = urllib.request.Request(CONSOLE + path, headers={"X-Admin-API-Key": KEY})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def probe_tickets() -> dict:
+    """未读工单：open/escalated 即为待我处置（answered=已有回复待执行）。"""
+    open_rows, crit = [], 0
+    for p in sorted(REQ_DIR.glob("req-*.json")):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        st = d.get("status")
+        if st in ("open", "escalated", "answered"):
+            open_rows.append({"id": d.get("id"), "status": st, "sev": d.get("severity"),
+                              "from": d.get("from_flow"), "title": str(d.get("title"))[:90]})
+            if d.get("severity") == "critical":
+                crit += 1
+    return {"open": open_rows, "n_open": len(open_rows), "n_critical": crit}
+
+
+def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
+    """近 window_min 的派发产出：attempts / blocked(按原因) / error / cancelled / landed。"""
+    import time
+    cutoff = time.time() - window_min * 60
+    rows, fetched = [], 0
+    for fid in FLOWS:
+        try:
+            d = _get(f"/api/executions?flow_id={fid}&limit=30")
+        except Exception:
+            continue
+        exs = d if isinstance(d, list) else d.get("executions") or []
+        for e in exs:
+            st_time = e.get("start_time") or e.get("started_at")
+            if not st_time:
+                continue
+            try:
+                ts = time.mktime(time.strptime(str(st_time)[:19], "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                continue
+            if ts < cutoff:
+                continue
+            rows.append({"eid": e["execution_id"], "flow": fid, "status": e.get("status"),
+                         "start": str(st_time)[:19]})
+    stats = {"attempts": len(rows), "landed": 0, "blocked_disk": 0, "blocked_other": 0,
+             "engine_error": 0, "cancelled": 0, "running": 0, "completed_no_land": 0,
+             "block_reasons": {}, "landed_runs": []}
+    for r in rows:
+        if r["status"] == "running":
+            stats["running"] += 1
+            continue
+        if r["status"] == "cancelled":
+            stats["cancelled"] += 1
+            continue
+        if fetched >= max_fetch:
+            continue
+        try:
+            full = _get(f"/api/executions/{r['eid']}", timeout=12)
+        except Exception:
+            continue
+        fetched += 1
+        nd = (full.get("context") or {}).get("$NODE") or {}
+        keys = list((full.get("node_timings") or {}).keys())
+        inp = (full.get("context") or {}).get("$INPUT") or {}
+        rid = str(inp.get("run_id") or "")
+        pre = nd.get("pre") or {}
+        if any(k in keys for k in LANDED_MARK):
+            stats["landed"] += 1
+            stats["landed_runs"].append(rid)
+        elif BLOCKED_MARK in keys or pre.get("ok") is False:
+            why = str(pre.get("why") or "unknown")
+            if "disk" in why.lower():
+                stats["blocked_disk"] += 1
+            else:
+                stats["blocked_other"] += 1
+            key = re.sub(r"[\d.]+", "N", why)[:48]
+            stats["block_reasons"][key] = stats["block_reasons"].get(key, 0) + 1
+        elif full.get("status") in ("failed", "error"):
+            stats["engine_error"] += 1
+        else:
+            stats["completed_no_land"] += 1
+    return stats
+
+
+def _df(path: str) -> float | None:
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / 1e9
+    except Exception:
+        return None
+
+
+def probe_disk(min_gib: float = 20.0) -> dict:
+    """双端磁盘：disk-hygiene flow 只看 VM，Mac 侧今天正是盲区。"""
+    out = {"min_gib": min_gib}
+    for name, path in (("mac", "/"), ("vm", None)):
+        if name == "mac":
+            free = _df(path)
+        else:
+            free = None
+            try:
+                r = subprocess.run(["ssh", "-o", "ConnectTimeout=8", "tcloud_gz",
+                                    "df -BG --output=avail / | tail -1"],
+                                   capture_output=True, text=True, timeout=25)
+                m = re.search(r"(\d+)", r.stdout or "")
+                free = float(m.group(1)) if m else None
+            except Exception:
+                free = None
+        out[name] = {"free_gib": round(free, 1) if free is not None else None,
+                     "below_min": (free is not None and free < min_gib)}
+    return out
+
+
+def probe_sandbox() -> dict:
+    """沙箱浪费：实例 exist 但执行已终态（孤儿）或 paused 且无活跃执行。"""
+    out = {"instances": 0, "orphans": 0, "paused_idle": 0, "waste_instance_hours": 0.0, "detail": []}
+    env = dict(os.environ, E2B_DOMAIN="ap-guangzhou.tencentags.com",
+               E2B_API_KEY=os.environ.get("E2B_API_KEY", "e2b_725235357335be8d27367c596c9e3199cf3c5eeb"))
+    py = str(IK.parent / "plaita/.venv/bin/python")
+    try:
+        r = subprocess.run([py, str(IK / "flows/ags-list.py")], capture_output=True, text=True,
+                           timeout=60, env=env)
+        inst = json.loads(r.stdout or "[]")
+    except Exception as e:
+        return {**out, "error": str(e)[:80]}
+    for it in inst:
+        out["instances"] += 1
+        age = float(it.get("age_h") or 0)
+        st = it.get("state")
+        exec_st = None
+        try:
+            d = _get(f"/api/executions/{it.get('exec')}")
+            exec_st = d.get("status")
+        except Exception:
+            pass
+        waste = False
+        if exec_st in ("completed", "failed", "error", "cancelled"):
+            out["orphans"] += 1
+            waste = True
+        elif st == "paused":
+            out["paused_idle"] += 1
+            waste = True
+        if waste:
+            out["waste_instance_hours"] += age
+            out["detail"].append({"short": it.get("short"), "age_h": age, "state": st, "exec_status": exec_st})
+    out["waste_instance_hours"] = round(out["waste_instance_hours"], 2)
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--window-min", type=int, default=90)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    tk = probe_tickets()
+    tp = probe_throughput(args.window_min)
+    dk = probe_disk()
+    sb = probe_sandbox()
+
+    reasons = []
+    level = "OK"
+    if tk["n_critical"] > 0:
+        level = "BLOCKED"
+        reasons.append("%d 张 critical 工单未处置" % tk["n_critical"])
+    if tp["attempts"] >= 3 and tp["landed"] == 0 and (tp["blocked_disk"] + tp["blocked_other"]) >= 3:
+        level = "BLOCKED"
+        top = max(tp["block_reasons"].items(), key=lambda kv: kv[1])[0] if tp["block_reasons"] else "?"
+        reasons.append("近 %dmin %d 次派发 0 落地，主因=%s" % (args.window_min, tp["attempts"], top))
+    elif tp["attempts"] >= 5 and tp["landed"] == 0:
+        level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+        reasons.append("近 %dmin %d 次派发 0 落地" % (args.window_min, tp["attempts"]))
+    for side in ("mac", "vm"):
+        if dk[side]["below_min"]:
+            level = "BLOCKED"
+            reasons.append("%s 可用 %.1fG < 守卫线 %.0fG" % (side, dk[side]["free_gib"], dk["min_gib"]))
+        elif dk[side]["free_gib"] is not None and dk[side]["free_gib"] < dk["min_gib"] + 5:
+            level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+            reasons.append("%s 余量薄 %.1fG" % (side, dk[side]["free_gib"]))
+    if sb["orphans"] > 0:
+        level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+        reasons.append("%d 个孤儿沙箱（浪费 %.1f 实例小时）" % (sb["orphans"], sb["waste_instance_hours"]))
+    if sb["paused_idle"] > 0:
+        reasons.append("%d 个 paused 空闲实例" % sb["paused_idle"])
+
+    verdict = {"level": level, "reasons": reasons, "tickets": tk, "throughput": tp,
+               "disk": dk, "sandbox": sb}
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+    else:
+        print("VERDICT=%s | %s" % (level, "；".join(reasons) if reasons else "四路信号正常"))
+        print("  工单: 待处置 %d（critical %d）" % (tk["n_open"], tk["n_critical"]))
+        print("  产出: 近%dm 派发 %d / 落地 %d / 磁盘挡回 %d / engine_error %d / cancelled %d / 在跑 %d"
+              % (args.window_min, tp["attempts"], tp["landed"], tp["blocked_disk"],
+                 tp["engine_error"], tp["cancelled"], tp["running"]))
+        print("  磁盘: mac %sG / vm %sG（线 %.0fG）"
+              % (dk["mac"]["free_gib"], dk["vm"]["free_gib"], dk["min_gib"]))
+        print("  沙箱: 实例 %d / 孤儿 %d / paused 空闲 %d / 浪费 %.2f 实例小时"
+              % (sb["instances"], sb["orphans"], sb["paused_idle"], sb["waste_instance_hours"]))
+    return {"OK": 0, "DEGRADED": 1, "BLOCKED": 2}[level]
+
+
+if __name__ == "__main__":
+    sys.exit(main())
