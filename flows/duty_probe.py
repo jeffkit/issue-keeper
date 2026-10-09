@@ -203,6 +203,64 @@ def probe_sandbox() -> dict:
     return out
 
 
+def probe_retry_storm(window_min: int = 30, threshold: int = 5) -> dict:
+    """重投风暴探针（2026-10-09 盲区补丁，另一值守实例的发现）。
+
+    当天 90 分钟零落地的真因是「节点确定性失败 → 显式重投同体副本」循环，而探针此前
+    完全看不见（node_timings 只在节点边界写、执行又不终态）。指纹：日志里的
+    `第 N/5 次重试` —— 当天 598 次全是 `1/5`（plaita#73：重试预算键被任一节点成功清零）。
+    这里按执行聚合两端 worker 日志的失败重投次数，超阈值即报。
+    """
+    import collections
+    rx = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*?第 (\d+)/5 次重试，execution_id=([0-9a-f]+)")
+    sources: list[list[str]] = []
+    mac_log = pathlib.Path("~/.plaita-console/worker-mac.log").expanduser()
+    try:
+        with open(mac_log, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 2_000_000))
+            sources.append(f.read().decode("utf-8", "ignore").splitlines())
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=8", "tcloud_gz",
+                            "tail -c 2000000 ~/.plaita-console/worker-tcg1.log"],
+                           capture_output=True, text=True, timeout=30)
+        sources.append((r.stdout or "").splitlines())
+    except Exception:
+        pass
+
+    now = time.time()
+    by_exec: collections.Counter = collections.Counter()
+    ordinals: collections.Counter = collections.Counter()
+    total = 0
+    recent10 = 0
+    for lines in sources:
+        for line in lines:
+            m = rx.search(line)
+            if not m:
+                continue
+            try:
+                ts = time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                continue
+            age = now - ts
+            if age <= 600:
+                recent10 += 1
+            if age > window_min * 60:
+                continue
+            total += 1
+            by_exec[m.group(3)[:8]] += 1
+            ordinals[m.group(2)] += 1
+    worst = by_exec.most_common(1)[0] if by_exec else ("", 0)
+    return {"window_min": window_min, "total": total, "recent10": recent10,
+            "by_exec": dict(by_exec.most_common(5)), "ordinals": dict(ordinals),
+            "worst_exec": worst[0], "worst_count": worst[1], "threshold": threshold,
+            # 只有「仍在进行」才算问题：停息后 30 分钟窗口里仍留着一堆历史计数，
+            # 若据此报警会连续误报（2026-10-09 18:3x 实测：近 30min 92 次但近 10min 为 0）。
+            "active": recent10 >= 3}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--window-min", type=int, default=90)
@@ -213,6 +271,7 @@ def main() -> int:
     tp = probe_throughput(args.window_min)
     dk = probe_disk()
     sb = probe_sandbox()
+    rs = probe_retry_storm(30)
 
     reasons = []
     level = "OK"
@@ -246,9 +305,14 @@ def main() -> int:
         reasons.append("%d 个孤儿沙箱（浪费 %.1f 实例小时）" % (sb["orphans"], sb["waste_instance_hours"]))
     if sb["paused_idle"] > 0:
         reasons.append("%d 个 paused 空闲实例" % sb["paused_idle"])
+    if rs["active"]:
+        ordinal_hint = "（全为第 1/5 → 疑 #73 预算键被清零）" if set(rs["ordinals"]) <= {"1"} else ""
+        level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+        reasons.append("重投风暴进行中：执行 %s 近 %dmin 重投 %d 次、近 10min %d 次%s"
+                       % (rs["worst_exec"], rs["window_min"], rs["worst_count"], rs["recent10"], ordinal_hint))
 
     verdict = {"level": level, "reasons": reasons, "tickets": tk, "throughput": tp,
-               "disk": dk, "sandbox": sb}
+               "disk": dk, "sandbox": sb, "retry_storm": rs}
     # 心跳：独立兜底脚本（duty_escalation.py，launchd */3）据此判断「值守是否在场」——
     # 探针是每轮第 0 步，所以它的 mtime 就是值守活跃度最可靠的代理。
     try:
@@ -270,6 +334,10 @@ def main() -> int:
               % (dk["mac"]["free_gib"], dk["vm"]["free_gib"], dk["min_gib"]))
         print("  沙箱: 实例 %d / 孤儿 %d / paused 空闲 %d / 浪费 %.2f 实例小时"
               % (sb["instances"], sb["orphans"], sb["paused_idle"], sb["waste_instance_hours"]))
+        print("  重投: 近%dm %d 次 / 近10min %d 次%s%s"
+              % (rs["window_min"], rs["total"], rs["recent10"],
+                 ("，最多 " + rs["worst_exec"] + "×" + str(rs["worst_count"])) if rs["worst_exec"] else "",
+                 "（进行中）" if rs["active"] else "（已停息）"))
     return {"OK": 0, "DEGRADED": 1, "BLOCKED": 2}[level]
 
 
