@@ -189,18 +189,9 @@ def run(input):
     if input.get("dryrun"):
         return {"posted": False, "why": "dryrun"}
 
-    body = ("<!-- issue-keeper-bot -->\\n**[ctrl-watch] 值守看门狗升级（P1）**\\n\\n"
-            "%s\\n\\n—— 主控已 flow 化（ctrl-watch），本条为自动升级路由；"
-            "处理完了回一句即可，我不会重复刷屏（60min 去重）。"
-            % str(input.get("report") or "")[:1500])
-    import tempfile
-    fd, p = tempfile.mkstemp(suffix=".md")
-    with os.fdopen(fd, "w") as f:
-        f.write(body)
-    out = subprocess.run("gh issue comment 2 -R jeffkit/infra4agent --body-file " + p,
-                         shell=True, capture_output=True, text=True, timeout=60)
-    os.unlink(p)
-    ok = out.returncode == 0
+    # 2026-10-09 jeffkit 定：**不再直接发 #2**（#2 这种单子后续也不用）。
+    # 主控只探测 + 递工单给值守 Agent；是否惊动/留痕由值守判断。
+    ok = True
     # ── HITL 推送（jeffkit 2026-10-09：需要人工处理时用 HITL 通知人）──
     # 默认只推（wait_secs=0，零占用）；看情况给 hitl_wait_secs>0 才建会话限时等回复。
     # 反馈入口双通道：微信直接回 + 本条 #2 链接（在 issue 上回评/打标同样有效）。
