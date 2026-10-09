@@ -448,6 +448,11 @@ table.nodes tr.row-bad { background: rgba(255,107,107,.10); }
   max-width: 100%;
   padding: 14px 18px 48px;
   overflow-x: hidden;
+  /* app 外壳是固定 100vh 的 flex 列，长页面必须由本视图自己滚动，
+     否则底部区块会落在文档滚动高度之外、永远看不到（2026-10-09 实测） */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 .duty-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 2px 0 16px; }
 .duty-head h2 { margin: 0; font-size: 17px; font-weight: 600; color: var(--text); }
