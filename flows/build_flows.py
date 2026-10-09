@@ -65,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     for name in names:
         src, out = FLOWS[name]
         cmd = ["build", str(HERE / src), "-o", str(HERE / out),
-               "--register", "plaita_nodes", "--code-backend", "subprocess"]
+               "--register", "plaita_nodes", "--code-backend", "subprocess",
+               "--embed-source"]
         if args.check:
             cmd.append("--check")
         rc = plaita_main(cmd)
