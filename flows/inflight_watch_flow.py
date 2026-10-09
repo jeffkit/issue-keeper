@@ -316,7 +316,9 @@ def run(input):
     raised = None
     attempts = int(tp.get("attempts") or 0)
     landed = int(tp.get("landed") or 0)
-    stuck = level in ("BLOCKED", "DEGRADED") and attempts >= 5 and landed == 0
+    # 只在**真停摆**（BLOCKED：0 落地且无 run 在跑）递单；DEGRADED（如恢复中）不递，
+    # 避免历史挡回窗口造成的误报疲劳。
+    stuck = level == "BLOCKED" and attempts >= 5 and landed == 0
     if stuck and not input.get("dryrun"):
         duty = os.path.expanduser(input.get("duty_dir") or "~/.issue-keeper/duty")
         # 去重窗口 2h（**不论状态**）：产出停摆的判据窗口是 90 分钟，若只看「未决」

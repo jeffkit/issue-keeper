@@ -179,7 +179,10 @@ def probe_sandbox() -> dict:
         if exec_st in ("completed", "failed", "error", "cancelled"):
             out["orphans"] += 1
             waste = True
-        elif st == "paused":
+        elif st == "paused" and (exec_st != "running" or age >= 1.0):
+            # paused 但执行在跑 = 活跃 run 的空闲期（E2B 会暂停空闲沙箱），不是浪费；
+            # 只有 paused 且执行未知、或长时（>1h）挂着才算（2026-10-09 误报修正：
+            # amuvsy4n2jipok age 0.23h / exec running 被计入 waste）。
             out["paused_idle"] += 1
             waste = True
         if waste:
@@ -206,9 +209,17 @@ def main() -> int:
         level = "BLOCKED"
         reasons.append("%d 张 critical 工单未处置" % tk["n_critical"])
     if tp["attempts"] >= 3 and tp["landed"] == 0 and (tp["blocked_disk"] + tp["blocked_other"]) >= 3:
-        level = "BLOCKED"
         top = max(tp["block_reasons"].items(), key=lambda kv: kv[1])[0] if tp["block_reasons"] else "?"
-        reasons.append("近 %dmin %d 次派发 0 落地，主因=%s" % (args.window_min, tp["attempts"], top))
+        if tp["running"] >= 1:
+            # 有 run 在跑 = 派发链路当前是通的，历史挡回不等于现在卡死（2026-10-09
+            # 实证：磁盘修好后 6 个 run pre.ok=True 在跑，探针仍报 BLOCKED 属误报疲劳）。
+            level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+            reasons.append("恢复中：近 %dmin 历史挡回 %d 次，当前 %d 个 run 在跑"
+                           % (args.window_min, tp["blocked_disk"] + tp["blocked_other"], tp["running"]))
+        else:
+            level = "BLOCKED"
+            reasons.append("近 %dmin %d 次派发 0 落地且无 run 在跑，主因=%s"
+                           % (args.window_min, tp["attempts"], top))
     elif tp["attempts"] >= 5 and tp["landed"] == 0:
         level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
         reasons.append("近 %dmin %d 次派发 0 落地" % (args.window_min, tp["attempts"]))
