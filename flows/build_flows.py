@@ -35,7 +35,6 @@ FLOWS: dict[str, tuple[str, str]] = {
     "inflight-watch": ("inflight_watch_flow.py", "inflight-watch.flow.json"),
     "disk-hygiene": ("disk_hygiene_flow.py", "disk-hygiene.flow.json"),
     "hitl-inbox": ("hitl_inbox_flow.py", "hitl-inbox.flow.json"),
-    "duty-agent": ("duty_agent_flow.py", "duty-agent.flow.json"),
 }
 
 

@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import { dutyHumanQueue, dutyOverview, dutyStats, dutyTopology, type ThroughputRepoWindow } from "../api";
-import type { DutyOverview, DutyStats, DutyTopology, HumanQueue } from "../api";
+import type { DutyOverview, DutyRequest, DutyStats, DutyTopology, HumanQueue } from "../api";
 
 /** 值守总览——业务级协同的可视化：拓扑 + 心跳 + 统计图表（配色随全站深色主题）。 */
 
 const STATE_META: Record<string, { color: string; label: string }> = {
-  healthy: { color: "#3ddc84", label: "健康" },
-  idle: { color: "#8a93a3", label: "空闲" },
-  degraded: { color: "#f5a623", label: "降级" },
-  stalled: { color: "#ff6b6b", label: "停摆" },
+  working: { color: "#f5a623", label: "工作中" },
+  idle: { color: "#3ddc84", label: "空闲/正常" },
+  warn: { color: "#ffd166", label: "降级" },
+  error: { color: "#ff6b6b", label: "异常" },
+  unknown: { color: "#8a93a3", label: "未知" },
 };
 
 function fmtAge(sec?: number): string {
@@ -112,7 +113,7 @@ function Topology({ topo }: { topo: DutyTopology | null }) {
         {topo.nodes.map((n) => {
           const p = POS[n.id];
           if (!p) return null;
-          const meta = STATE_META[n.state] || STATE_META.idle;
+          const meta = STATE_META[n.state] || STATE_META.unknown;
           return (
             <g key={n.id} transform={`translate(${p.x},${p.y})`}>
               <title>{`${n.label}｜${meta.label}｜${n.detail}`}</title>
@@ -346,11 +347,22 @@ export function DutyView() {
           <div className="s">轮{ov?.controller?.round ?? "—"} · {ov?.controller?.status || "—"}</div>
         </div>
         <div className="duty-card">
-          <div className="k">在途 / 闸</div>
-          <div className="v">{inflight.length} / 4</div>
+          <div className="k">在途 / 闸（主版/灰度）</div>
+          <div className="v">
+            {inflight.length} / 4
+            <small className="eng-split">
+              主 {inflight.filter((i) => i.engine !== "sbx").length} · 沙 {inflight.filter((i) => i.engine === "sbx").length}
+            </small>
+          </div>
           <div className="s duty-list">
             {inflight.length
-              ? inflight.map((i) => <span key={`${i.repo}#${i.issue}`}>{i.repo.replace("jeffkit/", "")}#{i.issue} <em>{Math.round(i.minutes)}m</em></span>)
+              ? inflight.map((i) => (
+                  <span key={`${i.repo}#${i.issue}`}>
+                    {i.repo.replace("jeffkit/", "")}#{i.issue}
+                    {i.engine && <b className={`eng ${i.engine === "sbx" ? "eng-sbx" : "eng-main"}`}>{i.engine === "sbx" ? "沙" : "主"}</b>}
+                    <em>{Math.round(i.minutes)}m</em>
+                  </span>
+                ))
               : "—"}
           </div>
         </div>
@@ -382,6 +394,37 @@ export function DutyView() {
       <section className="duty-section">
         <h3>工作流拓扑（状态实时）</h3>
         <Topology topo={topo} />
+      </section>
+
+      <section className="duty-section">
+        <h3>
+          工单收件箱（值守 Agent 的决策队列）
+          <span className="muted" style={{ fontWeight: 400, fontSize: 12, marginLeft: 8 }}>
+            待处置 {hq?.requests?.active ?? 0} / 共 {hq?.requests?.total ?? 0}
+            {hq?.requests?.counts ? ` · ${Object.entries(hq.requests.counts).map(([k, v]) => `${k} ${v}`).join(" / ")}` : ""}
+          </span>
+        </h3>
+        <div className="duty-reqs">
+          {(hq?.requests?.items || []).length === 0 && <div className="muted">暂无工单</div>}
+          {(hq?.requests?.items || []).map((r: DutyRequest) => (
+            <div key={r.id} className={`duty-req st-${r.status}`}>
+              <div className="row1">
+                <span className={`badge b-${r.status}`}>{r.status}</span>
+                <span className="src">{r.from_flow}</span>
+                <span className="sev">{r.severity}</span>
+                <span className="t">{fit(r.title, 78)}</span>
+                <span className="age">{r.created_at}</span>
+              </div>
+              {(r.action || r.rationale) && (
+                <div className="dec">
+                  ▸ 值守决定{r.by ? `（${r.by}）` : ""}：<b>{r.action || "—"}</b>
+                  {r.rationale ? ` — ${fit(r.rationale, 110)}` : ""}
+                </div>
+              )}
+              {r.human_reply && <div className="reply">▸ 人回复：{fit(r.human_reply, 110)}</div>}
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className="duty-section">
