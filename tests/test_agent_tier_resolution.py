@@ -95,3 +95,48 @@ def test_both_dispatch_sites_use_global_tier():
     )
     # 不得残留写死的 glm 兜底（应经全局层再兜底）
     assert '"agent": pc.agent or "glm53-flash"' not in src, "主派发仍有写死兜底"
+
+
+def test_yaml_values_are_actually_loaded(tmp_path):
+    """★ yaml 旋钮必须**真的被读取**——本 dataclass 是逐字段白名单装配。
+
+    「死旋钮」陷阱在本仓已发生**三次**（见 config.py 内 max_in_flight /
+    daily_limit / console_queue_grace_secs 三处注释）：dataclass 加了字段、
+    yaml 也写了，但 load_config 的构造式没读 ⇒ 恒为默认值、切档静默失效。
+    2026-10-10 我自己又踩了一次（`pipeline_default_agent` 解析恒为 ''），
+    所以此处用**真实 load_config** 端到端钉住，而不只测 dataclass 默认值。
+    """
+    import yaml
+
+    from issue_keeper.config import load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(yaml.safe_dump({
+        "screener": {"enabled": False, "backend": "classic",
+                     "api_key": "x", "base_url": "http://x", "model": "m"},
+        "pipeline_default_agent": "deepseek-flash",
+        "pipeline_default_reviewer": "glm53-flash",
+    }, allow_unicode=True), encoding="utf-8")
+
+    c = load_config(str(cfg_file))
+    assert c.pipeline_default_agent == "deepseek-flash", (
+        "yaml 写了但没被 load_config 读取 ⇒ 死旋钮（切档静默失效）"
+    )
+    assert c.pipeline_default_reviewer == "glm53-flash"
+
+
+def test_yaml_absent_keeps_empty_default(tmp_path):
+    """未配置 → 空串（回退硬编码 glm53-flash，存量部署行为不变）。"""
+    import yaml
+
+    from issue_keeper.config import load_config
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(yaml.safe_dump({
+        "screener": {"enabled": False, "backend": "classic",
+                     "api_key": "x", "base_url": "http://x", "model": "m"},
+    }, allow_unicode=True), encoding="utf-8")
+
+    c = load_config(str(cfg_file))
+    assert c.pipeline_default_agent == ""
+    assert c.pipeline_default_reviewer == ""
