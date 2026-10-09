@@ -171,24 +171,34 @@ def probe_sandbox() -> dict:
         age = float(it.get("age_h") or 0)
         st = it.get("state")
         exec_st = None
+        exec_age_min = None
         try:
             d = _get(f"/api/executions/{it.get('exec')}")
             exec_st = d.get("status")
+            lu = d.get("last_update_time") or d.get("updated_at")
+            if lu:
+                exec_age_min = (time.time() - time.mktime(
+                    time.strptime(str(lu)[:19], "%Y-%m-%dT%H:%M:%S"))) / 60
         except Exception:
             pass
         waste = False
         if exec_st in ("completed", "failed", "error", "cancelled"):
             out["orphans"] += 1
             waste = True
-        elif st == "paused" and (exec_st != "running" or age >= 1.0):
-            # paused 但执行在跑 = 活跃 run 的空闲期（E2B 会暂停空闲沙箱），不是浪费；
-            # 只有 paused 且执行未知、或长时（>1h）挂着才算（2026-10-09 误报修正：
-            # amuvsy4n2jipok age 0.23h / exec running 被计入 waste）。
-            out["paused_idle"] += 1
-            waste = True
+        elif st in ("paused", "pausing"):
+            # E2B 会在空闲期自动 pause/pausing，活跃 run 的沙箱状态本就滚动
+            # （2026-10-09 18:0x 实测：4 实例状态 pausing/running 交替，其执行末节点
+            #  刚在 18:00:1x 更新——被误计为浪费 2.4 实例小时）。只有执行非 running，
+            #  或 running 但进度龄 >30min（真卡住）才算浪费。
+            stalled = exec_st != "running" or exec_age_min is None or exec_age_min > 30
+            if stalled:
+                out["paused_idle"] += 1
+                waste = True
         if waste:
             out["waste_instance_hours"] += age
-            out["detail"].append({"short": it.get("short"), "age_h": age, "state": st, "exec_status": exec_st})
+            out["detail"].append({"short": it.get("short"), "age_h": age, "state": st,
+                                  "exec_status": exec_st,
+                                  "exec_progress_age_min": round(exec_age_min, 1) if exec_age_min is not None else None})
     out["waste_instance_hours"] = round(out["waste_instance_hours"], 2)
     return out
 
