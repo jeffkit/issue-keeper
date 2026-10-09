@@ -93,6 +93,9 @@ def main() -> int:
         r = subprocess.run(["bash", TIER, "deepseek"], capture_output=True, text=True, timeout=90)
         ok = "deepseek" in r.stdout
         _log("切档%s" % ("成功 ✓" if ok else "失败 ✗: " + (r.stderr or "")[:200]))
+        # 切档是**事件**：递一张工单，duty-watch 插件会往值守会话 inbox 投递
+        # （这样无需我每 10 分钟轮询；只有真发生切换时才唤醒值守）。
+        _file_ticket(ok, code, body)
         return 0 if ok else 1
 
     if exhausted:
@@ -107,3 +110,24 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def _file_ticket(ok: bool, code: int, body: str) -> None:
+    """切档后递工单（open 状态 → duty-watch 插件注入值守会话）。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    req = os.path.join(here, "duty_request.py")
+    title = ("[配额] GLM 烧穿已自动切 DeepSeek" if ok
+             else "[配额] GLM 烧穿自动切档**失败**")
+    ctx = {"detected_http": code, "glm_body": (body or "")[:200],
+           "action": "model_tier.sh deepseek" if ok else "需人工排查 agent_env",
+           "revert": "恢复 GLM：bash flows/model_tier.sh glm（备份额度 config.yaml.bak-<日期>-tier）"}
+    opts = "keep,switch_back_glm,escalate_human" if ok else "escalate_human"
+    try:
+        subprocess.run(
+            ["python3", req, "create", "--from-flow", "model-fallback",
+             "--kind", "quota-switch", "--severity", "critical" if not ok else "warn",
+             "--title", title, "--context-json", json.dumps(ctx, ensure_ascii=False),
+             "--options", opts],
+            capture_output=True, text=True, timeout=60, check=False)
+    except Exception as e:  # noqa: BLE001 — 递单失败不影响切档本身
+        _log("递工单失败（忽略）: %s" % str(e)[:120])
