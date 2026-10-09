@@ -179,7 +179,7 @@ export interface DutyOverview {
   controller: { round?: number; status?: string; finished_at?: string; age_sec?: number };
   b_shift: { time?: string; kind?: string; brief?: string; text?: string; raw?: string };
   vm: { sched?: string; keeper?: string; disk?: string; dlq?: string; error?: string };
-  inflight: { repo: string; issue: string; minutes: number }[];
+  inflight: { repo: string; issue: string; minutes: number; engine?: "main" | "sbx" | null }[];
   shadow: { generated_at?: string; budget_left?: number; would_dispatch?: number; skip?: Record<string, number>; error?: string };
 }
 
@@ -236,11 +236,18 @@ export function dutyTopology(): Promise<DutyTopology> {
 
 // ---------- 等人工队列 ----------
 
+export interface DutyRequest {
+  id: string; status: string; severity: string; from_flow: string; kind: string;
+  title: string; created_at: string; action: string; by: string;
+  rationale: string; human_reply: string; human_notified: boolean;
+}
+
 export interface HumanQueue {
   ts: string;
   needs_human: { items: { repo: string; number: number; title: string; url: string; updated_at: string; age_h: number | null }[]; count: number; error?: string };
   hitl_recent: { items: { ts: string; title: string; status: string; session_id: string; feedback_url: string; waited: number; replies: string[] }[]; count: number };
   hil_pending: { items: { short_id: string; message: string; created_at: string; left_min: number | null }[]; total: number; error?: string };
+  requests: { items: DutyRequest[]; counts: Record<string, number>; active: number; total: number };
 }
 
 export function dutyHumanQueue(): Promise<HumanQueue> {

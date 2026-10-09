@@ -473,6 +473,10 @@ table.nodes tr.row-bad { background: rgba(255,107,107,.10); }
 }
 .duty-card .k { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .duty-card .v { font-size: 22px; font-weight: 600; color: var(--text); line-height: 1.2; }
+.duty-card .v .eng-split { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 8px; }
+.duty-card .s .eng { font-size: 10px; line-height: 1.4; padding: 0 3px; border-radius: 3px; margin: 0 1px 0 3px; font-weight: 600; }
+.duty-card .s .eng-main { background: rgba(79, 140, 255, 0.16); color: #6ea8fe; }
+.duty-card .s .eng-sbx { background: rgba(176, 124, 198, 0.16); color: #b07cc6; }
 .duty-card .s { font-size: 11.5px; color: var(--muted); margin-top: 6px; overflow-wrap: anywhere; }
 .duty-card .s.duty-list { display: flex; flex-wrap: wrap; gap: 4px 10px; }
 .duty-card .s.duty-list em { color: var(--accent-2); font-style: normal; }
@@ -554,3 +558,24 @@ a.duty-human-row:hover .title { color: var(--accent-2); }
 .duty-human-row .repo { color: var(--accent-2); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
 .duty-human-row .title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .duty-human-row .age { color: var(--muted); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+
+/* ---------- 工单收件箱（值守 Agent 决策队列） ---------- */
+.duty-reqs { display: flex; flex-direction: column; gap: 6px; }
+.duty-req { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--muted); border-radius: 8px; padding: 8px 10px; font-size: 12.5px; }
+.duty-req.st-escalated { border-left-color: #ff6b6b; }
+.duty-req.st-answered { border-left-color: #f5a623; }
+.duty-req.st-open { border-left-color: var(--accent); }
+.duty-req.st-decided, .duty-req.st-resolved { border-left-color: #3ddc84; }
+.duty-req .row1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.duty-req .badge { flex: 0 0 auto; padding: 1px 6px; border-radius: 4px; font-size: 11px; background: var(--panel-2); color: var(--muted); }
+.duty-req .badge.b-escalated { background: rgba(255,107,107,.16); color: #ff8f8f; }
+.duty-req .badge.b-answered { background: rgba(245,166,35,.16); color: #f5a623; }
+.duty-req .badge.b-open { background: rgba(79,140,255,.16); color: var(--accent-2); }
+.duty-req .badge.b-decided, .duty-req .badge.b-resolved { background: rgba(61,220,132,.14); color: #3ddc84; }
+.duty-req .src { color: var(--accent-2); flex: 0 0 auto; }
+.duty-req .sev { color: var(--muted); flex: 0 0 auto; font-size: 11px; }
+.duty-req .t { flex: 1 1 auto; min-width: 0; color: var(--text); }
+.duty-req .age { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.duty-req .dec, .duty-req .reply { margin-top: 4px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.duty-req .dec b { color: var(--accent-2); }
+.duty-req .reply { color: #f5a623; }

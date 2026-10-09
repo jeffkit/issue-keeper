@@ -347,10 +347,64 @@ def human_queue() -> dict:
         "needs_human": _cached("needs_human", 120, _needs_human),
         "hitl_recent": _cached("hitl_recent", 30, _hitl_recent),
         "hil_pending": _cached("hil_pending", 60, _hil_pending),
+        "requests": _cached("duty_requests", 20, _requests),
     }
 
 
+# ---------- 工单收件箱（值守 Agent 的决策队列）----------
+
+REQ_DIR = DUTY_DIR / "requests"
+_STATUS_ORDER = {"escalated": 0, "answered": 1, "open": 2, "decided": 3, "resolved": 4, "dismissed": 5}
+
+
+def _requests() -> dict:
+    """读 duty/requests/*.json（flow 递来的决策工单 + 值守 Agent 的处置留痕）。"""
+    rows = []
+    try:
+        paths = sorted(REQ_DIR.glob("req-*.json")) if REQ_DIR.is_dir() else []
+    except Exception:
+        paths = []
+    for p in paths:
+        try:
+            d = json.load(open(p))
+        except Exception:
+            continue
+        dec = d.get("decision") or {}
+        hum = d.get("human") or {}
+        rows.append({
+            "id": d.get("id"), "status": d.get("status"), "severity": d.get("severity"),
+            "from_flow": d.get("from_flow"), "kind": d.get("kind"),
+            "title": (d.get("title") or "")[:120],
+            "created_at": str(d.get("created_at") or "")[5:16].replace("T", " "),
+            "action": dec.get("action") or "", "by": dec.get("by") or "",
+            "rationale": (dec.get("rationale") or "")[:200],
+            "human_reply": (hum.get("reply") or "")[:160],
+            "human_notified": bool(hum.get("session_id")),
+        })
+    rows.sort(key=lambda r: (_STATUS_ORDER.get(r["status"] or "", 9), r.get("created_at") or ""))
+    counts: dict = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    active = [r for r in rows if r["status"] in ("escalated", "answered", "open")]
+    done = [r for r in rows if r["status"] not in ("escalated", "answered", "open")]
+    return {"items": (active + done)[:20], "counts": counts,
+            "active": len(active), "total": len(rows)}
+
+
 # ---------- topology ----------
+
+def _last_run_age() -> float | None:
+    """最近一次 run 收尾距今秒数（runs.jsonl 尾行）——reaper 活跃度信号。"""
+    out = _sh("ssh -o ConnectTimeout=8 tcloud_gz "
+              "'tail -1 ~/.issue-keeper/pipeline/runs.jsonl 2>/dev/null'", timeout=20)
+    try:
+        ts = str(json.loads(out).get("ts") or "")
+        import datetime as _dt
+        t = _dt.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")
+        return max(0.0, (_dt.datetime.now() - t).total_seconds())
+    except Exception:
+        return None
+
 
 def topology() -> dict:
     ov = _cached("ov_topo", 60, overview)
@@ -367,33 +421,89 @@ def topology() -> dict:
                 "detail": detail, **(meta or {})}
 
     sbx_n = len((sbx.get("instances") or []))
+    # 在途归属：inflight_query.py 顺带读 console-exec.json 的 flow_id（-sbx=灰度）
+    main_n = sum(1 for i in inflight if i.get("engine") == "main")
+    sbx_run_n = sum(1 for i in inflight if i.get("engine") == "sbx")
+
+    import datetime as _dt
+
+    def _age_min(ts: str | None) -> float | None:
+        if not ts:
+            return None
+        try:
+            t = _dt.datetime.strptime(str(ts)[:16], "%Y-%m-%d %H:%M")
+            return (_dt.datetime.now() - t).total_seconds() / 60
+        except Exception:
+            return None
+
+    last_run = _cached("last_run_age", 120, _last_run_age)  # 秒；None=取不到信号
+    sh_age = _age_min(shadow.get("generated_at"))
+    a_status, a_age = a.get("status"), (a.get("age_sec") or 0)
+    c = ov.get("controller") or {}
+    c_status, c_age = c.get("status"), (c.get("age_sec") or 0)
+    b_age = None
+    if b.get("time"):
+        try:
+            t = _dt.datetime.strptime(
+                f"{_dt.date.today().isoformat()} {b['time']}", "%Y-%m-%d %H:%M")
+            b_age = (_dt.datetime.now() - t).total_seconds() / 60
+            if b_age < 0:
+                b_age += 1440  # 跨零点
+        except Exception:
+            pass
+    dlq_raw = str(vm.get("dlq") or "")
+    dlq_n = int(dlq_raw) if dlq_raw.isdigit() else 0
+    sched_ok, keeper_ok = vm.get("sched") == "active", vm.get("keeper") == "active"
+
+    # 节点状态口径（前端配色）：working=橙·在干活 / idle=绿·空闲 /
+    # warn=黄·降级 / error=红·异常 / unknown=灰·取不到信号。
+    # 全部由实时信号推导（在途数/心跳新鲜度/末次收尾/服务状态），不再写死。
     nodes = [
         node("external", "外部用户 / jeffkit", "actor",
-             "healthy", "提 issue · /accept 验收"),
-        node("github", "GitHub Issues", "store", "healthy",
+             "idle", "提 issue · /accept 验收"),
+        node("github", "GitHub Issues", "store", "idle",
              "tunely 仓 + 各子仓", {"repo": "jeffkit/*"}),
         node("shadow", "keeper-shadow 派发", "flow",
-             "healthy" if shadow.get("generated_at") else "stalled",
+             "working" if (sh_age is not None and sh_age < 6 and (shadow.get("would_dispatch") or 0) > 0)
+             else "idle" if (sh_age is not None and sh_age < 20)
+             else "warn" if sh_age is not None else "error",
              f"对账 {str(shadow.get('generated_at', ''))[5:16]} · budget={shadow.get('budget_left')}"),
-        node("improve", "self-improve-v2 开发", "flow", "healthy",
-             f"主版：本机 recursive；在途 {len(inflight)}"),
+        node("improve", "self-improve-v2 开发", "flow",
+             "working" if main_n > 0 else "idle",
+             f"主版在途 {main_n} / 全局在途 {len(inflight)}"),
         node("sbx", "沙箱版 sbx（灰度）", "flow",
-             "healthy" if sbx_n else "idle",
-             f"AGS 实例 ×{sbx_n}"),
-        node("reaper", "reaper 收尾回评", "flow", "healthy", "status=done → 回评"),
+             "working" if sbx_run_n > 0 else ("warn" if sbx_n > 0 else "idle"),
+             f"AGS 实例 ×{sbx_n} · 灰度在途 {sbx_run_n}"),
+        node("reaper", "reaper 收尾回评", "flow",
+             "working" if last_run is not None and last_run < 1800
+             else "idle" if last_run is not None and last_run < 28800
+             else "warn" if last_run is not None else "unknown",
+             f"末次收尾 {f'{last_run / 60:.0f}min 前' if last_run is not None else '—'}"),
         node("accept", "A 班 issue-accept 验收", "flow",
-             ("healthy" if (a.get("age_sec") or 9999) < 1800 else "stalled"),
-             f"轮{a.get('round')} · {a.get('age_sec', 0)//60}min 前"),
+             "working" if a_status == "running"
+             else "error" if a_status in ("failed", "aborted")
+             else "idle" if a_age < 1800 else "warn" if a_age < 3600 else "error",
+             f"轮{a.get('round')} · {a_age // 60}min 前"),
         node("external_check", "外部验收 /accept", "gate",
-             "healthy", "验收通过 → 合并/关单"),
-        node("bwatch", "B 班 keeper-watch", "flow", "healthy",
+             "idle", "验收通过 → 合并/关单"),
+        node("bwatch", "B 班 keeper-watch", "flow",
+             "working" if b_age is not None and b_age < 120
+             else "idle" if b_age is not None and b_age < 480
+             else "warn" if b_age is not None else "unknown",
              f"{b.get('time', '—')} {b.get('kind') or ''}轮 · {b.get('brief', '')}".strip()),
-        node("ctrl", "主控 ctrl-watch", "flow", "healthy", "看门狗 + 升级路由"),
+        node("ctrl", "主控 ctrl-watch", "flow",
+             "working" if c_status == "running"
+             else "error" if c_status in ("failed", "aborted")
+             else "warn" if c_status == "attention" or c_age > 7200
+             else "idle" if c_status == "ok" else "unknown",
+             "看门狗 + 升级路由"),
         node("duty", "duty 内核（状态权威）", "store",
-             "healthy", f"roster gen={(ov.get('roster') or {}).get('generation')}"),
+             "idle" if (ov.get("roster") or {}).get("generation") else "error",
+             f"roster gen={(ov.get('roster') or {}).get('generation')}"),
         node("core", "plaita 内核 + console", "infra",
-             "healthy" if vm.get("sched") == "active" else "degraded",
-             f"sched={vm.get('sched')} keeper={vm.get('keeper')}"),
+             "idle" if sched_ok and keeper_ok and dlq_n == 0
+             else "error" if not sched_ok and not keeper_ok else "warn",
+             f"sched={vm.get('sched')} keeper={vm.get('keeper')} DLQ={vm.get('dlq') or '—'}"),
     ]
     edges = [
         {"from": "external", "to": "github", "label": "提 issue"},
