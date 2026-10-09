@@ -1,0 +1,86 @@
+{
+  "runtime": "python",
+  "flow_id": "sandbox-watch",
+  "inputType": {
+    "dataType": "object"
+  },
+  "desc": "【值守·沙箱】AGS 实例巡检：孤儿清查（终态 run 的实例）+ 静默卡死判定 + 配额压力；ctrl 队列 */30",
+  "nodes": [
+    {
+      "type": "start",
+      "id": "start",
+      "next": "facts"
+    },
+    {
+      "type": "code",
+      "id": "facts",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, subprocess, time, urllib.request\n\n    VENV = input.get(\"venv_py\") or \"/Users/kong/projects/infra4agent/plaita/.venv/bin/python\"\n    LISTER = input.get(\"lister\") or \"/Users/kong/projects/infra4agent/issue-keeper/flows/ags-list.py\"\n    KEY = input.get(\"console_key\") or \"b4b5042ee7d1b937633c08f3f50d4c8efbca88d33ece8a03\"\n    ENV = (\"E2B_DOMAIN=ap-guangzhou.tencentags.com \"\n           \"E2B_API_KEY=e2b_725235357335be8d27367c596c9e3199cf3c5eeb \")\n\n    def sh(cmd, timeout=60):\n        try:\n            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)\n            return (r.stdout or \"\").strip()\n        except Exception as e:\n            return \"\"\n\n    out = sh(ENV + VENV + \" \" + LISTER)\n    try:\n        items = json.loads(out)\n    except Exception:\n        items = []\n\n    now = time.time()\n    rows = []\n    for it in items:\n        eid = it.get(\"exec\") or \"\"\n        st, upd_age = \"unknown\", None\n        if eid:\n            try:\n                req = urllib.request.Request(\n                    \"http://127.0.0.1:8323/api/executions/\" + eid,\n                    headers={\"X-Admin-API-Key\": KEY})\n                d = json.load(urllib.request.urlopen(req, timeout=8))\n                st = str(d.get(\"status\") or \"unknown\")\n                ts = d.get(\"last_update_time\") or d.get(\"start_time\")\n                if ts:\n                    import datetime\n                    try:\n                        upd = datetime.datetime.fromisoformat(str(ts)[:19])\n                        upd_age = int(now - upd.timestamp())\n                    except Exception:\n                        upd_age = None\n            except Exception as e:\n                st = \"query-failed\"\n        rows.append({**it, \"exec_status\": st, \"exec_update_age_sec\": upd_age})\n    return {\"instances\": rows, \"count\": len(rows), \"now\": now, \"error\": None if items else out[:200]}\n",
+      "input": {
+        "venv_py": "$INPUT.venv_py",
+        "lister": "$INPUT.lister",
+        "console_key": "$INPUT.console_key"
+      },
+      "next": "triage",
+      "source_line": 35
+    },
+    {
+      "type": "code",
+      "id": "triage",
+      "language": "python",
+      "code": "\ndef run(input):\n    TERMINAL = {\"completed\", \"failed\", \"cancelled\", \"error\"}\n    inst = input.get(\"instances\") or []\n    orphan_h = float(input.get(\"orphan_min_age_h\") or 0.5)\n    stall_min = float(input.get(\"stall_min\") or 30)\n    quota_warn = int(input.get(\"quota_warn\") or 6)\n\n    orphans, stalled, findings = [], [], []\n    for it in inst:\n        age = it.get(\"age_h\") or 0\n        st = it.get(\"exec_status\") or \"unknown\"\n        upd = it.get(\"exec_update_age_sec\")\n        if (st in TERMINAL or st in (\"unknown\", \"query-failed\")) and age >= orphan_h:\n            orphans.append(it)\n        if st == \"running\" and upd is not None and upd > stall_min * 60 and age >= 0.75:\n            stalled.append(it)\n    for it in stalled:\n        findings.append({\"severity\": \"warn\",\n                         \"summary\": \"疑似静默卡死：实例 %s 存活 %sh，其执行 %s running 但 %s 分钟无节点更新\"\n                                    % (it.get(\"short\"), it.get(\"age_h\"), (it.get(\"exec\") or \"?\")[:8],\n                                       int((it.get(\"exec_update_age_sec\") or 0) / 60)),\n                         \"escalate\": False})\n    if len(inst) >= quota_warn:\n        findings.append({\"severity\": \"warn\",\n                         \"summary\": \"AGS 实例数 %d ≥ %d，配额压力（成本/并发受限）\" % (len(inst), quota_warn),\n                         \"escalate\": False})\n    if input.get(\"error\"):\n        findings.append({\"severity\": \"critical\",\n                         \"summary\": \"AGS 实例清单获取失败：%s\" % str(input.get(\"error\"))[:120],\n                         \"escalate\": True})\n\n    report = (\"实例 %d（孤儿 %d / 卡死 %d）\" % (len(inst), len(orphans), len(stalled)))         if inst or not input.get(\"error\") else \"清单失败\"\n    return {\"orphans\": orphans, \"stalled\": stalled, \"findings\": findings, \"report\": report}\n",
+      "input": {
+        "instances": "$NODE.facts.instances",
+        "count": "$NODE.facts.count",
+        "error": "$NODE.facts.error",
+        "orphan_min_age_h": "$INPUT.orphan_min_age_h",
+        "stall_min": "$INPUT.stall_min",
+        "quota_warn": "$INPUT.quota_warn"
+      },
+      "next": "act",
+      "source_line": 87
+    },
+    {
+      "type": "code",
+      "id": "act",
+      "language": "python",
+      "code": "\ndef run(input):\n    import subprocess\n    VENV = input.get(\"venv_py\") or \"/Users/kong/projects/infra4agent/plaita/.venv/bin/python\"\n    SWEEP = input.get(\"sweeper\") or \"/Users/kong/projects/infra4agent/issue-keeper/flows/ags-orphan-sweep.py\"\n    n_orphans = len(input.get(\"orphans\") or [])\n    if not n_orphans:\n        return {\"killed\": 0, \"out\": \"无孤儿\"}\n    if input.get(\"dryrun\"):\n        return {\"killed\": 0, \"out\": \"dryrun：将清 %d 个孤儿\" % n_orphans}\n    cmd = \"%s %s --min-age 0.5\" % (VENV, SWEEP)\n    try:\n        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)\n        out = ((r.stdout or \"\") + (r.stderr or \"\")).strip()\n        killed = out.count(\"→ kill=True\")\n        return {\"killed\": killed, \"out\": out[-600:]}\n    except Exception as e:\n        return {\"killed\": 0, \"out\": \"sweep 异常: %s\" % str(e)[:200]}\n",
+      "input": {
+        "orphans": "$NODE.triage.orphans",
+        "venv_py": "$INPUT.venv_py",
+        "sweeper": "$INPUT.sweeper",
+        "dryrun": "$INPUT.dryrun"
+      },
+      "next": "finish",
+      "source_line": 130
+    },
+    {
+      "type": "code",
+      "id": "finish",
+      "language": "python",
+      "code": "\ndef run(input):\n    import fcntl, json, os, tempfile, time\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    os.makedirs(duty, exist_ok=True)\n    ts = time.strftime(\"%Y-%m-%dT%H:%M:%S+08:00\")\n    findings = input.get(\"findings\") or []\n    killed = int(input.get(\"killed\") or 0)\n    spath = os.path.join(duty, \"state-sandbox.json\")\n    rd = 1\n    try:\n        doc = json.load(open(spath))\n        rd = max([r.get(\"round\", 0) for r in (doc.get(\"rounds\") or [])] or [0]) + 1\n    except Exception:\n        pass\n    status = \"attention\" if findings else \"ok\"\n    round_doc = {\"schema_version\": \"duty/state@0\", \"role\": \"sandbox\", \"generation\": 2,\n                 \"round\": rd, \"started_at\": ts, \"finished_at\": ts, \"status\": status,\n                 \"findings\": findings,\n                 \"actions\": ([{\"capability\": \"delete_cache\", \"level\": \"authorized\",\n                               \"summary\": \"杀孤儿沙箱实例 %d 个\" % killed, \"target\": \"ags\"}]\n                             if killed else []),\n                 \"narrative\": str(input.get(\"report\") or \"\")[:200]}\n    def atomic(path, d):\n        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=\".tmp-\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(json.dumps(d, indent=1, ensure_ascii=False))\n        os.replace(tmp, path)\n    with open(spath + \".lock\", \"w\") as lf:\n        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n        try:\n            doc = {\"schema_version\": \"duty/state@0\", \"role\": \"sandbox\", \"rounds\": []}\n            try:\n                doc = json.load(open(spath))\n            except Exception:\n                pass\n            rounds = doc.get(\"rounds\") or []\n            rounds.append(round_doc)\n            doc.update({\"rounds\": rounds[-20:], \"updated_at\": ts})\n            atomic(spath, doc)\n        finally:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n    with open(os.path.join(duty, \"rounds.log\"), \"a\") as fh:\n        fh.write(\"%s sandbox-watch 轮次=%s 状态=%s findings=%s 击杀=%s 摘要=%s\\n\"\n                 % (ts, rd, status, len(findings), killed, str(input.get(\"report\"))[:100]))\n    return {\"round\": rd, \"status\": status, \"killed\": killed}\n",
+      "input": {
+        "report": "$NODE.triage.report",
+        "findings": "$NODE.triage.findings",
+        "killed": "$NODE.act.killed",
+        "act_out": "$NODE.act.out",
+        "role": "sandbox",
+        "duty_dir": "$INPUT.duty_dir"
+      },
+      "next": "_n1",
+      "source_line": 154
+    },
+    {
+      "type": "end",
+      "id": "_n1",
+      "output": {
+        "round": "$NODE.finish.round",
+        "killed": "$NODE.finish.killed"
+      },
+      "resultType": "success",
+      "name": "return {'round': NODE.finis…",
+      "desc": "return {'round': NODE.finish.round, 'killed': NODE.finish.k…",
+      "source_line": 206
+    }
+  ]
+}
