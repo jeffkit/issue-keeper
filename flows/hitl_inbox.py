@@ -78,6 +78,17 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = _load()
+    # append-only 账本：同一 session 的「原通知行 + 回复行」都在账本里，原通知行
+    # 永远没有 replied_at——直接用它构造 pending 会让已回复会话每轮重复处理、
+    # 反复向 issue 贴同一条回复评论（2026-10-09 15:0x 实证：plaita#30 被贴 19 条）。
+    # 按 session_id 取**最新一行**作为该会话当前状态（回复行由 dict(r) 复制了
+    # 原通知行全部字段，取最新不丢 feedback_url/title）。
+    latest: dict[str, dict] = {}
+    for r in rows:
+        sid = r.get("session_id")
+        if sid:
+            latest[str(sid)] = r
+    rows = list(latest.values())
     cutoff = time.time() - args.max_age_h * 3600
     pending = [r for r in rows if r.get("session_id") and not r.get("replied_at")
                and float(r.get("ts") or 0) >= cutoff]
