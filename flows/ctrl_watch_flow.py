@@ -164,6 +164,7 @@ def run(input):
     act = CODE(id="act", lang="python", input={
         "need": NODE.triage.need_escalate, "report": NODE.triage.report,
         "duty_dir": INPUT.duty_dir, "dryrun": INPUT.dryrun,
+        "hitl_script": INPUT.hitl_script, "hitl_wait_secs": INPUT.hitl_wait_secs,
     }, code="""
 def run(input):
     import json, os, subprocess, time
@@ -200,6 +201,25 @@ def run(input):
                          shell=True, capture_output=True, text=True, timeout=60)
     os.unlink(p)
     ok = out.returncode == 0
+    # ── HITL 推送（jeffkit 2026-10-09：需要人工处理时用 HITL 通知人）──
+    # 默认只推（wait_secs=0，零占用）；看情况给 hitl_wait_secs>0 才建会话限时等回复。
+    # 反馈入口双通道：微信直接回 + 本条 #2 链接（在 issue 上回评/打标同样有效）。
+    hitl_script = input.get("hitl_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_notify.py"
+    wait_secs = int(input.get("hitl_wait_secs") or 0)
+    hitl = {"sent": False, "why": "skip"}
+    try:
+        import hashlib
+        dk = "ctrl:" + hashlib.sha1(str(input.get("report") or "").encode()).hexdigest()[:12]
+        cmd = ("python3 %s --title %s --body %s --dedupe-key %s --wait-secs %d "
+               "--feedback-url https://github.com/jeffkit/infra4agent/issues/2"
+               % (hitl_script,
+                  json.dumps("[值守] " + str(input.get("report") or "")[:60], ensure_ascii=False).replace("'", ""),
+                  json.dumps(str(input.get("report") or "")[:1000], ensure_ascii=False).replace("'", ""),
+                  dk, wait_secs))
+        hr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=max(60, wait_secs + 60))
+        hitl = json.loads((hr.stdout or "{}").strip().splitlines()[-1]) if hr.stdout.strip() else {"sent": False, "why": hr.stderr[:120]}
+    except Exception as e:
+        hitl = {"sent": False, "why": str(e)[:120]}
     meta["last_escalate_at"] = now
     doc["meta"] = meta
     try:
@@ -211,13 +231,14 @@ def run(input):
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
-    return {"posted": ok, "why": (out.stdout or out.stderr)[:160]}
+    return {"posted": ok, "why": (out.stdout or out.stderr)[:160], "hitl": hitl}
 """)
 
     # ── ④ finish（duty 滚动窗口 + rounds.log 一行；无事也只一行）──────────
     finish = CODE(id="finish", lang="python", input={
         "findings": NODE.triage.findings, "report": NODE.triage.report,
         "posted": NODE.act.posted, "duty_dir": INPUT.duty_dir,
+        "hitl": NODE.act.hitl,
     }, code="""
 def run(input):
     import fcntl, json, os, tempfile, time
@@ -278,4 +299,4 @@ def run(input):
 
 
 if __name__ == "__main__":
-    print("ctrl-watch flow 源码（编译见 build_ctrl_watch.py）")
+    print("ctrl-watch flow 源码（编译见 build_flows.py ctrl-watch）")

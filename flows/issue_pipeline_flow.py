@@ -1,7 +1,7 @@
 """issue-pipeline —— GitHub issue 自动处理管线（@flow 源码 = 审查主体，v0.3）。
 
 每 issue 一个 run。9 个 agent 段 + 确定性质量门 + 全出害口回评（消毒+发评）。
-生成 JSON：python3 flows/build_issue_pipeline.py（产物 flows/issue-pipeline.flow.json）
+生成 JSON：python3 flows/build_flows.py issue-pipeline（产物 flows/issue-pipeline.flow.json）
 
 v0.3（2026-09-30）per-repo 契约化——通用 flow 不再内嵌任何单仓形状：
   - 基线分支 INPUT.base_branch（wt_prep/sync_main/git_publish 全链参数化；

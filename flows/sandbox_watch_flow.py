@@ -207,4 +207,4 @@ def run(input):
 
 
 if __name__ == "__main__":
-    print("sandbox-watch flow 源码（编译见 build_sandbox_watch.py）")
+    print("sandbox-watch flow 源码（编译见 build_flows.py sandbox-watch）")
