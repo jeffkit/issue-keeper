@@ -212,21 +212,113 @@ def record_queued(crec: dict, grace_secs: float,
     return ((now if now is not None else time.time()) - base) < grace_secs
 
 
-def zombie(detail: dict, threshold_secs: float, now: float | None = None) -> bool:
-    """running 执行的 last_update_time 年龄超阈 → zombie（D6）。
+def _ts_age(ts: str, now: float | None = None) -> float | None:
+    """ISO 时间戳 → 距今秒数；解析不了返回 None。"""
+    if not ts:
+        return None
+    try:
+        from datetime import datetime
+        return (now if now is not None else time.time()) - \
+            datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
-    last_update_time 只在步界持久化时刷新——长 impl 节点（≤70min）期间正常
-    老化，阈值必须高于最长节点预算（默认 7200s = 2h）。
+
+def worker_alive(detail: dict, lease_ttl_secs: float = 120.0,
+                 now: float | None = None,
+                 node_stale_secs: float = 1800.0) -> bool | None:
+    """worker 活性三判据（D-0027 修正版）：节点在跑 / 租约 TTL / worker 心跳。
+
+    返回 True=确证活着（任一活信号）；False=确证死亡（节点史最新 ended_at
+    已停滞超 node_stale_secs、无任何活信号）；None=无判据（刚起步、节点间
+    空档、末节点刚结束等中间形态——不下结论，交给 last_update_time 兜底与
+    在途预算线）。
+
+    plaita#28 病灶（2026-10-09）：console 说 running、实际节点重试耗尽后状态
+    滞后，而 keeper 旧判据只看 last_update_time 年龄——失败后它永不刷新，
+    永远等不满阈值。这里优先看**活性证据**而非滞后时间戳：
+    - node_timings 里有 started 且未 ended 的节点（且 started 不太老）→ 活着
+      （在跑节点是最强活证据，优先于一切租约/心跳字段）；
+    - lease/heartbeat 带未来时间戳或新鲜年龄 → 活着；
+    - 节点史全部 ended 且**最新** ended_at 停滞超 node_stale_secs → 死。
+      阈值必须远大于节点间调度空档（上一节点结束到下一节点启动、末节点
+      结束到终态落盘只有秒级窗口）——无停滞前提的「有节点史=死」会被
+      reaper 轮询落进空档误杀健康 run（重复执行/git 撞合并，plaita#18）。
     """
     if str(detail.get("status") or "") != "running":
         return False
+    now = now if now is not None else time.time()
+
+    # ① 节点在跑：有 started 无 ended 的节点视为活证据（impl 节点跑 1-2h 正常，
+    # 但 started 已超 1 天的「在跑」节点不会再产出任何状态刷新，不作活证据——
+    # 它是死证据还是观测残缺交给 ③/兜底，不在此处下结论）
+    for v in (detail.get("node_timings") or {}).values():
+        if not isinstance(v, dict) or not v.get("started_at") or v.get("ended_at"):
+            continue
+        age = _ts_age(str(v.get("started_at")), now=now)
+        if age is None or age <= 86400:
+            return True
+
+    # ② 租约/心跳字段（console/worker 侧显式上报的活性；带 TTL 语义才可信。
+    # 字段形态今天未实测、属推测——故过期租约只在 ① 无在跑节点时才有否决权）
+    for lease_key in ("lease_expires_at", "lease_until"):
+        exp = _ts_age(str(detail.get(lease_key) or ""), now=now)
+        if exp is not None:
+            return exp < 0            # 到期时刻在未来（age<0）= 未过期 = 活
+    lease = detail.get("lease")
+    if isinstance(lease, dict):
+        for lease_key in ("expires_at", "until", "expiry"):
+            exp = _ts_age(str(lease.get(lease_key) or ""), now=now)
+            if exp is not None:
+                return exp < 0
+    for hb_key in ("worker_heartbeat", "heartbeat"):
+        age = _ts_age(str(detail.get(hb_key) or ""), now=now)
+        if age is not None:
+            return age <= lease_ttl_secs
+
+    # ③ 停滞判死：看节点史里**最新**的 ended_at——它停滞超阈才说明再无任何
+    # 节点会启动、终态也迟迟不落。停滞不足（刚结束）或史里无 ended_at → None：
+    # last_update_time 兜底线与在途预算线（inflight_overrun）接手。
+    ended_ages = [a for a in (_ts_age(str(v.get("ended_at") or ""), now=now)
+                              for v in (detail.get("node_timings") or {}).values()
+                              if isinstance(v, dict) and v.get("started_at"))
+                  if a is not None]
+    if ended_ages and min(ended_ages) > node_stale_secs:
+        return False
+    return None
+
+
+def zombie(detail: dict, threshold_secs: float, now: float | None = None,
+           node_stale_secs: float = 1800.0) -> bool:
+    """running 执行的滞后判死（D6，plaita#28 后与 worker_alive 合流）。
+
+    语义：活性确证死亡（worker_alive=False：末节点 ended_at 停滞超阈）直接
+    判死——不再要求 last_update_time 年龄超阈（失败后该时间戳永不刷新，旧
+    判据对无 TTL 持久键永不成立）；活性确证活着（True）永不判死——长 impl
+    节点（1-2h）期间 last_update_time 老化是正常形态；无判据（None：刚起步、
+    节点间空档、末节点刚结束未落终态）才退回旧时间戳兜底（阈值必须高于
+    最长节点预算，默认 2h）。
+    """
+    if str(detail.get("status") or "") != "running":
+        return False
+    alive = worker_alive(detail, now=now, node_stale_secs=node_stale_secs)
+    if alive is not None:
+        return alive is False
     ts = str(detail.get("last_update_time") or detail.get("start_time") or "")
-    if not ts:
+    age = _ts_age(ts, now=now)
+    return age is not None and age > threshold_secs
+
+
+def inflight_overrun(detail: dict, budget_secs: float,
+                     now: float | None = None) -> bool:
+    """在途总时长越过 run 级预算 → 兜底判死（不要求任何「无租约」前提）。
+
+    plaita#28 验收第 2 条：对「在途 >> 节点预算」的 run，无论 console 状态
+    怎么滞后（worker_alive 无判据 / last_update_time 被人为 resume 刷新），
+    超预算本身就是收尸依据。时长基线用 start_time，缺失则返回 False（连
+    基线都没有，交给 zombie 线）。budget_secs<=0 = 兜底线关闭。
+    """
+    if str(detail.get("status") or "") != "running" or budget_secs <= 0:
         return False
-    try:
-        from datetime import datetime
-        age = (now if now is not None else time.time()) - \
-            datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return False
-    return age > threshold_secs
+    age = _ts_age(str(detail.get("start_time") or ""), now=now)
+    return age is not None and age > budget_secs
