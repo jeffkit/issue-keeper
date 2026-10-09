@@ -33,9 +33,25 @@ s = re.sub(r'(ANTHROPIC_BASE_URL:\s*).*',  lambda m: m.group(1)+base,  s, count=
 s = re.sub(r'(CLAUDE_MODEL:\s*).*',        lambda m: m.group(1)+model, s, count=1)
 s = re.sub(r'(ANTHROPIC_AUTH_TOKEN:\s*).*',lambda m: m.group(1)+key,   s, count=1)
 s = re.sub(r'(ANTHROPIC_API_KEY:\s*).*',   lambda m: m.group(1)+key,   s, count=1)
+# 沙箱流档位（2026-10-10）：agent profile 名，**不是**端点——
+# 端点由 plaita-nodes 从 ~/.plaita/providers.json 翻译，keeper agent_env 管不到。
+agent_name = {'glm-5.3-flash': 'glm53-flash'}.get(model, 'deepseek-flash')
+if re.search(r'^pipeline_default_agent:', s, re.M):
+    s = re.sub(r'^pipeline_default_agent:.*$',
+               'pipeline_default_agent: ' + agent_name, s, flags=re.M)
+else:
+    s = re.sub(r'^(pipeline_max_in_flight:.*)$',
+               r'\1\npipeline_default_agent: ' + agent_name, s, count=1, flags=re.M)
 open(cfg, 'w').write(s)
 PY
-echo "--- 核读 ---"
+echo "--- 核读 agent_env（本地/legacy 流）---"
 sed -n '/^agent_env:/,/^pipeline:/p' "$cfg" | head -6
+echo "--- 核读 pipeline_default_agent（沙箱流，2026-10-10 接线）---"
+python3 - "$cfg" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r'^pipeline_default_agent:.*$', s, re.M)
+print(m.group(0) if m else "pipeline_default_agent: (未设置 → 回退硬编码 glm53-flash)")
+PY
 EOS
 echo "已切档：model=$MODEL（keeper ≤3min live-reload 生效；worker 无需重启）"
