@@ -319,15 +319,31 @@ def run(input):
     stuck = level in ("BLOCKED", "DEGRADED") and attempts >= 5 and landed == 0
     if stuck and not input.get("dryrun"):
         duty = os.path.expanduser(input.get("duty_dir") or "~/.issue-keeper/duty")
+        # 去重窗口 2h（**不论状态**）：产出停摆的判据窗口是 90 分钟，若只看「未决」
+        # 工单，值守一处置完，下一轮（15min）就再递一张 → 同一停摆刷屏
+        # （2026-10-09 17:00 实证：dismiss 后立刻又递 req-...-c32294）。
+        # 同一停摆 2h 内只递一次；持续超过 2h 才值得再报。
+        import datetime as _dt
+        now_ts = time.time()
         dup = False
         for p in glob.glob(os.path.join(duty, "requests", "req-*.json")):
             try:
                 d = json.load(open(p))
             except Exception:
                 continue
-            if d.get("kind") == "outcome-block" and d.get("status") in ("open", "escalated", "answered"):
+            if d.get("kind") != "outcome-block":
+                continue
+            if d.get("status") in ("open", "escalated", "answered"):
                 dup = True
                 break
+            try:
+                t = _dt.datetime.strptime(str(d.get("created_at"))[:19],
+                                          "%Y-%m-%dT%H:%M:%S").timestamp()
+                if now_ts - t < 7200:
+                    dup = True
+                    break
+            except Exception:
+                pass
         if not dup:
             rs = os.path.expanduser(input.get("requests_script") or
                 "~/projects/infra4agent/issue-keeper/flows/duty_request.py")
