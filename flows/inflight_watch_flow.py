@@ -293,7 +293,8 @@ def run(input):
     # ── ④ finish（duty state-inflight + rounds.log + critical 时推 HITL）──
     finish = CODE(id="finish", lang="python", input={
         "report": NODE.triage.report, "findings": NODE.triage.findings,
-        "resumed": NODE.act.resumed, "hitl_script": INPUT.hitl_script,
+        "resumed": NODE.act.resumed, "requests_script": INPUT.requests_script,
+        "rows": NODE.triage.rows,
         "hitl_wait_secs": INPUT.hitl_wait_secs, "duty_dir": INPUT.duty_dir,
     }, code="""
 def run(input):
@@ -341,28 +342,24 @@ def run(input):
         fh.write("%s inflight-watch 轮次=%s 状态=%s findings=%s resume=%s 摘要=%s\\n"
                  % (ts, rd, status, len(findings), len(input.get("resumed") or []),
                     str(input.get("report"))[:90]))
-    hitl = {"sent": False, "why": "无 critical"}
+    # 三层协同（jeffkit 2026-10-09）：critical **不再直接推人**——先写「决策工单」
+    # 给值守 Agent（duty-agent */10 按能力矩阵自决，判不了才 HITL 人 + 监听回复）。
+    req = {"id": None, "why": "无 critical"}
     if crit:
         try:
-            script = input.get("hitl_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_notify.py"
-            body = "\\n".join("- " + f.get("summary", "") for f in crit[:5])
-            # 去重键按「受影响的 run + 告警种类」稳定化：摘要里带分钟数，用内容哈希
-            # 会导致同一卡死每轮都被当成新告警（实测 30 分钟内推了 4 次）。
-            import hashlib, re as _re
-            runs = sorted(set(_re.findall(r"[a-z-]+#\d+", " ".join(f.get("summary", "") for f in crit))))
-            dkey = "inflight:" + ("|".join(runs) if runs else
-                                  hashlib.sha1("|".join(sorted(f.get("summary", "") for f in crit)).encode()).hexdigest()[:12])
-            cmd = ("python3 %s --title %s --body %s --dedupe-key %s --wait-secs %d "
-                   "--feedback-url https://github.com/jeffkit/infra4agent/issues/2"
-                   % (script, json.dumps("在途异常 " + str(input.get("report") or "")[:50], ensure_ascii=False).replace("'", ""),
-                      json.dumps(body[:900], ensure_ascii=False).replace("'", ""),
-                      dkey, int(input.get("hitl_wait_secs") or 0)))
-            hr = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                timeout=max(60, int(input.get("hitl_wait_secs") or 0) + 60))
-            hitl = json.loads((hr.stdout or "{}").strip().splitlines()[-1]) if hr.stdout.strip() else {"sent": False}
+            rs = input.get("requests_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_request.py"
+            ctx = json.dumps({"flow": "inflight-watch", "report": input.get("report"),
+                              "findings": [f.get("summary") for f in crit[:6]],
+                              "rows": input.get("rows") or []}, ensure_ascii=False)
+            cmd = ("python3 %s create --from-flow inflight-watch --kind inflight-stall "
+                   "--severity critical --title %s --context-json %s --options resume,cancel_reopen,wait"
+                   % (rs, json.dumps("[在途] " + str(input.get("report"))[:60], ensure_ascii=False).replace("'", ""),
+                      json.dumps(ctx, ensure_ascii=False).replace("'", "")))
+            rr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            req = json.loads((rr.stdout or "{}").strip().splitlines()[-1]) if rr.stdout.strip() else {"id": None}
         except Exception as e:
-            hitl = {"sent": False, "why": str(e)[:100]}
-    return {"round": rd, "status": status, "hitl": hitl}
+            req = {"id": None, "why": str(e)[:120]}
+    return {"round": rd, "status": status, "request": req}
 """)
 
     return {"round": NODE.finish.round, "status": NODE.finish.status}

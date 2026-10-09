@@ -182,7 +182,7 @@ print(json.dumps({"freed_gib": round(freed, 2), "removed": removed, "cleared": c
     finish = CODE(id="finish", lang="python", input={
         "report": NODE.triage.report, "findings": NODE.triage.findings,
         "freed_gib": NODE.act.freed_gib, "removed": NODE.act.removed,
-        "cleared": NODE.act.cleared, "hitl_script": INPUT.hitl_script,
+        "cleared": NODE.act.cleared, "requests_script": INPUT.requests_script,
         "hitl_wait_secs": INPUT.hitl_wait_secs, "duty_dir": INPUT.duty_dir,
     }, code="""
 def run(input):
@@ -232,24 +232,24 @@ def run(input):
         fh.write("%s disk-hygiene 轮次=%s 状态=%s findings=%s 释放=%.2fGiB 清理=%s 解封=%s\\n"
                  % (ts, rd, status, len(findings), input.get("freed_gib") or 0,
                     input.get("removed") or 0, len(input.get("cleared") or [])))
-    hitl = {"sent": False, "why": "无 critical"}
+    # 三层协同：critical 先递工单给值守 Agent（不再直接推人）。
+    req = {"id": None, "why": "无 critical"}
     if crit:
         try:
-            import hashlib
-            script = input.get("hitl_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_notify.py"
-            body = "\\n".join("- " + f.get("summary", "") for f in crit[:4])
-            dkey = "disk:" + hashlib.sha1(body.encode()).hexdigest()[:12]
-            cmd = ("python3 %s --title %s --body %s --dedupe-key %s --wait-secs %d "
-                   "--feedback-url https://github.com/jeffkit/infra4agent/issues/2"
-                   % (script, json.dumps("磁盘卫生告警 " + str(input.get("report") or "")[:40], ensure_ascii=False).replace("'", ""),
-                      json.dumps(body[:800], ensure_ascii=False).replace("'", ""), dkey,
-                      int(input.get("hitl_wait_secs") or 0)))
-            hr = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                timeout=max(60, int(input.get("hitl_wait_secs") or 0) + 60))
-            hitl = json.loads((hr.stdout or "{}").strip().splitlines()[-1]) if hr.stdout.strip() else {"sent": False}
+            rs = input.get("requests_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_request.py"
+            ctx = json.dumps({"flow": "disk-hygiene", "report": input.get("report"),
+                              "findings": [f.get("summary") for f in crit[:6]],
+                              "freed_gib": input.get("freed_gib"), "cleared": input.get("cleared")},
+                             ensure_ascii=False)
+            cmd = ("python3 %s create --from-flow disk-hygiene --kind disk-guard "
+                   "--severity critical --title %s --context-json %s --options clean_disk,escalate_human"
+                   % (rs, json.dumps("[磁盘] " + str(input.get("report"))[:60], ensure_ascii=False).replace("'", ""),
+                      json.dumps(ctx, ensure_ascii=False).replace("'", "")))
+            rr = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            req = json.loads((rr.stdout or "{}").strip().splitlines()[-1]) if rr.stdout.strip() else {"id": None}
         except Exception as e:
-            hitl = {"sent": False, "why": str(e)[:100]}
-    return {"round": rd, "status": status, "hitl": hitl}
+            req = {"id": None, "why": str(e)[:120]}
+    return {"round": rd, "status": status, "request": req}
 """)
 
     return {"round": NODE.finish.round, "status": NODE.finish.status}
