@@ -1133,6 +1133,11 @@ def reopen_issues(config: Config, repo: str, numbers: list[int]) -> list[int]:
         for n in changed:
             save_state_item(config.state_path, binding.repo_slug, str(n),
                             _clear_terminal_state)
+        # 2026-10-09 定约：重新入队 = 不再等人 → 自动摘 needs-human 标签。
+        # 标签只表示「正在等人处理」；只加不摘会让看板把已恢复处理的单一直列着
+        # （plaita#35 实测挂 16h、hitl-mcp#4 处理完仍需手工摘）。
+        for n in changed:
+            _gh_remove_label("issue", repo, n, config.pipeline_needs_human_label)
         # 状态透明化（okguitar 2026-09-30 建议）：拦截/终态评论只有「已拦」形态
         # 没有「已解除」，外部无法从 issue 页面区分排队中/被拦——reopen 时补一条
         # 带 bot marker 的状态评论（marker + self_identity 双保险，不会被评论层
@@ -1413,6 +1418,26 @@ def _gh_add_label(kind: str, repo: str, number: int, label: str) -> None:
                         (r.stderr or r.stdout or "")[-200:])
     except Exception as e:
         log.warning("[gh] 打标签异常（%s#%s label=%s）: %s", repo, number, label, e)
+
+
+def _gh_remove_label(kind: str, repo: str, number: int, label: str) -> None:
+    """摘升级标签（fail-open）。语义：标签只表示「正在等人处理」——
+
+    2026-10-09 定约：keeper 在**升级时**打 `needs-human`，在**该 issue 重新入队
+    回到流水线时**（reopen / 重新派发）自动摘掉。否则标签只加不摘，看板「等人工」
+    会把早已恢复处理的单一直列着（plaita#35 实测：已重新入队 16h 仍挂着标签）。
+    """
+    import subprocess as _sp
+    sub = "pr" if kind == "pr" else "issue"
+    try:
+        r = _sp.run(["gh", sub, "edit", str(number), "--repo", repo,
+                     "--remove-label", label], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            # 标签本就不在时 gh 也会非零退出——不是错误，降为 debug
+            log.debug("[gh] 摘标签未生效（%s#%s label=%s）: %s", repo, number, label,
+                      (r.stderr or r.stdout or "")[-120:])
+    except Exception as e:
+        log.warning("[gh] 摘标签异常（%s#%s label=%s）: %s", repo, number, label, e)
 
 
 @lru_cache(maxsize=1)
