@@ -32,6 +32,7 @@ FLOWS: dict[str, tuple[str, str]] = {
     "ctrl-watch": ("ctrl_watch_flow.py", "ctrl-watch.flow.json"),
     "sandbox-watch": ("sandbox_watch_flow.py", "sandbox-watch.flow.json"),
     "pipeline-patrol": ("pipeline_patrol_flow.py", "pipeline-patrol.flow.json"),
+    "inflight-watch": ("inflight_watch_flow.py", "inflight-watch.flow.json"),
 }
 
 
