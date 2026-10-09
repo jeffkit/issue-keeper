@@ -191,13 +191,22 @@ def run(input):
             # 而不是总在途时长——后者会让任何跑过 lag_min 的 run 一完成就误报
             # （2026-10-09 18:59 实测：recursive#148 刚落地推送 main，即被报成
             #  「已终态但 keeper 仍算在途 137 分钟」，而 keeper 只是还没轮到收尸）。
+            #
+            # ⚠️ 第二层（2026-10-10 03:3x 实测）：keeper 对失败执行是**有意持有**——
+            # 先落账（posted=True），再记 retry_after（退避 300s/3600s）等窗口重派，
+            # 期间该 issue 仍留在在途集合里。若把这种「退避等待」当收尸滞后，会每
+            # 10 分钟刷一张 critical 单（今晚 #148/#27/#22/#21 四单连续全是这类：
+            # 执行 error、keeper 已收尾过、正等 retry_after 到点重派）。
+            # 判据：**retry_after 有值 = keeper 已排定动作 → 不算滞后**。
+            if it.get("retry_after"):
+                continue
             lag = it.get("progress_age_min")
             if lag is None:
                 lag = it.get("last_node_ended_age_min")
             if lag is not None and lag >= lag_min:
                 terminal_lag.append(it)
                 findings.append({"severity": "critical",
-                                 "summary": "%s 执行已终态（%s）已 %.0f 分钟未收账（在途共 %.0f 分钟）——收尸滞后"
+                                 "summary": "%s 执行已终态（%s）已 %.0f 分钟未收账（在途共 %.0f 分钟，且无退避排程）——收尸滞后"
                                             % (label, st, lag, age), "escalate": True})
             continue
         # ① 末节点结束已久：**先分清长节点与卡死**——impl 类节点单跑 60-120 分钟且
