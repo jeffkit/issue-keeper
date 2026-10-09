@@ -377,3 +377,23 @@ def test_retry_after持久化与合并写(tmp_path):
     disk = load_state(path).repo("a-b").item("7")
     assert disk.retry_after == 500.0, "盘上轮内写入的退避不得被整轮旧快照反盖"
     assert disk.processed is True
+
+
+def test_engine_error已有终态回评仍升级(reap_env):
+    """comment_posted=True（终态回评已发）时，engine_error 二连仍必须升级。
+
+    修复前 `not posted` 闸让整个升级分支不进入（既无评论也无标签）→ 人工队列在
+    GitHub 上不可见（recursive#86 / argusai#13 走 engine_error 路径无标签；
+    对照 hitl-mcp#4 走 failed 路径有标签）。修复后：升级评论 + needs-human 标签。
+    """
+    state, it, art, posted, gh_calls, home = reap_env
+    for _ in range(2):
+        _ledger_row(home, "a/b", 7, status="engine_error", comment_posted=True,
+                    error="executor 'recursive' exited 1")
+
+    _reap_pipelines(_pipeline_cfg(home / "b"), state, _bindings(repo="a/b"))
+
+    labels = _label_calls(gh_calls)
+    assert labels, "已有终态回评也必须打 needs-human 标签（人工队列可见性）"
+    assert any("needs-human" in [str(x) for x in c] for c in labels)
+    assert any("引擎级失败" in p for p in posted), "必须发升级求助评论（语义区别于终态说明）"
