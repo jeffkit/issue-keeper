@@ -177,7 +177,7 @@ export interface DutyOverview {
   roster: { generation?: number; on_duty?: Record<string, { session_ref?: string; since?: string; model_tier?: string }> };
   a_shift: { round?: number; status?: string; finished_at?: string; age_sec?: number; narrative?: string };
   controller: { round?: number; status?: string; finished_at?: string; age_sec?: number };
-  b_shift: { last_line?: string };
+  b_shift: { time?: string; kind?: string; brief?: string; text?: string; raw?: string };
   vm: { sched?: string; keeper?: string; disk?: string; dlq?: string; error?: string };
   inflight: { repo: string; issue: string; minutes: number }[];
   shadow: { generated_at?: string; budget_left?: number; would_dispatch?: number; skip?: Record<string, number>; error?: string };

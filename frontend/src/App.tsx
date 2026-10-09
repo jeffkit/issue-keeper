@@ -37,12 +37,27 @@ export default function App() {
   const [actorType, setActorType] = useState<"human" | "agent">(
     () => (localStorage.getItem("ik_actor_type") as "human" | "agent") || "human",
   );
-  const [view, setView] = useState<View>("board");
+  const [view, setView] = useState<View>(() => {
+    // 深链：?view=duty 或 #duty（可直接收藏/分享值守总览）
+    const q = new URLSearchParams(window.location.search).get("view");
+    const h = window.location.hash.replace(/^#/, "");
+    const v = (q || h) as View;
+    return (["board", "workbench", "team", "pipeline", "duty"] as string[]).includes(v) ? v : "board";
+  });
   const [teamCount, setTeamCount] = useState<number>(0);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
   );
+
+  // 视图切换时同步地址栏（?view=xxx），便于收藏/分享/无头截图直达
+  useEffect(() => {
+    const u = new URL(window.location.href);
+    if (view === "board") u.searchParams.delete("view");
+    else u.searchParams.set("view", view);
+    u.hash = "";
+    window.history.replaceState(null, "", u.toString());
+  }, [view]);
 
   useEffect(() => {
     listProjects().then((ps) => {

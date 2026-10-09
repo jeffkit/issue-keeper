@@ -198,11 +198,10 @@ export function DutyView() {
   const sbxBy = st?.sandbox?.by_status || {};
   const tput = (st?.throughput?.data?.created_by_day as Record<string, number>) || {};
 
-  // B 班轮报行 → 紧凑摘要："10-09 08:59 B-flow 轮次=keeper-watch（值守）落地=…"
-  const bLine = ov?.b_shift?.last_line || "";
-  const bTime = (bLine.match(/(\d{2}:\d{2})\s+B-flow/) || [])[1] || "—";
-  const bKind = (bLine.match(/轮次=keeper-watch（([^）]+)）/) || [])[1] || "";
-  const bBrief = bLine.includes("简报发 #3") ? "简报已发 #3" : fit(bLine.replace(/^\S+\s+\S+\s+\S+\s+/, ""), 40);
+  // B 班：后端已结构化为 {time, kind, brief}（避免原始日志串）
+  const bTime = ov?.b_shift?.time || "—";
+  const bKind = ov?.b_shift?.kind || "";
+  const bBrief = ov?.b_shift?.brief || "—";
 
   const cAge = ov?.controller?.finished_at
     ? fmtAge(Math.round((Date.now() - new Date(ov.controller.finished_at).getTime()) / 1000))

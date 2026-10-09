@@ -100,6 +100,27 @@ def _roster() -> dict:
         return {}
 
 
+def _b_line() -> str:
+    return _sh(f"grep ' B-flow' {CONTROLLER_DIR}/rounds.log 2>/dev/null | tail -1")
+
+
+def _b_summary() -> dict:
+    """B 班轮报行 → 结构化摘要（前端与拓扑共用，避免原始日志串外泄）。"""
+    line = _b_line()
+    import re
+    t = (re.search(r"(\d{2}:\d{2})\s+B-flow", line) or [None, ""])[1]
+    kind = (re.search(r"轮次=keeper-watch（([^）]+)）", line) or [None, ""])[1]
+    if "简报发 #3" in line:
+        brief = "简报已发 #3"
+    elif not line:
+        brief = "无轮报"
+    else:
+        brief = line.split("落地=")[-1][:40] if "落地=" in line else line[:40]
+    return {"time": t or "—", "kind": kind, "brief": brief,
+            "text": f"{t} {kind}轮 · {brief}".strip() if t else "无 B 班轮报",
+            "raw": line[:200]}
+
+
 def _vm_facts() -> dict:
     """远端控制面事实（ssh，聚合一次）。"""
     out = _sh(
@@ -107,8 +128,8 @@ def _vm_facts() -> dict:
         "echo SCHED=$(systemctl is-active plaita-schedule-service 2>/dev/null);"
         "echo KEEPER=$(systemctl is-active issue-keeper-worker 2>/dev/null);"
         "echo DISK=$(df -h / | tail -1 | awk \"{print \\$4}\");"
-        "docker exec langfuse-v4-redis-1 redis-cli -a 6ace3bde72955c70b9f264e24f57b343 "
-        "-n 1 --no-auth-warning XLEN plaita:flow:queue:ctrl:dlq 2>/dev/null | xargs echo DLQ;"
+        "echo DLQ=$(docker exec langfuse-v4-redis-1 redis-cli -a 6ace3bde72955c70b9f264e24f57b343 "
+        "-n 1 --no-auth-warning XLEN plaita:flow:queue:ctrl:dlq 2>/dev/null);"
         "'",
         timeout=30,
     )
@@ -155,8 +176,7 @@ def overview() -> dict:
         "roster": _roster(),
         "a_shift": roles["issue-accept"],
         "controller": roles["controller"],
-        "b_shift": _cached("b_round", 120, lambda: {
-            "last_line": (_sh(f"grep ' B-flow' {CONTROLLER_DIR}/rounds.log 2>/dev/null | tail -1"))[:150]}),
+        "b_shift": _cached("b_round", 120, _b_summary),
         "vm": _cached("vm_facts", 60, _vm_facts),
         "inflight": _cached("inflight", 60, _inflight),
         "shadow": _cached("shadow", 120, _shadow),
@@ -251,6 +271,7 @@ def topology() -> dict:
     vm = ov.get("vm") or {}
     a = ov.get("a_shift") or {}
     shadow = ov.get("shadow") or {}
+    b = ov.get("b_shift") or {}
 
     def node(nid: str, label: str, kind: str, state: str, detail: str = "",
              meta: dict | None = None) -> dict:
@@ -278,7 +299,7 @@ def topology() -> dict:
         node("external_check", "外部验收 /accept", "gate",
              "healthy", "验收通过 → 合并/关单"),
         node("bwatch", "B 班 keeper-watch", "flow", "healthy",
-             str((ov.get("b_shift") or {}).get("last_line", ""))[:60]),
+             f"{b.get('time', '—')} {b.get('kind') or ''}轮 · {b.get('brief', '')}".strip()),
         node("ctrl", "主控 ctrl-watch", "flow", "healthy", "看门狗 + 升级路由"),
         node("duty", "duty 内核（状态权威）", "store",
              "healthy", f"roster gen={(ov.get('roster') or {}).get('generation')}"),
