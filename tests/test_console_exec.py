@@ -81,6 +81,164 @@ class TestZombie:
         assert ce.zombie(self._detail(99999, status="completed"), 7200) is False
 
 
+class TestWorkerAlive:
+    """D-0027 修正（#20）：判活看在跑节点/带 TTL 的租约/心跳，不看无 TTL 持久键。
+
+    实测执行键形态：plaita:execution:{id} TTL=-1（永久）——「键存在」不代表
+    worker 活着，旧「0 租约」判据对它永不成立。
+    判死纪律（reviewer blocking fix）：节点史存在≠死——最新 ended_at 停滞超
+    node_stale_secs 才算死；节点间空档/末节点刚结束等秒级窗口必须判 None，
+    否则 reaper 误杀健康 run（plaita#18 重复执行）。
+    """
+
+    def _nodes(self, **kw):
+        now = datetime.now()
+        ended = now - timedelta(**kw)
+        return {"_n17": {"started_at": (ended - timedelta(minutes=10)).isoformat(),
+                         "ended_at": ended.isoformat()}}
+
+    def test_no_signals_is_unknown(self):
+        """无节点史无心跳（刚起步）→ None：不下结论，交给超时兜底。"""
+        assert ce.worker_alive({"status": "running"}) is None
+
+    def test_running_node_is_alive(self):
+        d = {"status": "running",
+             "node_timings": {"impl": {"started_at": datetime.now().isoformat()}}}
+        assert ce.worker_alive(d) is True
+
+    def test_node_just_ended_is_not_dead(self):
+        """reviewer blocking case：末节点 30s 前结束（节点间空档/终态落盘窗口）
+        → None 不下结论。修复前此处返回 False → zombie 误杀健康 run。"""
+        d = {"status": "running", "node_timings": self._nodes(seconds=30)}
+        assert ce.worker_alive(d) is None
+
+    def test_all_nodes_ended_and_stale_is_dead(self):
+        """#28 形态：11 个节点全停在失败时刻、无租约无心跳 → 确证死亡。"""
+        d = {"status": "running",
+             "node_timings": self._nodes(hours=3)}
+        assert ce.worker_alive(d) is False
+
+    def test_staleness_uses_newest_ended_at(self):
+        """判死看**最新** ended_at：末节点刚结束而早节点老化 → 不是死。"""
+        d = {"status": "running",
+             "node_timings": {"a": self._nodes(hours=3)["_n17"],
+                              "b": {"started_at": (datetime.now()
+                                     - timedelta(minutes=5)).isoformat(),
+                                    "ended_at": (datetime.now()
+                                     - timedelta(seconds=30)).isoformat()}}}
+        assert ce.worker_alive(d) is None
+
+    def test_inprogress_node_too_old_is_unknown_not_dead(self):
+        """started 超 1 天仍未 ended 的节点不作活证据，但也不据此判死——
+        观测残缺（节点重试后 started_at 是否刷新未实测）不下结论，交
+        last_update_time 兜底（本例它 ≥ 节点年龄，兜底线必然接得住）。"""
+        started = (datetime.now() - timedelta(days=2)).isoformat()
+        d = {"status": "running",
+             "node_timings": {"impl": {"started_at": started}}}
+        assert ce.worker_alive(d) is None
+        d["last_update_time"] = started
+        assert ce.zombie(d, 7200) is True
+
+    def test_fresh_heartbeat_is_alive(self):
+        d = {"status": "running",
+             "worker_heartbeat": (datetime.now() - timedelta(seconds=10)).isoformat()}
+        assert ce.worker_alive(d) is True
+
+    def test_stale_heartbeat_is_not_alive(self):
+        d = {"status": "running",
+             "worker_heartbeat": (datetime.now() - timedelta(minutes=10)).isoformat()}
+        assert ce.worker_alive(d) is False
+
+    def test_unexpired_lease_is_alive(self):
+        d = {"status": "running",
+             "lease": {"expires_at": (datetime.now() + timedelta(seconds=30)).isoformat()}}
+        assert ce.worker_alive(d) is True
+
+    def test_expired_lease_is_not_alive(self):
+        d = {"status": "running",
+             "lease": {"expires_at": (datetime.now() - timedelta(seconds=30)).isoformat()}}
+        assert ce.worker_alive(d) is False
+
+    def test_running_node_beats_expired_lease(self):
+        """reviewer secondary fix：在跑节点是最强活证据，优先于租约字段——
+        过期/持久化过期的租约时间戳不得否决正在跑的节点（① 先于 ②）。"""
+        d = {"status": "running",
+             "lease": {"expires_at": (datetime.now() - timedelta(seconds=30)).isoformat()},
+             "node_timings": {"impl": {"started_at": datetime.now().isoformat()}}}
+        assert ce.worker_alive(d) is True
+
+    def test_terminal_status_never_alive(self):
+        assert ce.worker_alive({"status": "completed"}) is False
+
+
+class TestZombieAliveMerge:
+    """zombie 与 worker_alive 合流：活性确证死亡即判死，不等 last_update_time 老化。"""
+
+    def test_dead_worker_kills_regardless_of_last_update(self):
+        """#20 核心：执行键存在（TTL=-1）+ 无心跳 + 节点史停滞超阈 → 收尸，
+        即使 last_update_time 被 resume 刷新过（旧判据在此永不成立）。"""
+        d = {"status": "running",
+             "last_update_time": datetime.now().isoformat(),   # 新鲜——旧判据看不到死
+             "node_timings": {"a": {"started_at": (datetime.now()
+                                       - timedelta(hours=3)).isoformat(),
+                                    "ended_at": (datetime.now()
+                                       - timedelta(hours=2, minutes=50)).isoformat()}}}
+        assert ce.zombie(d, 7200) is True
+
+    def test_alive_worker_not_killed_by_old_last_update(self):
+        """长 impl 节点在跑（无 ended）：last_update_time 老化是正常形态，不判死。"""
+        d = {"status": "running",
+             "last_update_time": (datetime.now() - timedelta(hours=3)).isoformat(),
+             "node_timings": {"impl": {"started_at": (datetime.now()
+                                        - timedelta(hours=2)).isoformat()}}}
+        assert ce.zombie(d, 7200) is False
+
+    def test_recent_node_end_falls_back_to_last_update(self):
+        """reviewer blocking case 全链路：末节点 30s 前结束 → worker_alive=None，
+        zombie 退回 last_update_time 兜底（新鲜 → 不判死）。修复前这里误杀。"""
+        d = {"status": "running",
+             "last_update_time": (datetime.now() - timedelta(minutes=5)).isoformat(),
+             "node_timings": {"a": {"started_at": (datetime.now()
+                                       - timedelta(hours=1)).isoformat(),
+                                    "ended_at": (datetime.now()
+                                       - timedelta(seconds=30)).isoformat()}}}
+        assert ce.zombie(d, 7200) is False
+
+    def test_stale_node_end_kills_even_with_fresh_last_update(self):
+        """停滞超阈（默认 1800s）才是确证死亡：last_update 新鲜拦不住。"""
+        d = {"status": "running",
+             "last_update_time": datetime.now().isoformat(),
+             "node_timings": {"a": {"started_at": (datetime.now()
+                                       - timedelta(hours=3)).isoformat(),
+                                    "ended_at": (datetime.now()
+                                       - timedelta(minutes=31)).isoformat()}}}
+        assert ce.zombie(d, 7200) is True
+
+
+class TestInflightOverrun:
+    """兜底收尸线（#20 验收 2）：在途总时长越预算即判死，不要求「无租约」前提。"""
+
+    def _detail(self, age_secs, status="running"):
+        return {"status": status,
+                "start_time": (datetime.now() - timedelta(seconds=age_secs)).isoformat()}
+
+    def test_over_budget_kills(self):
+        assert ce.inflight_overrun(self._detail(4 * 3600), 3 * 3600) is True
+
+    def test_within_budget_alive(self):
+        assert ce.inflight_overrun(self._detail(3600), 3 * 3600) is False
+
+    def test_zero_budget_disables(self):
+        assert ce.inflight_overrun(self._detail(99 * 3600), 0) is False
+
+    def test_terminal_never_overrun(self):
+        assert ce.inflight_overrun(self._detail(99 * 3600, status="completed"),
+                                   3 * 3600) is False
+
+    def test_no_start_time_no_verdict(self):
+        assert ce.inflight_overrun({"status": "running"}, 3 * 3600) is False
+
+
 class TestRecordQueued:
     """plaita#18：「已派发未消费」窗口（GET 404）判排队中，非故障。"""
 
@@ -306,6 +464,63 @@ class TestReapConsole:
         cfg, it, row, posted = self._reap(art, monkeypatch, FakeClient(fresh))
         assert row is None
         assert (art / K.CONSOLE_EXEC_RECORD).exists()
+
+    def test_running_no_signal_stale_last_update_stays_in_flight(self, art, monkeypatch):
+        """刚起步（无节点史无心跳）：worker_alive 无判据，旧 last_update 兜底
+        未到阈 → 仍在途。"""
+        d = {"status": "running",
+             "last_update_time": (datetime.now() - timedelta(seconds=3600)).isoformat()}
+        cfg, it, row, posted = self._reap(art, monkeypatch, FakeClient(d))
+        assert row is None
+
+    def test_issue20_accreditation_exec_key_exists_no_heartbeat_4h(self, art, monkeypatch):
+        """#20 验收单测：执行键存在（TTL=-1 持久键）+ 无租约无心跳 +
+        在途 4h → 收尸发生（修复前：旧判据要求「0 租约」+ last_update 老化，
+        而租约键无 TTL ⇒ 永不成立，229 分钟无人收尸）。"""
+        stalled = {"status": "running",
+                   "start_time": (datetime.now() - timedelta(hours=4)).isoformat(),
+                   "last_update_time": (datetime.now() - timedelta(hours=4)).isoformat(),
+                   "node_timings": {
+                       f"_n{i}": {"started_at": (datetime.now()
+                                                  - timedelta(hours=3)).isoformat(),
+                                  "ended_at": (datetime.now()
+                                               - timedelta(hours=2, minutes=50)
+                                               ).isoformat()}
+                       for i in range(11)}}
+        client = FakeClient(stalled)
+        cfg, it, row, posted = self._reap(art, monkeypatch, client,
+                                          dispatched_ago=4 * 3600)
+        assert client.cancelled == ["exec-123"]
+        assert row["status"] == "engine_error"
+        assert "超时" in row["error"] or "zombie" in row["error"]
+        assert not (art / K.CONSOLE_EXEC_RECORD).exists()   # 在途锚已清 → 交回重派
+
+    def test_overrun_budget_reaps_even_with_fresh_last_update(self, art, monkeypatch):
+        """兜底线（验收 2）：在途越 3h 预算即判死，不要求无租约前提，
+        last_update_time 被 resume 刷新也拦不住。"""
+        d = {"status": "running",
+             "start_time": (datetime.now() - timedelta(hours=4)).isoformat(),
+             "last_update_time": datetime.now().isoformat()}   # 新鲜
+        client = FakeClient(d)
+        cfg, it, row, posted = self._reap(art, monkeypatch, client,
+                                          dispatched_ago=4 * 3600)
+        assert client.cancelled == ["exec-123"]
+        assert row["status"] == "engine_error" and "超时" in row["error"]
+
+    def test_budget_zero_disables_overrun_line(self, art, monkeypatch):
+        """兜底线关掉（0）后，仅剩 zombie 线：无节点史 + last_update 新鲜 → 不判死。"""
+        d = {"status": "running",
+             "start_time": (datetime.now() - timedelta(hours=99)).isoformat(),
+             "last_update_time": datetime.now().isoformat()}
+        client = FakeClient(d)
+        cfg, it, row, _ = self._reap(
+            art, monkeypatch, client, dispatched_ago=99 * 3600)
+        cfg.console_inflight_budget_secs = 0
+        row2 = K._reap_console_execution(
+            cfg, _binding(), it, "5", "l", art,
+            {"execution_id": "exec-123", "retry_count": 0}, time.time())
+        assert row2 is None                       # 仅剩 zombie 线，未触发
+        assert client.cancelled == ["exec-123"]   # 第一轮（默认预算）已收尸
 
     def test_running_zombie_cancels_and_lands_engine_error(self, art, monkeypatch):
         old = {"status": "running",
