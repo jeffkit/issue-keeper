@@ -1,0 +1,57 @@
+{
+  "runtime": "python",
+  "flow_id": "hitl-inbox",
+  "inputType": {
+    "dataType": "object"
+  },
+  "desc": "【值守·通道】回收人对 HITL 通知的回复（轮询会话 → 落到 issue + 留痕）；ctrl 队列 */5",
+  "nodes": [
+    {
+      "type": "start",
+      "id": "start",
+      "next": "facts"
+    },
+    {
+      "type": "code",
+      "id": "facts",
+      "language": "python",
+      "code": "\ndef run(input):\n    import json, subprocess\n\n    script = input.get(\"inbox_script\") or \"/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_inbox.py\"\n    base = input.get(\"hitl_base\") or \"http://127.0.0.1:8081\"\n    try:\n        r = subprocess.run([\"python3\", script, \"--base\", base],\n                           capture_output=True, text=True, timeout=180)\n        out = (r.stdout or \"\").strip().splitlines()\n        d = json.loads(out[-1]) if out else {}\n    except Exception as e:\n        return {\"checked\": 0, \"replied\": [], \"errors\": [str(e)[:120]], \"server_sessions\": 0}\n    d.setdefault(\"replied\", [])\n    d.setdefault(\"errors\", [])\n    return d\n",
+      "input": {
+        "inbox_script": "$INPUT.inbox_script",
+        "hitl_base": "$INPUT.hitl_base"
+      },
+      "next": "finish",
+      "source_line": 29
+    },
+    {
+      "type": "code",
+      "id": "finish",
+      "language": "python",
+      "code": "\ndef run(input):\n    import fcntl, json, os, tempfile, time\n    replied = input.get(\"replied\") or []\n    if not replied and not (input.get(\"errors\") or []):\n        # 无回复且无异常：静默（不写轮报，避免每 5 分钟刷屏）\n        return {\"round\": None, \"status\": \"quiet\", \"n\": 0}\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    os.makedirs(duty, exist_ok=True)\n    ts = time.strftime(\"%Y-%m-%dT%H:%M:%S+08:00\")\n    spath = os.path.join(duty, \"state-hitl.json\")\n    rd = 1\n    try:\n        doc = json.load(open(spath))\n        rd = max([r.get(\"round\", 0) for r in (doc.get(\"rounds\") or [])] or [0]) + 1\n    except Exception:\n        pass\n    findings = []\n    for r in replied:\n        findings.append({\"severity\": \"info\",\n                         \"summary\": \"收到人工回复（%s）：%s → %s\" % (r.get(\"sid\"), (r.get(\"text\") or \"\")[:80],\n                                                                   r.get(\"routed_to\") or \"仅留痕\"),\n                         \"escalate\": False})\n    for e in (input.get(\"errors\") or [])[:3]:\n        findings.append({\"severity\": \"warn\", \"summary\": \"会话轮询异常：%s\" % str(e)[:100],\n                         \"escalate\": False})\n    status = \"ok\" if replied else \"attention\"\n    round_doc = {\"schema_version\": \"duty/state@0\", \"role\": \"hitl\", \"generation\": 2,\n                 \"round\": rd, \"started_at\": ts, \"finished_at\": ts, \"status\": status,\n                 \"findings\": findings,\n                 \"narrative\": \"回收人工回复 %d 条（检查会话 %s）\" % (len(replied), input.get(\"checked\"))}\n    def atomic(path, d):\n        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=\".tmp-\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(json.dumps(d, indent=1, ensure_ascii=False))\n        os.replace(tmp, path)\n    with open(spath + \".lock\", \"w\") as lf:\n        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n        try:\n            doc = {\"schema_version\": \"duty/state@0\", \"role\": \"hitl\", \"rounds\": []}\n            try:\n                doc = json.load(open(spath))\n            except Exception:\n                pass\n            rounds = doc.get(\"rounds\") or []\n            rounds.append(round_doc)\n            doc.update({\"rounds\": rounds[-20:], \"updated_at\": ts})\n            atomic(spath, doc)\n        finally:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n    with open(os.path.join(duty, \"rounds.log\"), \"a\") as fh:\n        fh.write(\"%s hitl-inbox 轮次=%s 状态=%s 回复=%d 检查=%s\\n\"\n                 % (ts, rd, status, len(replied), input.get(\"checked\")))\n    return {\"round\": rd, \"status\": status, \"n\": len(replied)}\n",
+      "input": {
+        "replied": "$NODE.facts.replied",
+        "checked": "$NODE.facts.checked",
+        "errors": "$NODE.facts.errors",
+        "duty_dir": "$INPUT.duty_dir"
+      },
+      "next": "_n1",
+      "source_line": 49
+    },
+    {
+      "type": "end",
+      "id": "_n1",
+      "output": {
+        "round": "$NODE.finish.round",
+        "status": "$NODE.finish.status"
+      },
+      "resultType": "success",
+      "name": "return {'round': NODE.finis…",
+      "desc": "return {'round': NODE.finish.round, 'status': NODE.finish.s…",
+      "source_line": 108
+    }
+  ],
+  "metadata": {
+    "source": "#!/usr/bin/env python3\n\"\"\"hitl-inbox —— 回收人对 HITL 通知的回复（v0.1，ctrl 队列专用）。\n\n背景（2026-10-09 jeffkit 实测「我回复了，AI 也应该没收到的」）：\n值守发出的 HITL 通知此前用 `wait_reply=false` → 服务端**不建会话** → 人在微信/\n企微的回复没有可归属 session，被丢弃（`/admin/api/hil/sessions` 为空即证据）。\n`hitl_notify.py` 已改为一律建会话（`wait_reply=true` + 24h TTL）；本 flow 负责**收**：\n\n  facts（CODE：跑 hitl_inbox.py——轮询会话 → 回复回写 jsonl + `gh issue comment`\n         落到通知里带的 feedback_url，业务面留痕）\n    → finish（CODE：**有回复才写 duty 轮报**，避免每 5 分钟刷屏）\n\n为什么单独一个 flow 而不是塞进 ctrl-watch：回复要**分钟级**收（人回完就期待有反应），\nctrl-watch 是 */30；本 flow 轻量纯 IO，*/5 一轮成本可忽略。\n\n编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \\\n        python3 flows/build_flows.py hitl-inbox\n\"\"\"\nfrom __future__ import annotations\n\nfrom plaita.dsl.codeflow import CODE, NODE, flow\nfrom plaita.node import register_code_node\n\nregister_code_node(default_backend=\"subprocess\")\n\n\n@flow(\"hitl-inbox\", desc=\"【值守·通道】回收人对 HITL 通知的回复（轮询会话 → 落到 issue + 留痕）；ctrl 队列 */5\")\ndef hitl_inbox(INPUT):\n    facts = CODE(id=\"facts\", lang=\"python\", input={\n        \"inbox_script\": INPUT.inbox_script, \"hitl_base\": INPUT.hitl_base,\n    }, code=\"\"\"\ndef run(input):\n    import json, subprocess\n\n    script = input.get(\"inbox_script\") or \"/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_inbox.py\"\n    base = input.get(\"hitl_base\") or \"http://127.0.0.1:8081\"\n    try:\n        r = subprocess.run([\"python3\", script, \"--base\", base],\n                           capture_output=True, text=True, timeout=180)\n        out = (r.stdout or \"\").strip().splitlines()\n        d = json.loads(out[-1]) if out else {}\n    except Exception as e:\n        return {\"checked\": 0, \"replied\": [], \"errors\": [str(e)[:120]], \"server_sessions\": 0}\n    d.setdefault(\"replied\", [])\n    d.setdefault(\"errors\", [])\n    return d\n\"\"\")\n\n    finish = CODE(id=\"finish\", lang=\"python\", input={\n        \"replied\": NODE.facts.replied, \"checked\": NODE.facts.checked,\n        \"errors\": NODE.facts.errors, \"duty_dir\": INPUT.duty_dir,\n    }, code=\"\"\"\ndef run(input):\n    import fcntl, json, os, tempfile, time\n    replied = input.get(\"replied\") or []\n    if not replied and not (input.get(\"errors\") or []):\n        # 无回复且无异常：静默（不写轮报，避免每 5 分钟刷屏）\n        return {\"round\": None, \"status\": \"quiet\", \"n\": 0}\n    duty = os.path.expanduser(input.get(\"duty_dir\") or \"~/.issue-keeper/duty\")\n    os.makedirs(duty, exist_ok=True)\n    ts = time.strftime(\"%Y-%m-%dT%H:%M:%S+08:00\")\n    spath = os.path.join(duty, \"state-hitl.json\")\n    rd = 1\n    try:\n        doc = json.load(open(spath))\n        rd = max([r.get(\"round\", 0) for r in (doc.get(\"rounds\") or [])] or [0]) + 1\n    except Exception:\n        pass\n    findings = []\n    for r in replied:\n        findings.append({\"severity\": \"info\",\n                         \"summary\": \"收到人工回复（%s）：%s → %s\" % (r.get(\"sid\"), (r.get(\"text\") or \"\")[:80],\n                                                                   r.get(\"routed_to\") or \"仅留痕\"),\n                         \"escalate\": False})\n    for e in (input.get(\"errors\") or [])[:3]:\n        findings.append({\"severity\": \"warn\", \"summary\": \"会话轮询异常：%s\" % str(e)[:100],\n                         \"escalate\": False})\n    status = \"ok\" if replied else \"attention\"\n    round_doc = {\"schema_version\": \"duty/state@0\", \"role\": \"hitl\", \"generation\": 2,\n                 \"round\": rd, \"started_at\": ts, \"finished_at\": ts, \"status\": status,\n                 \"findings\": findings,\n                 \"narrative\": \"回收人工回复 %d 条（检查会话 %s）\" % (len(replied), input.get(\"checked\"))}\n    def atomic(path, d):\n        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=\".tmp-\")\n        with os.fdopen(fd, \"w\") as f:\n            f.write(json.dumps(d, indent=1, ensure_ascii=False))\n        os.replace(tmp, path)\n    with open(spath + \".lock\", \"w\") as lf:\n        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)\n        try:\n            doc = {\"schema_version\": \"duty/state@0\", \"role\": \"hitl\", \"rounds\": []}\n            try:\n                doc = json.load(open(spath))\n            except Exception:\n                pass\n            rounds = doc.get(\"rounds\") or []\n            rounds.append(round_doc)\n            doc.update({\"rounds\": rounds[-20:], \"updated_at\": ts})\n            atomic(spath, doc)\n        finally:\n            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)\n    with open(os.path.join(duty, \"rounds.log\"), \"a\") as fh:\n        fh.write(\"%s hitl-inbox 轮次=%s 状态=%s 回复=%d 检查=%s\\\\n\"\n                 % (ts, rd, status, len(replied), input.get(\"checked\")))\n    return {\"round\": rd, \"status\": status, \"n\": len(replied)}\n\"\"\")\n\n    return {\"round\": NODE.finish.round, \"status\": NODE.finish.status}\n\n\nif __name__ == \"__main__\":\n    print(\"hitl-inbox flow 源码（编译见 build_flows.py）\")\n",
+    "source_format": "plaita@flow"
+  }
+}
