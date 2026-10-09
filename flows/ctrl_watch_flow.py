@@ -26,7 +26,7 @@ LLM 仲裁留给真实冲突场景（如 A/B 报告互斥）——届时按 prot
   shadow = ssh tcloud_gz stat ~/.issue-keeper/shadow/latest.json mtime；周期 5min，超 20min = stale
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_ctrl_watch.py
+        python3 flows/build_flows.py ctrl-watch
 """
 from __future__ import annotations
 

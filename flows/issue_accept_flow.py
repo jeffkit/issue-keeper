@@ -26,7 +26,7 @@
   /reject 或含「验收不通过」→ 只记 finding（本轮不自动动作）
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_issue_accept.py
+        python3 flows/build_flows.py issue-accept
 """
 from __future__ import annotations
 

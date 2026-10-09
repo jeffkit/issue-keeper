@@ -19,7 +19,7 @@
     → finish（CODE：duty state-sandbox 滚动窗口 + rounds.log 一行）
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_sandbox_watch.py
+        python3 flows/build_flows.py sandbox-watch
 """
 from __future__ import annotations
 
