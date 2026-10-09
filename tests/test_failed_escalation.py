@@ -147,6 +147,32 @@ def test_重试耗尽才升级_二连失败发评论打标签(reap_env):
     assert any("needs-human" in [str(x) for x in c] for c in labels)
 
 
+def test_engine_error二连升级_发评论打标签(reap_env):
+    """engine_error 连续 2 次 → 升级：发升级评论 + needs-human 标签。
+
+    2026-10-09 缺口修复的护栏：本分支此前**只落 keeper 日志**，GitHub 上零痕迹
+    （实证 recursive#86 / argusai#13 无标签无评论，而走 failed 路径的 hitl-mcp#4 有），
+    导致外部看不到、值守与看板也无法发现「哪些单在等人」。修复前本用例必然失败。
+    """
+    state, it, art, posted, gh_calls, home = reap_env
+    # comment_posted=False 是本补丁覆盖的路径（分支闸 `not posted`）；
+    # posted=True（已有终态回评）时整个 engine_error 升级分支不进入——另一处缺口，另行决策
+    for _ in range(2):
+        _ledger_row(home, "a/b", 7, status="engine_error", comment_posted=False,
+                    error="executor 'recursive' exited 1")
+
+    _reap_pipelines(_pipeline_cfg(home / "b"), state, _bindings(repo="a/b"))
+
+    assert it.processed is True, "engine_error 二连升级即终态收尾（不再自动重派）"
+    assert it.in_flight_since is None
+    assert len(posted) == 1, "升级必须发一条评论（恰好一条，别和兜底回评叠双）"
+    assert "engine_error" in posted[0] or "引擎级失败" in posted[0]
+    assert "issue-keeper-bot" in posted[0], "升级评论必带 bot marker（防循环第一层）"
+    labels = _label_calls(gh_calls)
+    assert labels, "engine_error 升级必须给 issue 打 needs-human 标签"
+    assert any("needs-human" in [str(x) for x in c] for c in labels)
+
+
 def test_guarded与partial同样走连击升级(reap_env):
     """issue #8 的连击集合含 guarded/partial（均为「内容性失败」）。"""
     state, it, art, posted, gh_calls, home = reap_env
