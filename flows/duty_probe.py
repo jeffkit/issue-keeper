@@ -26,6 +26,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import time
 import urllib.request
 
 CONSOLE = "http://127.0.0.1:8323"
@@ -238,6 +239,15 @@ def main() -> int:
 
     verdict = {"level": level, "reasons": reasons, "tickets": tk, "throughput": tp,
                "disk": dk, "sandbox": sb}
+    # 心跳：独立兜底脚本（duty_escalation.py，launchd */3）据此判断「值守是否在场」——
+    # 探针是每轮第 0 步，所以它的 mtime 就是值守活跃度最可靠的代理。
+    try:
+        hb = REQ_DIR.parent / "probe-heartbeat.json"
+        hb.write_text(json.dumps({"ts": time.time(), "iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                  "level": level, "reasons": reasons[:3]}, ensure_ascii=False),
+                      encoding="utf-8")
+    except Exception:
+        pass
     if args.json:
         print(json.dumps(verdict, ensure_ascii=False, indent=2))
     else:
