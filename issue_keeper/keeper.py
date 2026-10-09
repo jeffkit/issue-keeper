@@ -1381,6 +1381,25 @@ def _gh_post_comment(kind: str, repo: str, number: int, body: str) -> None:
         raise RuntimeError(f"gh comment 失败: {(r.stderr or r.stdout or '')[-200:]}")
 
 
+def _escalate_engine_error(config, kind: str, repo: str, number: int,
+                           n_err: int, err: str, label: str) -> None:
+    """engine_error 连击升级人工：升级评论（语义区别于终态说明）+ needs-human 标签。
+
+    2026-10-09：原先只有 failed/筛选两条路径会「评论 + 打标」，engine_error 路径
+    只落 keeper 日志 → 人工队列在 GitHub 上不可见（recursive#86 / argusai#13 实证）。
+    抽成函数后，`not posted` 与 `posted=True` 两个入口都走同一套动作。
+    """
+    try:
+        _gh_post_comment(kind, repo, number,
+                         f"{config.bot_marker}\n[issue-pipeline] 本 issue 近 12 小时内连续 "
+                         f"{n_err} 次引擎级失败（status=engine_error，自动重派已耗尽），"
+                         f"已升级人工处理（标签 {config.pipeline_needs_human_label}）。"
+                         f"最近一次原因：{_sanitize_public_comment(err or '未记录')[:280]}")
+    except Exception as e:
+        log.error("[%s] engine_error 升级评论发送失败: %s", label, e)
+    _gh_add_label(kind, repo, number, config.pipeline_needs_human_label)
+
+
 def _gh_add_label(kind: str, repo: str, number: int, label: str) -> None:
     """升级留痕：给 issue/PR 打标签。fail-open——标签不存在或无权限不阻塞收尾
     （本工具不自动建标签；internal 看板源无 label 接口，调用方照常降级为仅评论）。"""
@@ -2669,43 +2688,41 @@ def _reap_pipelines(config, state, bindings) -> int:
                     posted = True     # 挡住下方兜底回评：升级评论恰一条
                     log.warning("[%s] failed/guarded/partial 连续 %d 次，升级人工", label, n_fail)
                 # 单次 guarded/partial（含 budget=0 的单次 failed）→ 落回通用收尾
-            if status == "engine_error" and not posted and not timed_out:
-                # 宿主终局标记优先（DESIGN §5 D6）：node_retry_exhausted 表示宿主
-                # 已在节点级烧满重试/预算墙才判 engine_error——keeper 再自动重派
-                # 一轮（implement 1-2h）纯浪费，跳过连击计数直接走下方升级。
-                # 普通崩溃（无标记）才吃自动重试额度。
-                if node_exhausted:
-                    log.warning("[%s] node_retry_exhausted（宿主已耗尽节点重试），"
-                                "跳过自动重派直接升级：%s", label, err[:80])
+            if status == "engine_error" and not timed_out:
+                if not posted:
+                    # 宿主终局标记优先（DESIGN §5 D6）：node_retry_exhausted 表示宿主
+                    # 已在节点级烧满重试/预算墙才判 engine_error——keeper 再自动重派
+                    # 一轮（implement 1-2h）纯浪费，跳过连击计数直接走下方升级。
+                    # 普通崩溃（无标记）才吃自动重试额度。
+                    if node_exhausted:
+                        log.warning("[%s] node_retry_exhausted（宿主已耗尽节点重试），"
+                                    "跳过自动重派直接升级：%s", label, err[:80])
+                    else:
+                        # 台账终态行（bridge _finish / reaper 代记）在计数**之前**已落，
+                        # 尾部连续数已含本次——不能再 +1，否则首败即 2 直接升级、
+                        # 重试分支永不可达（2026-10-01 实证：日志 0 次自动重试/24 次
+                        # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
+                        n_err = _consecutive_engine_errors(binding.repo, number)
+                        if n_err < 2:
+                            delay = _arm_auto_redispatch(it, config, now, lock=lock)
+                            finalized += 1
+                            log.info("[%s] engine_error 自动重试（连续第 %d 次，退避 %ds）：%s",
+                                     label, n_err, int(delay), err[:80])
+                            continue
+                        log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
+                        _escalate_engine_error(config, kind, binding.repo, number, n_err, err, label)
+                        posted = True
                 else:
-                    # 台账终态行（bridge _finish / reaper 代记）在计数**之前**已落，
-                    # 尾部连续数已含本次——不能再 +1，否则首败即 2 直接升级、
-                    # 重试分支永不可达（2026-10-01 实证：日志 0 次自动重试/24 次
-                    # 升级；语义：首败 trailing=1 → 重试，二连 trailing=2 → 升级）。
+                    # 已有终态回评（bridge/reaper 已发）：**仍按连击判定升级人工**。
+                    # failed 分支先例：「升级评论无条件发（语义不同：一条终态说明、
+                    # 一条升级求助）」。此前 `not posted` 闸让这类 engine_error 连
+                    # 升级分支都不进（既无评论也无标签）→ 人工队列在 GitHub 上不可见，
+                    # 值守/看板都发现不了（recursive#86 / argusai#13 实证）。
                     n_err = _consecutive_engine_errors(binding.repo, number)
-                    if n_err < 2:
-                        delay = _arm_auto_redispatch(it, config, now, lock=lock)
-                        finalized += 1
-                        log.info("[%s] engine_error 自动重试（连续第 %d 次，退避 %ds）：%s",
-                                 label, n_err, int(delay), err[:80])
-                        continue
-                    log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
-                    # 2026-10-09（B 值守 finding + 三先例核对：recursive#86 / argusai#13
-                    # 走本路径 → GitHub 零痕迹；hitl-mcp#4 走 failed 路径 → 有标签）：
-                    # 本分支原先只落 keeper 日志，外部看不到、值守与看板也无法发现
-                    # 「哪些单在等人」。与 failed 分支对齐：升级评论（posted=True
-                    # 挡住下方兜底回评，恰一条）+ needs-human 标签。
-                    try:
-                        _gh_post_comment(kind, binding.repo, number,
-                                         f"{config.bot_marker}\n[issue-pipeline] 本 issue 近 12 小时内连续 "
-                                         f"{n_err} 次引擎级失败（status=engine_error，自动重派已耗尽），"
-                                         f"已升级人工处理（标签 {config.pipeline_needs_human_label}）。"
-                                         f"最近一次原因：{_sanitize_public_comment(err or '未记录')[:280]}")
-                    except Exception as e:
-                        log.error("[%s] engine_error 升级评论发送失败: %s", label, e)
-                    _gh_add_label(kind, binding.repo, number,
-                                  config.pipeline_needs_human_label)
-                    posted = True
+                    if n_err >= 2:
+                        log.warning("[%s] engine_error 连续 %d 次（已有终态回评），仍升级人工",
+                                    label, n_err)
+                        _escalate_engine_error(config, kind, binding.repo, number, n_err, err, label)
 
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
