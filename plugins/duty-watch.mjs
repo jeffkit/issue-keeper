@@ -48,14 +48,36 @@ function apply(ctx, config = {}) {
   const seenOnce = new Set()  // 回复类事件 key -> 已投递（一次性）
   let priming = true          // 首次 tick 只给回复类事件做基线，不投历史回复
   let running = false
+  const scheduleStore = String(config.scheduleStore || path.join(os.homedir(), '.dsh', 'storages', 'schedule.json'))
+
+  // 哪些会话持有「值守」定时任务 → 事件的优先投递目标（新会话起了值守轮即自动接棒）
+  function dutySessionIds() {
+    try {
+      const doc = JSON.parse(fs.readFileSync(scheduleStore, 'utf8'))
+      const ids = new Set()
+      for (const task of Object.values(doc?.tables?.tasks ?? {})) {
+        const title = String(task?.record?.title ?? '')
+        const sid = String(task?.sessionId ?? '')
+        if (sid && title.includes('值守')) ids.add(sid)
+      }
+      return ids
+    } catch {
+      return new Set()
+    }
+  }
 
   async function resolveTarget() {
     if (fixedSession) return fixedSession
     try {
       const value = await ctx.sessionController.list({}, new AbortController().signal)
       const items = (value?.items ?? []).filter(it => it?.sessionId && it.origin !== 'subagent')
-      items.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
-      const pick = items.find(it => it.running) ?? items[0]
+      // 优先投给「持有值守定时任务」的会话（读 DSH schedule 存储）——否则新开一个
+      // 随便聊两句的会话会把值守事件抢走。没有值守会话时退回最近活跃会话。
+      const duty = dutySessionIds()
+      const preferred = items.filter(it => duty.has(String(it.sessionId)))
+      const pool = preferred.length ? preferred : items
+      pool.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
+      const pick = pool.find(it => it.running) ?? pool[0]
       return pick?.sessionId ?? ''
     } catch (error) {
       log.warn?.(`[duty-watch] resolve target failed: ${error}`)
