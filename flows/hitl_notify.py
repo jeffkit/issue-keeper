@@ -3,10 +3,11 @@
 
 设计（jeffkit 2026-10-09：「需要人工处理时可以通过 HITL 通知人，但要提供反馈入口；
 阻塞等待要看情况使用」）：
-- **默认 fire-and-forget**（`--wait-secs 0`）：只推送，不占执行位；
+- **默认只推送**（`--wait-secs 0`）：不占执行位，但**仍建会话**（否则回复无处落，
+  2026-10-09 实测踩过：无会话 → 人回复被服务端丢弃）；
 - **按需限时等待**（`--wait-secs N` >0）：推完轮询回复最多 N 秒——仅用于「不马上定就
   会持续烧钱/扩大影响」的场景（如平台级 P0）；阻塞会占住 ctrl worker 并发位，慎用；
-- **反馈入口双通道**：微信直接回（本脚本可收回执）+ 正文里必带 GitHub 链接
+- **反馈入口双通道**：微信直接回（由 hitl_inbox.py 轮询会话收取并回落到 issue）+ 正文里必带 GitHub 链接
   （人在 issue 上回评/打标同样有效，且留痕在业务面上）；
 - **去重**：同 dedupe-key 在 --dedupe-hours 内只推一次（防刷屏）；
 - **留痕**：每次推送落 ~/.issue-keeper/duty/hitl-notifications.jsonl，供看板「等人工」面板展示。
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import sys
 import time
@@ -93,11 +95,16 @@ def main() -> int:
         return 0
 
     try:
-        # wait_reply=True 才会在 hitl-server 建会话（可收微信回复；会话占用到 timeout）——
-        # 因此仅在显式要求等待时开启；纯通知零占用（jeffkit：阻塞等待看情况用）。
-        want_wait = args.wait_secs > 0
-        resp = _post(f"{BASE}/api/send", {"message": message, "wait_reply": want_wait,
-                                          "timeout": max(300, args.wait_secs or 0), "upstream": "ilink"})
+        # 2026-10-09 修正（jeffkit 实测：回复我发的 HITL 消息「AI 也没收到」）：
+        # **必须建会话**，否则人在微信/企微里的回复没有可归属的 session，服务端只能丢弃。
+        # 服务端语义（hil-mcp handlers/api.py）：只有 wait_reply=true 才 create_session；
+        # false 时纯推送、无 session_id、`/admin/api/hil/sessions` 里查不到、回复无处落。
+        # 因此这里**一律 wait_reply=true**（HTTP 调用本身不阻塞，阻塞的是 MCP 客户端的
+        # 轮询循环）；timeout 给足（默认 24h）让回复有足够窗口被 ingest。
+        # --wait-secs 只决定**本脚本是否当场轮询**（占用执行位），与建会话无关。
+        resp = _post(f"{BASE}/api/send", {"message": message, "wait_reply": True,
+                                          "timeout": int(os.environ.get("HITL_SESSION_TTL_SECS", "86400")),
+                                          "upstream": "ilink"})
     except Exception as e:
         rec.update({"sent": False, "error": str(e)[:200]})
         _append(rec)
