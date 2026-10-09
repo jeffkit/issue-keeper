@@ -19,7 +19,7 @@ zcode B 降为每日抽查。跑在 `plaita:flow:queue:ctrl`（Mac worker-ctrl-1
 （重启=升级 #2 报请）；不代推他人提交；重大拍板 → #2 留言不擅动。
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_keeper_watch.py
+        python3 flows/build_flows.py keeper-watch
 """
 from __future__ import annotations
 

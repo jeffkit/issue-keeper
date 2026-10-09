@@ -18,7 +18,7 @@ keeper 已于 10-07 单实例迁远端 tcloud_gz，而该 LaunchAgent 读的是*
     → finish（CODE：duty state-patrol + rounds.log 一行）
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
-        python3 flows/build_pipeline_patrol.py
+        python3 flows/build_flows.py pipeline-patrol
 """
 from __future__ import annotations
 
@@ -169,4 +169,4 @@ def run(input):
 
 
 if __name__ == "__main__":
-    print("pipeline-patrol flow 源码（编译见 build_pipeline_patrol.py）")
+    print("pipeline-patrol flow 源码（编译见 build_flows.py pipeline-patrol）")
