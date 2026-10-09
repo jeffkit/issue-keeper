@@ -56,6 +56,9 @@ def run(input):
     # 2026-10-08 外部验收闭环（jeffkit 拍板）：external_authors = 不在 allowlist 的
     # 外部作者，其 issue 同样接单开发（screener 照走；验收由 issue-accept flow 承接）。
     external = {str(a).lower() for a in (cfg.get("external_authors") or [])}
+    # 2026-10-09：按单插队（config pipeline_priority_issues: ["owner/repo#123", ...]）
+    # 用途=平台级 P0/P1 缺陷（如 plaita#48 调度器炸穿）优先占用下一个空槽
+    prio_issues = {str(x).strip().lower() for x in (cfg.get("pipeline_priority_issues") or [])}
     optout = [str(x) for x in (cfg.get("opt_out_labels") or ["keeper-ignore"])]
     # ---- keeper 状态（processed/blocked/在途/退避/screener 连击）
     try:
@@ -132,6 +135,7 @@ def run(input):
                 "opt_out": any(l in optout for l in labels),
                 "allow_ok": (not allow) or (author.lower() in allow),
                 "external_ok": author.lower() in external,
+                "prio_issue": (repo_full + "#" + str(num)).lower() in prio_issues,
                 "has_state": bool(it),
                 "st_processed": bool(it.get("processed")),
                 "st_blocked": bool(it.get("blocked")),
@@ -258,7 +262,8 @@ def run(input):
     # 派发次序对齐 keeper：priority_repos 优先，其次按仓/单号（槽位竞争的公平性）
     prio = set(cfg.pipeline_priority_repos or [])
     rows = sorted(input.get("rows") or [],
-                  key=lambda r: (0 if r.get("repo") in prio else 1,
+                  key=lambda r: (0 if r.get("prio_issue") else 1,
+                                 0 if r.get("repo") in prio else 1,
                                  r.get("repo") or "", int(r.get("num") or 0)))
     for r in rows:
         repo, num = r.get("repo"), r.get("num")
