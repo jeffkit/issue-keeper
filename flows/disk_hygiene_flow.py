@@ -74,18 +74,39 @@ print(json.dumps({"free_gib": round(free_gib, 1), "blocked": blocked,
                 "blocked": [], "runs": [], "n_runs": 0}
     d["error"] = None
     d["min_free_gib"] = float(input.get("min_free_gib") or 20)
+    # 本机（Mac）侧事实：本 flow 由 Mac ctrl worker 执行，而原实现只 ssh 看 VM——
+    # 2026-10-09 Mac 侧 17.2GiB 跌破守卫线、8 次派发全被 preflight 挡回、管线停摆
+    # 30min+ 而无任何 flow 报出（disk-hygiene 报的永远是 VM 数字）。此即根因盲区。
+    import os as _os
+    try:
+        stt = _os.statvfs("/")
+        d["local_free_gib"] = round(stt.f_bavail * stt.f_frsize / 2**30, 1)
+    except Exception:
+        d["local_free_gib"] = None
+    try:
+        root = _os.path.expanduser("~/projects/infra4agent")
+        n = 0
+        for b in _os.listdir(root):
+            rd = _os.path.join(root, b, ".flowcast", "runs")
+            if _os.path.isdir(rd):
+                n += sum(1 for x in _os.listdir(rd) if _os.path.isdir(_os.path.join(rd, x)))
+        d["local_n_runs"] = n
+    except Exception:
+        d["local_n_runs"] = None
     return d
 """)
 
     # ── ② triage（阈值/挡单分级）──────────────────────────────────────
     triage = CODE(id="triage", lang="python", input={
         "free_gib": NODE.facts.free_gib, "min_free_gib": NODE.facts.min_free_gib,
+        "local_free_gib": NODE.facts.local_free_gib, "local_n_runs": NODE.facts.local_n_runs,
         "blocked": NODE.facts.blocked, "n_runs": NODE.facts.n_runs, "error": NODE.facts.error,
         "margin_gib": INPUT.margin_gib,
     }, code="""
 def run(input):
     findings = []
     free = input.get("free_gib")
+    lfree = input.get("local_free_gib")
     mn = float(input.get("min_free_gib") or 20)
     margin = float(input.get("margin_gib") or 5)
     blocked = input.get("blocked") or []
@@ -102,6 +123,17 @@ def run(input):
             findings.append({"severity": "warn",
                              "summary": "VM 可用磁盘 %.1fGiB 逼近守卫阈值 %.0fGiB（余量 <%.0f）"
                                         % (free, mn, margin), "escalate": False})
+    # 本机(Mac)侧同判据：Mac 上跑着 ctrl + v2 worker，其 run 的 preflight 读的是本机
+    # 磁盘；低于守卫线同样会全线挡回（2026-10-09 实证 17.2GiB → 8 次派发全部 retry-later）。
+    if lfree is not None:
+        if lfree < mn:
+            findings.append({"severity": "critical",
+                             "summary": "本机(Mac)可用磁盘 %.1fGiB < 守卫阈值 %.0fGiB——Mac 侧 run 派发会被全线挡回"
+                                        % (lfree, mn), "escalate": True})
+        elif lfree < mn + margin:
+            findings.append({"severity": "warn",
+                             "summary": "本机(Mac)可用磁盘 %.1fGiB 逼近守卫阈值 %.0fGiB（余量 <%.0f）"
+                                        % (lfree, mn, margin), "escalate": False})
     if disk_blocked:
         findings.append({"severity": "critical",
                          "summary": "被守卫挡住的条目 %d 条（退避最长 6h）：%s"
@@ -109,9 +141,12 @@ def run(input):
                                        ", ".join("%s#%s(streak=%s)" % (b["repo"], b["num"], b["streak"])
                                                  for b in disk_blocked[:6])),
                          "escalate": True})
-    need_clean = free is not None and free < mn + margin
-    report = "可用 %.1fGiB（阈值 %.0f）· 挡单 %d · run worktree %d 个" % (
-        free if free is not None else -1, mn, len(disk_blocked), input.get("n_runs") or 0)
+    need_clean = ((free is not None and free < mn + margin)
+                  or (lfree is not None and lfree < mn + margin))
+    report = "VM %.1fGiB / Mac %sGiB（阈值 %.0f）· 挡单 %d · worktree VM%d/Mac%s" % (
+        free if free is not None else -1, lfree if lfree is not None else "?",
+        mn, len(disk_blocked), input.get("n_runs") or 0,
+        input.get("local_n_runs") if input.get("local_n_runs") is not None else "?")
     return {"findings": findings, "need_clean": need_clean, "disk_blocked": disk_blocked,
             "report": report}
 """)
@@ -120,24 +155,43 @@ def run(input):
     act = CODE(id="act", lang="python", input={
         "need_clean": NODE.triage.need_clean, "disk_blocked": NODE.triage.disk_blocked,
         "ssh_host": INPUT.ssh_host, "keep_hours": INPUT.keep_hours, "dryrun": INPUT.dryrun,
+        "min_free_gib": NODE.facts.min_free_gib, "local_free_gib": NODE.facts.local_free_gib,
     }, code="""
 def run(input):
-    import json, subprocess
+    import json, os, subprocess
 
     HOST = input.get("ssh_host") or "tcloud_gz"
     keep = float(input.get("keep_hours") or 24)
+    min_gib = float(input.get("min_free_gib") or 20)
     if input.get("dryrun"):
-        return {"freed_gib": 0, "removed": 0, "cleared": [], "why": "dryrun"}
+        return {"freed_gib": 0, "removed": 0, "cleared": [], "local": {}, "why": "dryrun"}
     need_clean = bool(input.get("need_clean"))
     blocked = input.get("disk_blocked") or []
+
+    # ── 本机(Mac)侧清理：本 flow 由 Mac ctrl worker 执行，而清理脚本原先只 ssh 清
+    #    VM——Mac 侧 run worktree 无人清扫（2026-10-09 累积 152G，17G 可用把管线挡停
+    #    30min+）。复用 clean_local_runs.py 的同一判据（mtime>keep + 空间闸）。
+    local = {"removed": 0, "freed_gib": 0.0, "skipped_reason": "need_clean=False"}
+    if need_clean:
+        try:
+            cs = os.environ.get("DUTY_CLEAN_LOCAL_SCRIPT") or \\
+                "/Users/kong/projects/infra4agent/issue-keeper/flows/clean_local_runs.py"
+            rr = subprocess.run(["python3", cs, "--keep-hours", str(keep),
+                                 "--min-free-gib", str(min_gib)],
+                                capture_output=True, text=True, timeout=600)
+            local = json.loads((rr.stdout or "{}").strip().splitlines()[-1] or "{}")
+        except Exception as e:
+            local = {"error": str(e)[:120]}
 
     remote = r'''
 import json, os, shutil, subprocess, tempfile, time
 need_clean = %s
 keep_h = %s
+min_gib = %s
 cleared = []
 removed = 0
 before = os.statvfs("/home/ubuntu")
+free_before = (before.f_bavail * before.f_frsize) / 2**30
 if need_clean:
     cutoff = time.time() - keep_h * 3600
     for base in os.listdir("/home/ubuntu/projects/infra4agent"):
@@ -149,40 +203,50 @@ if need_clean:
             if os.path.isdir(p) and os.stat(p).st_mtime < cutoff:
                 shutil.rmtree(p, ignore_errors=True)
                 removed += 1
-# 解封：清被守卫挡住的 retry_after（先备份）
-p = "/home/ubuntu/.issue-keeper/state.json"
-shutil.copy(p, p + ".bak-diskhygiene")
-doc = json.load(open(p))
-now = time.time()
-for slug, rv in (doc.get("repos") or {}).items():
-    for num, it in (rv.get("items") or {}).items():
-        ra = it.get("retry_after")
-        if ra and ra > now and (it.get("retry_later_streak") or 0) >= 2:
-            cleared.append("%%s#%%s" %% (slug.replace("jeffkit-", ""), num))
-            it["retry_after"] = None
-            it["retry_later_streak"] = 0
-if cleared:
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-state-")
-    with os.fdopen(fd, "w") as f:
-        json.dump(doc, f, ensure_ascii=False)
-    os.replace(tmp, p)
+# 解封：清被守卫挡住的 retry_after（先备份）。
+# ⚠️ 2026-10-09 修复「盲解封」：根因（磁盘不足）未解除时清 retry_after 只会把 run
+#    立刻派回同一堵墙 → 重试风暴（req-20261009-163048 实证 cleared 5 条而 free 18.9G）。
+#    现在要求 free >= 守卫线 + 3GiB 才解封；否则保留退避，等磁盘真的修好。
+if free_before >= min_gib + 3:
+    p = "/home/ubuntu/.issue-keeper/state.json"
+    shutil.copy(p, p + ".bak-diskhygiene")
+    doc = json.load(open(p))
+    now = time.time()
+    for slug, rv in (doc.get("repos") or {}).items():
+        for num, it in (rv.get("items") or {}).items():
+            ra = it.get("retry_after")
+            if ra and ra > now and (it.get("retry_later_streak") or 0) >= 2:
+                cleared.append("%%s#%%s" %% (slug.replace("jeffkit-", ""), num))
+                it["retry_after"] = None
+                it["retry_later_streak"] = 0
+    if cleared:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-state-")
+        with os.fdopen(fd, "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        os.replace(tmp, p)
 after = os.statvfs("/home/ubuntu")
 freed = ((after.f_bavail - before.f_bavail) * after.f_frsize) / 2**30
-print(json.dumps({"freed_gib": round(freed, 2), "removed": removed, "cleared": cleared}))
-''' % (repr(need_clean), repr(keep))
+print(json.dumps({"freed_gib": round(freed, 2), "removed": removed, "cleared": cleared,
+                  "free_before_gib": round(free_before, 1)}))
+''' % (repr(need_clean), repr(keep), repr(min_gib))
     try:
         r = subprocess.run(["ssh", "-o", "ConnectTimeout=8", HOST, "python3 -"],
                            input=remote, capture_output=True, text=True, timeout=300)
-        return json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}")
+        res = json.loads((r.stdout or "{}").strip().splitlines()[-1] or "{}")
     except Exception as e:
-        return {"freed_gib": 0, "removed": 0, "cleared": [], "error": str(e)[:120]}
+        res = {"freed_gib": 0, "removed": 0, "cleared": [], "error": str(e)[:120]}
+    res["local"] = local
+    res["freed_gib"] = round((res.get("freed_gib") or 0) + (local.get("freed_gib") or 0), 2)
+    res["removed"] = (res.get("removed") or 0) + (local.get("removed") or 0)
+    return res
 """)
 
     # ── ④ finish（duty 轮报 + critical 推 HITL）──────────────────────
     finish = CODE(id="finish", lang="python", input={
         "report": NODE.triage.report, "findings": NODE.triage.findings,
         "freed_gib": NODE.act.freed_gib, "removed": NODE.act.removed,
-        "cleared": NODE.act.cleared, "requests_script": INPUT.requests_script,
+        "cleared": NODE.act.cleared, "local": NODE.act.local,
+        "requests_script": INPUT.requests_script,
         "hitl_wait_secs": INPUT.hitl_wait_secs, "duty_dir": INPUT.duty_dir,
     }, code="""
 def run(input):
@@ -200,8 +264,10 @@ def run(input):
     except Exception:
         pass
     status = "critical" if crit else ("attention" if findings else "ok")
-    narrative = "%s ｜ 清理 %s 个（释放 %.2fGiB）｜ 解封 %s" % (
+    loc = input.get("local") or {}
+    narrative = "%s ｜ 清理 %s 个（释放 %.2fGiB，其中本机 %s 个/%.2fGiB）｜ 解封 %s" % (
         input.get("report"), input.get("removed"), input.get("freed_gib") or 0,
+        loc.get("removed", 0), loc.get("freed_gib", 0) or 0,
         ",".join(input.get("cleared") or []) or "无")
     round_doc = {"schema_version": "duty/state@0", "role": "disk", "generation": 2,
                  "round": rd, "started_at": ts, "finished_at": ts, "status": status,

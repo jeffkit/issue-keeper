@@ -291,10 +291,68 @@ def run(input):
 """)
 
     # ── ④ finish（duty state-inflight + rounds.log + critical 时推 HITL）──
+    # ── ④ outcome（产出探针：活着 ≠ 出活）────────────────────────────
+    # 2026-10-09 教训（jeffkit 点名）：8 个 flow 轮报全绿，而磁盘守卫把 8 次派发
+    # 全挡回、落地为 0——**没有任何 flow 在看「产出」**。此节点每 15min 跑
+    # duty_probe，凡 attempts>=5 且落地 0 即递工单（同类未决不重复递），
+    # 使「产出停摆」不再依赖值守会话在场。
+    outcome = CODE(id="outcome", lang="python", input={
+        "requests_script": INPUT.requests_script, "duty_dir": INPUT.duty_dir,
+        "dryrun": INPUT.dryrun,
+    }, code="""
+def run(input):
+    import glob, json, os, subprocess
+    probe = os.environ.get("DUTY_PROBE_SCRIPT") or \\
+        "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_probe.py"
+    try:
+        r = subprocess.run(["python3", probe, "--json", "--window-min", "90"],
+                           capture_output=True, text=True, timeout=300)
+        v = json.loads((r.stdout or "{}").strip() or "{}")
+    except Exception as e:
+        return {"level": "unknown", "error": str(e)[:120], "raised": None, "reasons": []}
+    tp = v.get("throughput") or {}
+    level = v.get("level") or "unknown"
+    reasons = v.get("reasons") or []
+    raised = None
+    attempts = int(tp.get("attempts") or 0)
+    landed = int(tp.get("landed") or 0)
+    stuck = level in ("BLOCKED", "DEGRADED") and attempts >= 5 and landed == 0
+    if stuck and not input.get("dryrun"):
+        duty = os.path.expanduser(input.get("duty_dir") or "~/.issue-keeper/duty")
+        dup = False
+        for p in glob.glob(os.path.join(duty, "requests", "req-*.json")):
+            try:
+                d = json.load(open(p))
+            except Exception:
+                continue
+            if d.get("kind") == "outcome-block" and d.get("status") in ("open", "escalated", "answered"):
+                dup = True
+                break
+        if not dup:
+            rs = os.path.expanduser(input.get("requests_script") or
+                "~/projects/infra4agent/issue-keeper/flows/duty_request.py")
+            ctx = json.dumps({"flow": "inflight-watch/outcome", "level": level,
+                              "reasons": reasons, "throughput": tp}, ensure_ascii=False)
+            title = "[产出] 近90m %d 次派发 0 落地：%s" % (
+                attempts, (reasons[0] if reasons else "原因待查")[:60])
+            try:
+                rr = subprocess.run(["python3", rs, "create", "--from-flow", "inflight-watch",
+                                     "--kind", "outcome-block", "--severity", "critical",
+                                     "--title", title, "--context-json", ctx,
+                                     "--options", "clean_disk,resume,cancel_reopen,escalate_human"],
+                                    capture_output=True, text=True, timeout=60)
+                lines = (rr.stdout or "").strip().splitlines()
+                raised = json.loads(lines[-1]).get("id") if lines else None
+            except Exception as e:
+                raised = "create-failed: %s" % str(e)[:60]
+    return {"level": level, "reasons": reasons, "attempts": attempts, "landed": landed,
+            "raised": raised}
+""")
+
     finish = CODE(id="finish", lang="python", input={
         "report": NODE.triage.report, "findings": NODE.triage.findings,
         "resumed": NODE.act.resumed, "requests_script": INPUT.requests_script,
-        "rows": NODE.triage.rows,
+        "rows": NODE.triage.rows, "outcome": NODE.outcome,
         "hitl_wait_secs": INPUT.hitl_wait_secs, "duty_dir": INPUT.duty_dir,
     }, code="""
 def run(input):
@@ -303,7 +361,19 @@ def run(input):
     os.makedirs(duty, exist_ok=True)
     ts = time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
     findings = input.get("findings") or []
+    oc = input.get("outcome") or {}
+    if oc.get("level") in ("BLOCKED", "DEGRADED"):
+        findings = findings + [{
+            "severity": "critical" if oc.get("level") == "BLOCKED" else "warn",
+            "source": "outcome",
+            "summary": "产出探针 %s：近90m %s 次派发落地 %s——%s" % (
+                oc.get("level"), oc.get("attempts"), oc.get("landed"),
+                "；".join(oc.get("reasons") or [])[:120]),
+            "escalate": False}]
     crit = [f for f in findings if f.get("severity") == "critical"]
+    # 递单去重：产出类 finding 已由 outcome 节点递了精确工单（kind=outcome-block），
+    # 这里不再为它重复递通用 inflight-stall 单（2026-10-09 实证双单）。
+    crit_ticket = [f for f in crit if f.get("source") != "outcome"]
     spath = os.path.join(duty, "state-inflight.json")
     rd = 1
     try:
@@ -318,7 +388,11 @@ def run(input):
                  "actions": ([{"capability": "restart_worker", "level": "authorized",
                                "summary": "自动 resume 卡死执行：%s" % ", ".join(input.get("resumed") or [])}]
                              if input.get("resumed") else []),
-                 "narrative": str(input.get("report") or "")[:200]}
+                 "narrative": (str(input.get("report") or "")[:160]
+                               + (" ｜ 产出 %s（派发 %s/落地 %s%s）" % (
+                                   oc.get("level", "?"), oc.get("attempts"), oc.get("landed"),
+                                   "，已递工单 " + str(oc.get("raised")) if oc.get("raised") else "")
+                                  if oc else ""))[:300]}
     def atomic(path, d):
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
         with os.fdopen(fd, "w") as f:
@@ -345,11 +419,11 @@ def run(input):
     # 三层协同（jeffkit 2026-10-09）：critical **不再直接推人**——先写「决策工单」
     # 给值守 Agent（duty-agent */10 按能力矩阵自决，判不了才 HITL 人 + 监听回复）。
     req = {"id": None, "why": "无 critical"}
-    if crit:
+    if crit_ticket:
         try:
             rs = input.get("requests_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_request.py"
             ctx = json.dumps({"flow": "inflight-watch", "report": input.get("report"),
-                              "findings": [f.get("summary") for f in crit[:6]],
+                              "findings": [f.get("summary") for f in crit_ticket[:6]],
                               "rows": input.get("rows") or []}, ensure_ascii=False)
             cmd = ("python3 %s create --from-flow inflight-watch --kind inflight-stall "
                    "--severity critical --title %s --context-json %s --options resume,cancel_reopen,wait"
