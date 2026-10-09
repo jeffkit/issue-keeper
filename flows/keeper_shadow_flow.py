@@ -31,7 +31,7 @@ from plaita.node import register_code_node
 register_code_node(default_backend="subprocess")
 
 
-@flow("keeper-shadow", desc="【影子/金丝雀】keeper 派发决策 + 可选 canary 派发——dispatch_repos 空=纯影子零写入；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）")
+@flow("keeper-shadow", desc="【生产·在用】keeper 派发决策 + intake 承接（screener+派发）——Phase 3 起为派发权持有者；dispatch_repos 空=只读对账；白名单内仓真派发（复用 keeper 库写回，reaper 可收尾）")
 def keeper_shadow(INPUT):
     # ── ① 事实装载（IO 叶子：config/state/台账 + gh 扫单，join 成 items）─────
     facts = CODE(id="facts", lang="python", input={"ik_home": INPUT.ik_home}, code="""
