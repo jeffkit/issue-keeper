@@ -35,7 +35,7 @@ KEEP_HANDOFFS = 20
 _ROLES = {"A", "B", "controller", "sandbox"}
 _FLOW_ROLES = set(_ROLES) | {
     # flow 形态的值守角色：以 flow 名为 state 文件名（一个 flow 一份轮次序列）
-    "issue-accept",
+    "issue-accept", "sandbox", "patrol",
 }
 _ROUND_REQUIRED = ("schema_version", "role", "round", "started_at", "status")
 _ROUND_STATUS = {"running", "ok", "attention", "failed", "aborted"}
