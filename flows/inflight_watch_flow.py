@@ -169,6 +169,7 @@ print(json.dumps(rows, ensure_ascii=False))
         "rows": NODE.facts.rows, "instances": NODE.facts.instances,
         "error": NODE.facts.error,
         "stall_min": INPUT.stall_min, "hard_min": INPUT.hard_min, "long_min": INPUT.long_min,
+        "terminal_lag_min": INPUT.terminal_lag_min,
     }, code="""
 def run(input):
     TERMINAL = {"completed", "failed", "cancelled", "error"}
@@ -177,6 +178,7 @@ def run(input):
     stall = float(input.get("stall_min") or 30)
     hard = float(input.get("hard_min") or 45)
     long_min = float(input.get("long_min") or 180)
+    lag_min = float(input.get("terminal_lag_min") or 10)
 
     findings, stalled, terminal_lag = [], [], []
     for it in rows:
@@ -185,10 +187,13 @@ def run(input):
         pa = it.get("progress_age_min")
         age = it.get("in_flight_min") or 0
         if st in TERMINAL:
-            terminal_lag.append(it)
-            findings.append({"severity": "critical",
-                             "summary": "%s 执行已终态（%s）但 keeper 仍算在途 %.0f 分钟——收尸滞后"
-                                        % (label, st, age), "escalate": True})
+            # keeper 收尸是轮询制（轮间隔数分钟），刚终态就报=噪声——2026-10-09
+            # 实测 plaita#31 终态后 3 分钟即被 keeper 落账，1 分钟时报警属误报。
+            if age >= lag_min:
+                terminal_lag.append(it)
+                findings.append({"severity": "critical",
+                                 "summary": "%s 执行已终态（%s）但 keeper 仍算在途 %.0f 分钟——收尸滞后"
+                                            % (label, st, age), "escalate": True})
             continue
         # ① 最强信号：有节点时间戳、无在跑节点、最后一个节点早已结束 → 流程该动没动
         lne = it.get("last_node_ended_age_min")
