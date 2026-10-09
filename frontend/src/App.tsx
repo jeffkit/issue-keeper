@@ -17,9 +17,10 @@ import { CreateIssueModal } from "./components/CreateIssueModal";
 import { CreateProjectModal } from "./components/CreateProjectModal";
 import { TeamPanel } from "./components/TeamPanel";
 import { PipelineView } from "./components/PipelineView";
+import { DutyView } from "./components/DutyView";
 import { WorkbenchView } from "./components/WorkbenchView";
 
-type View = "board" | "workbench" | "team" | "pipeline";
+type View = "board" | "workbench" | "team" | "pipeline" | "duty";
 
 export default function App() {
   const [projects, setProjects] = useState<Project[]>([]);
@@ -143,6 +144,10 @@ export default function App() {
               className={view === "pipeline" ? "tab active" : "tab"}
               onClick={() => setView("pipeline")}
             >管线观测</button>
+            <button
+              className={view === "duty" ? "tab active" : "tab"}
+              onClick={() => setView("duty")}
+            >值守总览</button>
           </div>
         </div>
         <div className="controls">
@@ -191,6 +196,8 @@ export default function App() {
         <WorkbenchView />
       ) : view === "pipeline" ? (
         <PipelineView />
+      ) : view === "duty" ? (
+        <DutyView />
       ) : (
         <>
           {loading && <div className="banner">加载中…</div>}

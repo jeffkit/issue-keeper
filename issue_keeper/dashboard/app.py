@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import router
+from .duty_api import router as duty_router
 
 # 仓库根 = issue_keeper/dashboard/app.py 往上两级
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +49,7 @@ def create_app(db_path: str, *, agent_label: str = "dashboard") -> FastAPI:
     app.state.db_path = db_path
     app.state.agent_label = agent_label
     app.include_router(router)
+    app.include_router(duty_router)
 
     dist = _frontend_dist()
     if dist is None:

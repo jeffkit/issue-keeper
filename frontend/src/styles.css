@@ -440,3 +440,28 @@ table.nodes tr.row-bad { background: rgba(255,107,107,.10); }
 .wb-reason { color: var(--danger); }
 .wb-empty { text-align: center; padding: 14px 0; font-size: 12px; }
 .wb-note { margin-top: 12px; font-size: 12px; }
+
+/* ---------- 值守总览（DutyView） ---------- */
+.duty-view { padding: 8px 4px 40px; }
+.duty-head { display: flex; align-items: center; gap: 12px; margin: 6px 0 14px; }
+.duty-head .tab { border: 1px solid #c8d2dc; background: #fff; }
+.duty-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.duty-card { border: 1px solid #dde4ea; border-radius: 10px; padding: 10px 12px; background: #fbfcfd; }
+.duty-card .k { font-size: 12px; color: #5a6b7b; margin-bottom: 4px; }
+.duty-card .v { font-size: 22px; font-weight: 600; }
+.duty-card .s { font-size: 11px; color: #7a8a99; margin-top: 4px; word-break: break-all; }
+.duty-section { margin: 18px 0 22px; }
+.duty-section-title { font-weight: 600; margin-bottom: 8px; }
+.duty-topo { width: 100%; height: auto; background: #fff; border: 1px solid #e3e9ee; border-radius: 10px; }
+.duty-node-title { font-size: 13px; font-weight: 600; fill: #24313d; }
+.duty-node-detail { font-size: 10.5px; fill: #5a6b7b; }
+.duty-edge-label { font-size: 10px; fill: #8595a5; }
+.duty-stackbar { display: flex; height: 22px; border-radius: 6px; overflow: hidden; background: #eef1f4; }
+.duty-stackbar div { height: 100%; }
+.duty-legend { display: flex; gap: 14px; margin-top: 6px; font-size: 12px; color: #5a6b7b; }
+.duty-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
+.duty-daybars { display: flex; align-items: flex-end; gap: 14px; height: 130px; padding: 6px 2px 0; }
+.duty-daybar { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; min-width: 44px; }
+.duty-daybar .bar { width: 30px; background: linear-gradient(180deg, #6ea8fe, #4d8de0); border-radius: 4px 4px 0 0; }
+.duty-daybar .lbl { font-size: 11px; color: #7a8a99; margin-top: 4px; }
+.duty-daybar .val { font-size: 12px; font-weight: 600; color: #24313d; }
