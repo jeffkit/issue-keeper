@@ -63,9 +63,23 @@ def probe_tickets() -> dict:
 
 
 def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
-    """近 window_min 的派发产出：attempts / blocked(按原因) / error / cancelled / landed。"""
+    """近 window_min 的派发产出：attempts / blocked(按原因) / error / cancelled / landed。
+
+    ⚠️ 口径（另一值守实例 2026-10-09 20:15 指出并修正）：
+    - `attempts` = **窗口内派发**的次数；
+    - `landed` = **窗口内落地**（含很久以前派发、但在窗口内完成的 run）——若只按派发窗口
+      统计，会出现「明明落地了却报 0 落地」的假 DEGRADED（实测：plaita#33 于 16:41 派发、
+      20:0x 落地，落在 90min 窗口外 → 探针误报「近 90min 0 落地」）。
+    """
     import time
     cutoff = time.time() - window_min * 60
+
+    def _ts(v):
+        try:
+            return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            return None
+
     rows, fetched = [], 0
     for fid in FLOWS:
         try:
@@ -77,15 +91,19 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
             st_time = e.get("start_time") or e.get("started_at")
             if not st_time:
                 continue
-            try:
-                ts = time.mktime(time.strptime(str(st_time)[:19], "%Y-%m-%dT%H:%M:%S"))
-            except Exception:
+            st_ts = _ts(st_time)
+            if st_ts is None:
                 continue
-            if ts < cutoff:
+            up_ts = _ts(e.get("last_update_time") or st_time)
+            in_window_dispatch = st_ts >= cutoff
+            in_window_update = up_ts is not None and up_ts >= cutoff
+            if not (in_window_dispatch or in_window_update):
                 continue
             rows.append({"eid": e["execution_id"], "flow": fid, "status": e.get("status"),
-                         "start": str(st_time)[:19]})
-    stats = {"attempts": len(rows), "landed": 0, "blocked_disk": 0, "blocked_other": 0,
+                         "start": str(st_time)[:19], "start_ts": st_ts,
+                         "update_ts": up_ts, "in_window_dispatch": in_window_dispatch})
+    stats = {"attempts": sum(1 for r in rows if r["in_window_dispatch"]),
+             "landed": 0, "blocked_disk": 0, "blocked_other": 0,
              "engine_error": 0, "cancelled": 0, "running": 0, "completed_no_land": 0,
              "block_reasons": {}, "landed_runs": []}
     for r in rows:
@@ -107,9 +125,18 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
         inp = (full.get("context") or {}).get("$INPUT") or {}
         rid = str(inp.get("run_id") or "")
         pre = nd.get("pre") or {}
-        if any(k in keys for k in LANDED_MARK):
+        # 落地判据：① `$NODE.land_push.ok=True`（直推成功的权威信号，2026-10-09 实测
+        # plaita#33 的 node_timings 只到 any_eq_false，但 land_push 结果在 $NODE 里）；
+        # ② 兜底沿用节点键标记。
+        lp = nd.get("land_push") or {}
+        landed = (isinstance(lp, dict) and bool(lp.get("ok"))) or any(k in keys for k in LANDED_MARK)
+        if landed:
+            # 窗口内落地：不论何时派发都计入（这正是修正点）
             stats["landed"] += 1
             stats["landed_runs"].append(rid)
+        elif not r["in_window_dispatch"]:
+            # 窗口外派发、窗口内仅有一次更新且未落地 → 不参与受阻/异常统计（历史账）
+            continue
         elif BLOCKED_MARK in keys or pre.get("ok") is False:
             why = str(pre.get("why") or "unknown")
             if "disk" in why.lower():
