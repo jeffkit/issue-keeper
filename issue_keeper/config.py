@@ -305,6 +305,20 @@ class Config:
     # 同时刻在跑的管线 run 上限（跨仓；worktree 天然隔离不同 issue）。
     # 2026-09-29 派发解耦后 keeper 不再被长 run 阻塞，这个池子才有意义。
     pipeline_max_in_flight: int = 2
+    # 管线 agent/reviewer 档位的**全局兜底**（agents.json 键，如 "glm53-flash"
+    # / "deepseek-flash"）。per-repo 的 `pipeline_repos[repo].agent` 优先级更高，
+    # 二者都空才回退到硬编码 `glm53-flash`。
+    #
+    # 为什么要有全局开关（2026-10-10 实证）：沙箱流（sbx）的 agent 端点来自
+    # `plaita-nodes` 的 provider 翻译（`~/.plaita/providers.json` 的
+    # apiBase/apiKey），**不是** keeper 的 `agent_env`——所以 GLM 配额烧穿时
+    # 只切 `agent_env` 管不到沙箱，沙箱 agent 仍打 GLM 429 秒退、run 无限重投
+    # （实测 07:33 沙箱内仍 429；`agent=glm53-flash` 写死在派发 params 里）。
+    # 有了本字段，切档 = 改一处配置（`model_tier.sh` 已同步改写），
+    # 全仓下次派发即生效（无需重启 worker）。
+    pipeline_default_agent: str = ""
+    # reviewer 档位独立于 impl：空 = 跟随 pipeline_default_agent。
+    pipeline_default_reviewer: str = ""
     # 派发优先级仓（仓库全名，如 ["owner/repo"]）：名单内的仓在每轮扫描序里排最前，
     # 槽位释放时先被派发——治理「排末位的仓被前序仓的失败-重试循环长期饿死」
     # （2026-10-05 实证：recursive 批次被饿 8h）。空默认=纯扫描序，行为不变。

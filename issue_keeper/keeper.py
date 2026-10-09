@@ -2052,8 +2052,12 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         # v2 flow 的 INPUT 契约吃 run_dir（checkpoint 目录；self_improve_bridge_v2
         # 同式 repo/.flowcast/runs/<run_id>），run_id 仅供日志/台账关联。
         "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
-        "agent": pc.agent or "glm53-flash",
-        "reviewer": pc.reviewer or "glm53-flash",
+        # 档位优先级：per-repo → 全局 → 硬编码兜底（2026-10-10 加全局层：
+        # 沙箱流的 agent 端点来自 plaita-nodes provider 翻译，与 keeper
+        # agent_env 是两条路；GLM 配额烧穿时只改 agent_env 管不到沙箱）。
+        "agent": pc.agent or config.pipeline_default_agent or "glm53-flash",
+        "reviewer": (pc.reviewer or config.pipeline_default_reviewer
+                     or config.pipeline_default_agent or "glm53-flash"),
     }
     # per-repo 门禁注入（2026-10-06，多仓支持）：v2 flow 原为 recursive(Rust)
     # 硬编码 cargo 门——跑别的仓必然假红（plaita#41 实证：cargo fmt 在 Python
@@ -2149,8 +2153,11 @@ def _dispatch_shadow_execution(config, binding, res, label: str,
         "repo": binding.cwd,
         "run_id": run_id,
         "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
-        "agent": pc.agent or "glm53-flash",
-        "reviewer": pc.reviewer or "glm53-flash",
+        # 档位优先级同 _dispatch_pipeline：per-repo → 全局 → 硬编码兜底
+        # （影子副本走同一 provider 翻译，配额烧穿时同样要能切）
+        "agent": pc.agent or config.pipeline_default_agent or "glm53-flash",
+        "reviewer": (pc.reviewer or config.pipeline_default_reviewer
+                     or config.pipeline_default_agent or "glm53-flash"),
         "shadow": True,          # 供 flow/worker 侧识别并强制不落地（阶段 1a 后启用）
     }
     try:
