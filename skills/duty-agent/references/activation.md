@@ -39,6 +39,13 @@ PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src
 注意：会话定时**只在会话/应用存活时投递**；深度宕机后只补最近一次。所以"必须可靠发现"的事
 （体系停摆、磁盘涨满、孤儿沙箱）要放 **A（flow/launchd）**，"需要我判断"的事放 B。
 
+> ⚠️ **换会话要重新 arm**（2026-10-09 实测）：DSH schedule 是**会话绑定**的——存储里
+> `tables.tasks[*].sessionId` 钉死创建它的那个会话，新会话不会继承。所以在**新会话**里起
+> 值守时，让 agent 用 `schedule_create` 重建 30 分钟轮，否则该会话没有常规巡检节奏。
+> 事件类感知**不受影响**：`duty-watch` 插件（critical 工单 / 工单回复 / HITL 回复）会
+> **优先投给持有值守定时任务的会话**，没有则退回最近活跃会话；launchd `duty-escalation`
+> 与会话完全无关。
+
 ## 三、被事件激活（现在是怎么接的）
 
 | 事件 | 谁发现 | 怎么到达我 |
