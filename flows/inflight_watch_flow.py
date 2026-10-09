@@ -188,7 +188,12 @@ def run(input):
     stall = float(input.get("stall_min") or 30)
     hard = float(input.get("hard_min") or 45)
     long_min = float(input.get("long_min") or 180)
-    lag_min = float(input.get("terminal_lag_min") or 10)
+    # 默认 40 分钟（2026-10-10 04:3x 由 10 上调）：keeper 的「engine_error 自动重试 →
+    # resume-retry → 新执行真正出现」实测延迟 **25-35 分钟**（#35：03:50 终态 → 04:23
+    # 新执行；#34：04:17 终态 → keeper 04:25 决策、04:31 仍无新执行）。阈值取 10 会让
+    # keeper 的正常排发延迟被反复报成 critical（当晚因此触发 5+ 次）。取 40 以覆盖
+    # 正常延迟，只在 keeper 真的卡住时报警。
+    lag_min = float(input.get("terminal_lag_min") or 40)
 
     findings, stalled, terminal_lag = [], [], []
     for it in rows:
