@@ -133,6 +133,21 @@ dependabot PR 标题"bump @types/node from **20**.19.30"撞上 issue#20 的子�
   self-improve-v2 preflight，默认 20；经 dispatch env 注入，下轮派发生效）。
   至此 #26 的磁盘阻塞解除，等 tunely#3 释放仓配额后自然派发。
 
+## 值守总览控制台（2026-10-09 晨上线）
+
+issue-keeper dashboard（127.0.0.1:7433，launchd `cc.agentstudio.issue-keeper-dashboard`）新增
+**「值守总览」tab**，公网经 tunely 既有 `ik` 隧道 → `dsht.AgentStudio.cc/ik/`（服务器登录门后）：
+
+- **工作流拓扑**：12 节点 live SVG（外部用户→GitHub→shadow 派发→主版/沙箱开发→reaper→
+  A 班验收→外部 /accept→关单；B/主控/duty 内核旁路），节点状态色实时（30s 刷新）；
+- **心跳卡**：A/主控/B 三班最后轮次与时长、在途/闸、远端控制面（sched/keeper/盘/DLQ）、shadow 对账；
+- **统计图**：沙箱 24h 实例小时按终态堆积条（cancelled 浪费占比直接可见）、7 天提报柱图、
+  活实例清单（含存活时长）。
+- 端点：`/api/duty/{overview,stats,topology}`（只读，多源聚合带缓存——duty 文件/console/
+  AGS/VM ssh/pipeline_stats，任一路失败降级为空字段）。
+- 成本闸：`ags-orphan-sweep` launchd 每 30min 清「终态 run 且存活>1h」的沙箱实例
+  （首个战果：清掉 06:27 完成后白烧 1.6h 的孤儿）。
+
 ## 已知后续（P1/P2）
 
 1. 外部作者的 `/accept` 会触发 keeper 评论 agent 回复（噪音，无害）——评论路径
