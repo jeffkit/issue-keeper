@@ -71,8 +71,18 @@ for slug, rv in (st.get("repos") or {}).items():
             flow_id = json.load(open(os.path.join(d, "console-exec.json"))).get("flow_id", "")
         except Exception:
             pass
+        # retry_pending：keeper 是否仍在**有效的**退避窗口中等待重派。
+        # ⚠️ 不能只看「retry_after 有值」——实测存在**过期很久的残留值**
+        # （2026-10-10 04:0x：plaita#37/#46/#47 携带 1791420123 ≈ 10-08 15:42），
+        # 若仅判有值会把真·收尸滞后误跳过。必须与当前时间比较。
+        ra = it.get("retry_after")
+        try:
+            retry_pending = bool(ra) and float(ra) > time.time()
+        except Exception:
+            retry_pending = False
         rows.append({"repo": short, "num": str(num), "in_flight_min": round((time.time() - ifs) / 60),
-                     "exec_id": eid, "flow_id": flow_id, "retry_after": it.get("retry_after")})
+                     "exec_id": eid, "flow_id": flow_id, "retry_after": ra,
+                     "retry_pending": retry_pending})
 print(json.dumps(rows, ensure_ascii=False))
 '''
     try:
@@ -197,8 +207,9 @@ def run(input):
             # 期间该 issue 仍留在在途集合里。若把这种「退避等待」当收尸滞后，会每
             # 10 分钟刷一张 critical 单（今晚 #148/#27/#22/#21 四单连续全是这类：
             # 执行 error、keeper 已收尾过、正等 retry_after 到点重派）。
-            # 判据：**retry_after 有值 = keeper 已排定动作 → 不算滞后**。
-            if it.get("retry_after"):
+            # 判据：**仍处于有效退避窗口**（retry_pending，由 payload 按时间判定）→ 不算滞后。
+            # 注意不能用「retry_after 有值」代替——存在过期残留值（见 payload 注释）。
+            if it.get("retry_pending"):
                 continue
             lag = it.get("progress_age_min")
             if lag is None:
