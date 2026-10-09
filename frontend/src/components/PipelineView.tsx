@@ -93,6 +93,23 @@ function RunDetailDrawer({ executionId, onClose }: { executionId: string; onClos
   );
 }
 
+/** 门失败 Top N 横条图：summary.gate_failures 已按门聚合。 */
+function GateBars({ gates }: { gates: Record<string, number> }) {
+  const entries = Object.entries(gates).sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const max = Math.max(...entries.map(([, v]) => v), 1);
+  return (
+    <div className="gate-bars">
+      {entries.map(([g, v]) => (
+        <div key={g} className="gate-bar" title={`${g}：窗口内失败 ${v} 次`}>
+          <span className="g">{g}</span>
+          <i className="track"><em style={{ width: `${(v / max) * 100}%` }} /></i>
+          <span className="v">{v}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function PipelineView() {
   const [days, setDays] = useState(30);
   const [repo, setRepo] = useState("");
@@ -153,6 +170,13 @@ export function PipelineView() {
           </div>
         ))}
       </div>
+
+      {summary && Object.keys(summary.gate_failures || {}).length > 0 && (
+        <div className="gate-fails">
+          <h3>门失败 Top（窗口 {days} 天 · 多次失败的门优先排查）</h3>
+          <GateBars gates={summary.gate_failures} />
+        </div>
+      )}
 
       <table className="runs">
         <thead>

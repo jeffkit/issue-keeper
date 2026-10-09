@@ -262,6 +262,94 @@ def stats() -> dict:
     }
 
 
+# ---------- 等人工队列 ----------
+
+HITL_LEDGER = DUTY_DIR / "hitl-notifications.jsonl"
+HITL_BASE = "http://127.0.0.1:8081"
+
+
+def _needs_human() -> dict:
+    """跨仓扫 needs-human 标签（keeper 升级人工的单在这里浮出来）。"""
+    import datetime
+    out = _sh("gh search issues --owner jeffkit --label needs-human --state open "
+              "--json repository,number,title,updatedAt,url --limit 30", timeout=60)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    rows = []
+    try:
+        for it in json.loads(out):
+            up = str(it.get("updatedAt") or "")
+            age_h = None
+            try:
+                t = datetime.datetime.fromisoformat(up.replace("Z", "+00:00"))
+                age_h = round((now - t).total_seconds() / 3600, 1)
+            except Exception:
+                pass
+            rows.append({"repo": (it.get("repository") or {}).get("nameWithOwner", "?"),
+                         "number": it.get("number"), "title": (it.get("title") or "")[:90],
+                         "url": it.get("url"), "updated_at": up[:16].replace("T", " "),
+                         "age_h": age_h})
+    except Exception as e:
+        return {"items": [], "error": str(e)[:120]}
+    rows.sort(key=lambda r: -(r.get("age_h") or 0))
+    return {"items": rows, "count": len(rows)}
+
+
+def _hitl_recent() -> dict:
+    """本机 HITL 推送留痕（hitl_notify.py 写的 jsonl）。"""
+    rows = []
+    try:
+        lines = HITL_LEDGER.read_text(encoding="utf-8").splitlines()[-20:]
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            rows.append({"ts": time.strftime("%m-%d %H:%M", time.localtime(float(r.get("ts") or 0))),
+                         "title": (r.get("title") or "")[:70],
+                         "status": r.get("status") or ("sent" if r.get("sent") else "failed"),
+                         "session_id": (r.get("session_id") or "")[:12],
+                         "feedback_url": r.get("feedback_url") or "",
+                         "waited": r.get("wait_secs") or 0,
+                         "replies": (r.get("replies") or [])[:1]})
+    except Exception:
+        pass
+    rows.reverse()
+    return {"items": rows[:12], "count": len(rows)}
+
+
+def _hil_pending() -> dict:
+    """hitl-server 里仍在等回复的会话（仅 wait 模式建会话）。"""
+    import datetime
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{HITL_BASE}/admin/api/hil/sessions", timeout=6) as resp:
+            d = json.load(resp)
+    except Exception as e:
+        return {"items": [], "error": str(e)[:80]}
+    now = datetime.datetime.now()
+    items = []
+    for s in d.get("sessions") or []:
+        if str(s.get("status")) in ("pending", "waiting", "open"):
+            try:
+                exp = datetime.datetime.fromisoformat(str(s.get("expire_at")).replace("Z", ""))
+                left_min = max(0, int((exp - now).total_seconds() // 60))
+            except Exception:
+                left_min = None
+            items.append({"short_id": s.get("short_id"), "message": (s.get("message") or "")[:70],
+                          "created_at": str(s.get("created_at"))[5:16].replace("T", " "),
+                          "left_min": left_min})
+    return {"items": items, "total": d.get("total", 0)}
+
+
+def human_queue() -> dict:
+    return {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "needs_human": _cached("needs_human", 120, _needs_human),
+        "hitl_recent": _cached("hitl_recent", 30, _hitl_recent),
+        "hil_pending": _cached("hil_pending", 60, _hil_pending),
+    }
+
+
 # ---------- topology ----------
 
 def topology() -> dict:
@@ -342,3 +430,8 @@ def duty_stats() -> dict:
 @router.get("/duty/topology")
 def duty_topology() -> dict:
     return _cached("duty_topology", 45, topology)
+
+
+@router.get("/duty/human-queue")
+def duty_human_queue() -> dict:
+    return _cached("duty_human_queue", 60, human_queue)
