@@ -4,7 +4,8 @@
 jeffkit 2026-10-10：「今晚如果 glm 又烧光了，换上 deepseek 跑吧」。
 本脚本把「发现烧穿 → 切档」做成确定性动作，不依赖值守 Agent 在场：
 
-  探 GLM anthropic 端点 → 若返回 429/1301/1308（限额）→ 调 model_tier.sh deepseek
+  探 GLM anthropic 端点 → 若返回 429 或限额类错误码（1301 余额 / 1308 5h /
+  1310 周月 / 1113 余额不足 …）→ 调 model_tier.sh deepseek
   → 记录到 rounds.log；恢复（200）且当前在 deepseek 档 → **不自动切回**
   （避免抖动；由值守或人显式 `model_tier.sh glm`）。
 
@@ -84,7 +85,7 @@ def main() -> int:
     dry = "--dry-run" in sys.argv
     tier = current_tier()
     code, body = probe_glm()
-    exhausted = code == 429 or ("1301" in body) or ("1308" in body) or ("limit" in body.lower())
+    exhausted = _looks_exhausted(code, body)
 
     if exhausted and tier == "glm":
         _log("GLM 限额烧穿（HTTP %s）→ 切 DeepSeek%s" % (code, "（dry-run）" if dry else ""))
@@ -131,3 +132,23 @@ def _file_ticket(ok: bool, code: int, body: str) -> None:
             capture_output=True, text=True, timeout=60, check=False)
     except Exception as e:  # noqa: BLE001 — 递单失败不影响切档本身
         _log("递工单失败（忽略）: %s" % str(e)[:120])
+
+
+# 限额类错误码（GLM 常见）：
+#   1301 账户余额不足 / 1308 5 小时用量上限 / 1310 每周或每月用量上限
+#   1113 余额不足 / 1302 并发超限（可退避重试，但对我们等价于「现在别用」）
+# 判据刻意用「码 + 文案」双通道：智谱新增码时不至于漏判（2026-10-10 实测
+# 1310 = 周/月上限，**此前只认 1301/1308 导致漏判**，差点让切档静默失效）。
+_QUOTA_CODES = ("1301", "1308", "1310", "1113", "1302")
+_QUOTA_HINTS = ("limit", "quota", "exceed", "insufficient", "balance",
+                "上限", "额度", "余额", "限额")
+
+
+def _looks_exhausted(code: int, body: str) -> bool:
+    """GLM 是否不可用（配额/限额类）——429 或错误码/文案命中。"""
+    if code == 429:
+        return True
+    b = (body or "").lower()
+    if any(c in b for c in _QUOTA_CODES):
+        return True
+    return any(h in b for h in _QUOTA_HINTS)
