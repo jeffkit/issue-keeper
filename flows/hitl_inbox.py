@@ -111,6 +111,16 @@ def main() -> int:
         if not args.dry_run:
             rec["routed_to"] = _route_to_issue(r.get("feedback_url") or "", text, r.get("title") or "")
             _append(rec)
+            # 三层协同闭环：把回复回填到对应决策工单（值守 Agent 下轮据此执行）
+            try:
+                rs = "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_request.py"
+                rr = subprocess.run(["python3", rs, "answer", "--session-id", sid, "--text", text],
+                                    capture_output=True, text=True, timeout=30)
+                hit = json.loads((rr.stdout or "[]").strip() or "[]")
+                if hit:
+                    rec["request_id"] = hit[0].get("id")
+            except Exception:
+                pass
         replied.append({"sid": sid[:12], "title": (r.get("title") or "")[:50], "text": text[:200],
                         "routed_to": rec.get("routed_to")})
     print(json.dumps({"checked": len(pending), "replied": replied, "errors": errors,
