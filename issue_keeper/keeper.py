@@ -2690,6 +2690,22 @@ def _reap_pipelines(config, state, bindings) -> int:
                                  label, n_err, int(delay), err[:80])
                         continue
                     log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
+                    # 2026-10-09（B 值守 finding + 三先例核对：recursive#86 / argusai#13
+                    # 走本路径 → GitHub 零痕迹；hitl-mcp#4 走 failed 路径 → 有标签）：
+                    # 本分支原先只落 keeper 日志，外部看不到、值守与看板也无法发现
+                    # 「哪些单在等人」。与 failed 分支对齐：升级评论（posted=True
+                    # 挡住下方兜底回评，恰一条）+ needs-human 标签。
+                    try:
+                        _gh_post_comment(kind, binding.repo, number,
+                                         f"{config.bot_marker}\n[issue-pipeline] 本 issue 近 12 小时内连续 "
+                                         f"{n_err} 次引擎级失败（status=engine_error，自动重派已耗尽），"
+                                         f"已升级人工处理（标签 {config.pipeline_needs_human_label}）。"
+                                         f"最近一次原因：{_sanitize_public_comment(err or '未记录')[:280]}")
+                    except Exception as e:
+                        log.error("[%s] engine_error 升级评论发送失败: %s", label, e)
+                    _gh_add_label(kind, binding.repo, number,
+                                  config.pipeline_needs_human_label)
+                    posted = True
 
             # ── 收尾（与旧同步路径同一套语义）─────────────────────────
             lock.unlink(missing_ok=True)  # 收尾即清锁（dead 路径 _lock_holder 已清，kill 路径在这补）
