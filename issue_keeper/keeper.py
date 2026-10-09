@@ -2180,9 +2180,10 @@ def _reap_console_execution(config, binding, it, key, label: str,
     交回 _reap_pipelines 走共享收尾（读回校验/engine_error 重派/升级/兜底回评）。
 
     决策表（设计稿 §G5）：error → resume-retry ×1（断点步进，免整跑重做）；
-    running + last_update_time 年龄超阈 → zombie（cancel + engine_error 行）；
-    GET 404 且在 `console_queue_grace_secs` 宽限内 → 记录未落（排队中），返回
-    None 不动作不重派（plaita#18）；其余终态 → verdict 映射落账。
+    running + 活性确证死亡（末节点 ended_at 停滞超阈）或在途越 run 预算 →
+    zombie（cancel + engine_error 行）；GET 404 且在 `console_queue_grace_secs`
+    宽限内 → 记录未落（排队中），返回 None 不动作不重派（plaita#18）；
+    其余终态 → verdict 映射落账。
     非 engine_error 的收尾回评由本函数出
     （console flow 无回评节点契约），避免共享兜底「未确认发出回评」文案。
 
@@ -2225,16 +2226,24 @@ def _reap_console_execution(config, binding, it, key, label: str,
     kind = "pr" if key.startswith("pr:") else "issue"
 
     if status == "running":
-        if not _ce.zombie(detail, config.console_zombie_secs, now=now):
+        budget = int(getattr(config, "console_inflight_budget_secs", 0) or 0)
+        overrun = _ce.inflight_overrun(detail, budget, now=now)
+        # 兜底收尸线（plaita#28 验收 2）：在途 >> 节点预算即判死，不要求
+        # 「0 租约」前提——租约键无 TTL（TTL=-1）时「0 租约」永不成立。
+        if overrun or _ce.zombie(detail, config.console_zombie_secs, now=now,
+                                 node_stale_secs=config.console_node_stale_secs):
+            why = (f"超时：在途 >{budget}s 越过 run 预算（终态滞后兜底收尸）" if overrun
+                   else f"zombie：>{config.console_node_stale_secs}s 末节点无进展且无活性信号")
+            try:
+                client.cancel(str(crec["execution_id"]))
+            except _ce.ConsoleExecError as e:
+                log.warning("[%s] 收尸 cancel 失败（仍按 engine_error 收尾）：%s", label, e)
+            log.error("[%s] console execution %s，cancel 收尸",
+                      label, "在途超预算（>%ss）" % budget if overrun
+                      else "疑似 zombie（>%ss 末节点 ended_at 停滞）" % config.console_node_stale_secs)
+            row = _ce.map_verdict({"verdict": "engine_error", "why": why})
+        else:
             return None
-        try:
-            client.cancel(str(crec["execution_id"]))
-        except _ce.ConsoleExecError as e:
-            log.warning("[%s] zombie cancel 失败（仍按 zombie 收尾）：%s", label, e)
-        log.error("[%s] console execution 疑似 zombie（>%ss 无 checkpoint 刷新），cancel",
-                  label, config.console_zombie_secs)
-        row = _ce.map_verdict({"verdict": "engine_error",
-                               "why": f"zombie：>{config.console_zombie_secs}s 无步界持久化"})
     elif status == "error":
         if int(crec.get("retry_count") or 0) < config.console_retry_max:
             try:
@@ -2735,8 +2744,13 @@ def _reap_pipelines(config, state, bindings) -> int:
                                      label, n_err, int(delay), err[:80])
                             continue
                         log.warning("[%s] engine_error 连续 %d 次，升级人工", label, n_err)
-                        _escalate_engine_error(config, kind, binding.repo, number, n_err, err, label)
-                        posted = True
+                        # 升级动作 = needs-human 标签 + 终态收尾；回评交给收尾段
+                        # 的兜底评论（gate 上下文/异常链尾/worktree 快照齐全）。
+                        # 此前在这里发截断升级评论并置 posted=True，把诊断更全的
+                        # 兜底回评挡掉——280 头部截断切掉异常链最内层（#4），
+                        # 看板也被误移 review。恰一条评论 = 兜底评论。
+                        _gh_add_label(kind, binding.repo, number,
+                                      config.pipeline_needs_human_label)
                 else:
                     # 已有终态回评（bridge/reaper 已发）：**仍按连击判定升级人工**。
                     # failed 分支先例：「升级评论无条件发（语义不同：一条终态说明、
