@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { dutyOverview, dutyStats, dutyTopology } from "../api";
-import type { DutyOverview, DutyStats, DutyTopology } from "../api";
+import { dutyHumanQueue, dutyOverview, dutyStats, dutyTopology, type ThroughputRepoWindow } from "../api";
+import type { DutyOverview, DutyStats, DutyTopology, HumanQueue } from "../api";
 
 /** 值守总览——业务级协同的可视化：拓扑 + 心跳 + 统计图表（配色随全站深色主题）。 */
 
@@ -15,7 +15,8 @@ function fmtAge(sec?: number): string {
   if (sec == null) return "—";
   if (sec < 90) return `${Math.round(sec)}s`;
   if (sec < 5400) return `${Math.round(sec / 60)}m`;
-  return `${(sec / 3600).toFixed(1)}h`;
+  if (sec < 172800) return `${(sec / 3600).toFixed(1)}h`;
+  return `${(sec / 86400).toFixed(1)}d`;
 }
 
 /** 按显示宽度截断：CJK 记 2 单位、其余 1 单位。 */
@@ -154,17 +155,116 @@ function StackedBar({ by }: { by: Record<string, number> }) {
   );
 }
 
-function DayBars({ by }: { by: Record<string, number> }) {
-  const entries = Object.entries(by).sort();
-  const max = Math.max(...entries.map(([, v]) => v), 1);
-  if (!entries.length) return <div className="muted">暂无数据</div>;
+/** 提报 vs 关闭双柱 + 净积压趋势线（窗口累计新建−累计关闭）。
+ *  数据全部来自 pipeline_stats --json 的透传，无需额外请求。 */
+function ThroughputChart({ created, closed }: { created: Record<string, number>; closed: Record<string, number> }) {
+  const days = Array.from(new Set([...Object.keys(created || {}), ...Object.keys(closed || {})])).sort();
+  if (!days.length) return <div className="muted">暂无数据</div>;
+  const g = (m: Record<string, number>, d: string) => m?.[d] || 0;
+  const max = Math.max(...days.map((d) => Math.max(g(created, d), g(closed, d))), 1);
+  let c = 0, cl = 0;
+  const backlog = days.map((d) => { c += g(created, d); cl += g(closed, d); return c - cl; });
+  const bMin = Math.min(0, ...backlog), bMax = Math.max(1, ...backlog);
+  const PLOT_H = 120;
+  const y = (v: number) => PLOT_H - 6 - ((v - bMin) / (bMax - bMin)) * (PLOT_H - 12);
+  const pts = backlog.map((v, i) => `${((i + 0.5) / days.length) * 100},${y(v)}`).join(" ");
+  const totC = days.reduce((s, d) => s + g(created, d), 0);
+  const totCl = days.reduce((s, d) => s + g(closed, d), 0);
   return (
-    <div className="duty-daybars">
-      {entries.map(([d, v]) => (
-        <div key={d} className="duty-daybar" title={`${d}: 提报 ${v}`}>
-          <div className="val">{v}</div>
-          <div className="bar" style={{ height: `${Math.max(4, (v / max) * 100)}%` }} />
-          <div className="lbl">{d.slice(5)}</div>
+    <div>
+      <div className="duty-tp-vals">
+        {days.map((d) => (
+          <div key={d} className="val">{g(created, d)}/{g(closed, d)}</div>
+        ))}
+      </div>
+      <div className="duty-tp-plot">
+        {days.map((d) => (
+          <div key={d} className="tp-pair" title={`${d}：新建 ${g(created, d)} · 关闭 ${g(closed, d)}`}>
+            <div className="bar cr" style={{ height: `${Math.max(2, (g(created, d) / max) * 100)}%` }} />
+            <div className="bar cl" style={{ height: `${Math.max(2, (g(closed, d) / max) * 100)}%` }} />
+          </div>
+        ))}
+        <svg className="tp-line" viewBox={`0 0 100 ${PLOT_H}`} preserveAspectRatio="none" aria-hidden>
+          <polyline points={pts} fill="none" stroke="#f5a623" strokeWidth={2} vectorEffect="non-scaling-stroke" />
+        </svg>
+      </div>
+      <div className="duty-tp-lbls">
+        {days.map((d) => <div key={d} className="lbl">{d.slice(5)}</div>)}
+      </div>
+      <div className="duty-legend">
+        <span><i style={{ background: "#4f8cff" }} />新建 {totC}</span>
+        <span><i style={{ background: "#3ddc84" }} />关闭 {totCl}</span>
+        <span><i style={{ background: "#f5a623" }} />净积压（窗口累计差）期末 {backlog[backlog.length - 1] ?? 0}</span>
+      </div>
+    </div>
+  );
+}
+
+/** keeper run 按日终态堆叠柱（done/failed/engine_error/退避…）+ 值守落地数。 */
+const RUN_COLORS: Record<string, string> = {
+  done: "#3ddc84", failed: "#ff6b6b", engine_error: "#b07cc6", "retry-later": "#f5a623",
+};
+
+function RunDaily({ runsByDay, landByDay }: {
+  runsByDay: Record<string, Record<string, number>>;
+  landByDay: Record<string, number>;
+}) {
+  const days = Array.from(new Set([...Object.keys(runsByDay || {}), ...Object.keys(landByDay || {})])).sort();
+  if (!days.length) return <div className="muted">暂无数据</div>;
+  const totalOf = (d: string) =>
+    Object.values(runsByDay?.[d] || {}).reduce((a, b) => a + b, 0);
+  const max = Math.max(...days.map(totalOf), 1);
+  return (
+    <div>
+      <div className="duty-runbars">
+        {days.map((d) => {
+          const entries = Object.entries(runsByDay?.[d] || {}).filter(([, v]) => v > 0);
+          const total = totalOf(d);
+          const land = landByDay?.[d] || 0;
+          const tip = `${d}：${entries.map(([k, v]) => `${k} ${v}`).join(" · ") || "无 run"}${land ? ` · 值守落地 ${land}` : ""}`;
+          return (
+            <div key={d} className="run-day" title={tip}>
+              <div className="val">{total || "·"}</div>
+              <div className="stack" style={{ height: 110 }}>
+                {entries.map(([k, v]) => (
+                  <div key={k} className="seg" style={{ height: `${(v / max) * 100}%`, background: RUN_COLORS[k] || "#8a93a3" }} />
+                ))}
+              </div>
+              <div className="lbl">{d.slice(5)}</div>
+              <div className="sub">{land ? `落地 ${land}` : " "}</div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="duty-legend">
+        {Object.entries(RUN_COLORS).map(([k, c]) => (
+          <span key={k}><i style={{ background: c }} />{k === "done" ? "done（管线完成）" : k === "retry-later" ? "retry-later（退避）" : k}</span>
+        ))}
+        <span><i style={{ background: "#8a93a3" }} />其他终态</span>
+      </div>
+    </div>
+  );
+}
+
+/** 按仓对比：在册 open / 窗口新建 vs 关闭（横条）/ 全期关闭率。 */
+function RepoCompare({ byRepo }: { byRepo: Record<string, ThroughputRepoWindow> }) {
+  const rows = Object.entries(byRepo || {})
+    .sort((a, b) => b[1].open - a[1].open || b[1].created - a[1].created);
+  if (!rows.length) return <div className="muted">暂无数据</div>;
+  const max = Math.max(...rows.flatMap(([, r]) => [r.created, r.closed]), 1);
+  return (
+    <div className="duty-repos">
+      {rows.map(([name, r]) => (
+        <div key={name} className="repo-row" title={`${name}｜在册 ${r.open} · 窗口新建 ${r.created} · 窗口关闭 ${r.closed}`}>
+          <span className="name">{name.split("/")[1] || name}</span>
+          <span className="open">在册 {r.open}</span>
+          <span className="bars">
+            <i className="track"><em className="cr" style={{ width: `${(r.created / max) * 100}%` }} /></i>
+            <b className="num">新 {r.created}</b>
+            <i className="track"><em className="cl" style={{ width: `${(r.closed / max) * 100}%` }} /></i>
+            <b className="num">关 {r.closed}</b>
+          </span>
+          <span className="rate">{r.close_rate != null ? `${Math.round(r.close_rate * 100)}%` : "—"}</span>
         </div>
       ))}
     </div>
@@ -177,12 +277,14 @@ export function DutyView() {
   const [ov, setOv] = useState<DutyOverview | null>(null);
   const [st, setSt] = useState<DutyStats | null>(null);
   const [topo, setTopo] = useState<DutyTopology | null>(null);
+  const [hq, setHq] = useState<HumanQueue | null>(null);
   const [err, setErr] = useState("");
 
   const refresh = useCallback(() => {
     dutyOverview().then(setOv).catch((e) => setErr(String(e)));
     dutyStats().then(setSt).catch((e) => setErr(String(e)));
     dutyTopology().then(setTopo).catch((e) => setErr(String(e)));
+    dutyHumanQueue().then(setHq).catch((e) => setErr(String(e)));
   }, []);
 
   useEffect(() => {
@@ -196,7 +298,17 @@ export function DutyView() {
   const shadow = ov?.shadow || {};
   const sbxLive = st?.sandbox_live?.instances || [];
   const sbxBy = st?.sandbox?.by_status || {};
-  const tput = (st?.throughput?.data?.created_by_day as Record<string, number>) || {};
+  const tp = st?.throughput?.data || {};
+  const tputC = tp.created_by_day || {};
+  const tputX = tp.closed_by_day || {};
+  const runsByDay = tp.runs_by_day || {};
+  const landByDay = tp.landings_by_day || {};
+  const byRepoWin = tp.by_repo_window || {};
+  const openTotal = tp.open_total;
+  const ttcMedian = tp.ttc_median_secs;
+  const ttcP90 = tp.ttc_p90_secs;
+  const backoffList = tp.backoff || [];
+  const blockedList = tp.blocked || [];
 
   // B 班：后端已结构化为 {time, kind, brief}（避免原始日志串）
   const bTime = ov?.b_shift?.time || "—";
@@ -252,11 +364,65 @@ export function DutyView() {
           <div className="v">{shadow.generated_at ? shadow.generated_at.slice(11, 16) : "—"}</div>
           <div className="s">budget {shadow.budget_left ?? "—"} · 可派 {shadow.would_dispatch ?? "—"}</div>
         </div>
+        <div className="duty-card">
+          <div className="k">在册 / 受阻</div>
+          <div className="v">{openTotal ?? "—"}</div>
+          <div className="s duty-list">
+            {`blocked ${blockedList.length} · 退避 ${backoffList.length}`}
+            {blockedList.length ? <em>{blockedList.join(" ")}</em> : ""}
+          </div>
+        </div>
+        <div className="duty-card">
+          <div className="k">关闭时效（中位）</div>
+          <div className="v">{ttcMedian != null ? fmtAge(Math.round(ttcMedian)) : "—"}</div>
+          <div className="s">P90 {ttcP90 != null ? fmtAge(Math.round(ttcP90)) : "—"} · 提报→关闭</div>
+        </div>
       </div>
 
       <section className="duty-section">
         <h3>工作流拓扑（状态实时）</h3>
         <Topology topo={topo} />
+      </section>
+
+      <section className="duty-section">
+        <h3>等人工队列（needs-human 标签 + HITL 推送）</h3>
+        <div className="duty-human">
+          <div className="duty-human-col">
+            <div className="duty-human-title">
+              待人工处理 {hq?.needs_human?.count ?? 0} 条
+              {hq?.needs_human?.error ? ` · ${hq.needs_human.error}` : ""}
+            </div>
+            {(hq?.needs_human?.items || []).length === 0 && <div className="muted">队列为空 ✓</div>}
+            {(hq?.needs_human?.items || []).map((i: HumanQueue["needs_human"]["items"][number]) => (
+              <a key={`${i.repo}#${i.number}`} className="duty-human-row" href={i.url} target="_blank" rel="noreferrer">
+                <span className="repo">{i.repo.replace("jeffkit/", "")}#{i.number}</span>
+                <span className="title">{fit(i.title, 46)}</span>
+                <span className="age">{i.age_h != null ? `${i.age_h}h` : "—"}</span>
+              </a>
+            ))}
+          </div>
+          <div className="duty-human-col">
+            <div className="duty-human-title">
+              HITL 推送最近 {hq?.hitl_recent?.count ?? 0} 条
+              {(hq?.hil_pending?.items || []).length > 0 ? ` · 待回复 ${hq!.hil_pending.items.length}` : ""}
+            </div>
+            {(hq?.hitl_recent?.items || []).length === 0 && <div className="muted">暂无推送</div>}
+            {(hq?.hitl_recent?.items || []).map((h: HumanQueue["hitl_recent"]["items"][number], k: number) => (
+              <div key={k} className="duty-human-row">
+                <span className="age">{h.ts}</span>
+                <span className="title">{fit(h.title, 40)}</span>
+                <span className={`st-${h.status === "replied" ? "done" : h.status === "sent" ? "mid" : "early"}`}>{h.status}</span>
+              </div>
+            ))}
+            {(hq?.hil_pending?.items || []).map((s2: HumanQueue["hil_pending"]["items"][number]) => (
+              <div key={s2.short_id} className="duty-human-row">
+                <span className="age">⏳{s2.left_min != null ? `${s2.left_min}m` : "?"}</span>
+                <span className="title">{fit(s2.message, 40)}</span>
+                <span className="st-mid">等回复</span>
+              </div>
+            ))}
+          </div>
+        </div>
       </section>
 
       <section className="duty-section">
@@ -269,8 +435,18 @@ export function DutyView() {
       </section>
 
       <section className="duty-section">
-        <h3>提报吞吐（近 7 天 · 新建 issue 数）</h3>
-        <DayBars by={tput} />
+        <h3>提报 vs 关闭（近 7 天 · 全仓 issue，柱上数字为 新建/关闭）</h3>
+        <ThroughputChart created={tputC} closed={tputX} />
+      </section>
+
+      <section className="duty-section">
+        <h3>keeper 按日产出（run 终态 · 值守落地）</h3>
+        <RunDaily runsByDay={runsByDay} landByDay={landByDay} />
+      </section>
+
+      <section className="duty-section">
+        <h3>按仓对比（在册 / 窗口新建 vs 关闭 / 全期关闭率）</h3>
+        <RepoCompare byRepo={byRepoWin} />
       </section>
     </div>
   );

@@ -183,11 +183,39 @@ export interface DutyOverview {
   shadow: { generated_at?: string; budget_left?: number; would_dispatch?: number; skip?: Record<string, number>; error?: string };
 }
 
+export interface ThroughputRepoWindow {
+  open: number;
+  created: number;
+  closed: number;
+  close_rate: number | null;
+}
+
+/** pipeline_stats.py --json 的完整透传（duty_api._throughput 原样返回） */
+export interface ThroughputData {
+  window_days?: number;
+  created_by_day?: Record<string, number>;
+  closed_by_day?: Record<string, number>;
+  open_total?: number;
+  open_by_repo?: Record<string, number>;
+  ttc_median_secs?: number | null;
+  ttc_p90_secs?: number | null;
+  /** keeper run 按日终态计数：{ "2026-10-08": { done: 3, failed: 1 } } */
+  runs_by_day?: Record<string, Record<string, number>>;
+  /** 值守落地按日（landings.log） */
+  landings_by_day?: Record<string, number>;
+  /** 窗口按仓：在册 / 窗口新建 / 窗口关闭 / 全期关闭率 */
+  by_repo_window?: Record<string, ThroughputRepoWindow>;
+  inflight?: string[];
+  backoff?: string[];
+  blocked?: string[];
+  [k: string]: unknown;
+}
+
 export interface DutyStats {
   ts: string;
   sandbox: { window_hours: number; runs: number; instance_hours: number; by_status: Record<string, number>; runs_detail: { status: string; hrs: number; start: string }[] };
   sandbox_live: { instances: { id: string; age_h: number | null; exec: string }[]; error?: string };
-  throughput: { days: number; data: { created_by_day?: Record<string, number>; [k: string]: unknown } | null; error?: string };
+  throughput: { days: number; data: ThroughputData | null; error?: string };
 }
 
 export interface DutyTopology {
@@ -204,4 +232,17 @@ export function dutyStats(): Promise<DutyStats> {
 }
 export function dutyTopology(): Promise<DutyTopology> {
   return j(fetch(`${BASE}/duty/topology`));
+}
+
+// ---------- 等人工队列 ----------
+
+export interface HumanQueue {
+  ts: string;
+  needs_human: { items: { repo: string; number: number; title: string; url: string; updated_at: string; age_h: number | null }[]; count: number; error?: string };
+  hitl_recent: { items: { ts: string; title: string; status: string; session_id: string; feedback_url: string; waited: number; replies: string[] }[]; count: number };
+  hil_pending: { items: { short_id: string; message: string; created_at: string; left_min: number | null }[]; total: number; error?: string };
+}
+
+export function dutyHumanQueue(): Promise<HumanQueue> {
+  return j(fetch(`${BASE}/duty/human-queue`));
 }

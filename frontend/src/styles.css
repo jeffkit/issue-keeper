@@ -497,3 +497,60 @@ table.nodes tr.row-bad { background: rgba(255,107,107,.10); }
 .duty-daybar .val { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
 .duty-daybar .bar { width: 100%; max-width: 34px; background: var(--accent); border-radius: 4px 4px 0 0; }
 .duty-daybar .lbl { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+/* ── 提报 vs 关闭 双柱 + 净积压线（值守总览）────────────────────────── */
+.duty-tp-plot { position: relative; display: flex; align-items: flex-end; gap: 12px; height: 120px; padding: 0 2px; }
+.duty-tp-plot .tp-pair { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; justify-content: center; gap: 3px; }
+.duty-tp-plot .bar { flex: 0 1 15px; min-width: 5px; max-width: 15px; border-radius: 3px 3px 0 0; }
+.duty-tp-plot .bar.cr { background: #4f8cff; }
+.duty-tp-plot .bar.cl { background: #3ddc84; }
+.duty-tp-plot .tp-line { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.duty-tp-vals { display: flex; gap: 12px; padding: 0 2px 4px; }
+.duty-tp-vals .val { flex: 1 1 0; min-width: 0; text-align: center; font-size: 11px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.duty-tp-lbls { display: flex; gap: 12px; padding: 6px 2px 0; }
+.duty-tp-lbls .lbl { flex: 1 1 0; min-width: 0; text-align: center; font-size: 11px; color: var(--muted); }
+
+/* ── keeper 按日产出堆叠柱（值守总览）──────────────────────────────── */
+.duty-runbars { display: flex; align-items: flex-end; gap: 12px; padding: 4px 2px 0; }
+.duty-runbars .run-day { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; align-items: center; }
+.duty-runbars .val { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 4px; }
+.duty-runbars .stack { width: 100%; max-width: 34px; display: flex; flex-direction: column; justify-content: flex-end; border-radius: 4px 4px 0 0; overflow: hidden; background: var(--panel-2); }
+.duty-runbars .stack .seg { width: 100%; }
+.duty-runbars .lbl { font-size: 11px; color: var(--muted); margin-top: 6px; }
+.duty-runbars .sub { font-size: 10.5px; color: var(--muted); opacity: 0.85; min-height: 14px; }
+
+/* ── 按仓对比（值守总览）───────────────────────────────────────────── */
+.duty-repos { display: flex; flex-direction: column; }
+.duty-repos .repo-row { display: grid; grid-template-columns: 110px 64px 1fr 48px; align-items: center; gap: 10px; padding: 4px 0; font-size: 12px; border-bottom: 1px dashed var(--border); }
+.duty-repos .repo-row:last-child { border-bottom: none; }
+.duty-repos .name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.duty-repos .open { color: var(--muted); }
+.duty-repos .bars { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.duty-repos .track { flex: 1 1 auto; display: block; height: 8px; background: var(--panel-2); border-radius: 4px; overflow: hidden; min-width: 24px; }
+.duty-repos .track em { display: block; height: 100%; border-radius: 4px; }
+.duty-repos .cr { background: #4f8cff; }
+.duty-repos .cl { background: #3ddc84; }
+.duty-repos .num { font-weight: 400; color: var(--muted); white-space: nowrap; }
+.duty-repos .rate { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* ── 门失败 Top N（管线观测）───────────────────────────────────────── */
+.gate-fails { margin: 16px 0 4px; }
+.gate-fails h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; color: var(--text); }
+.gate-bars { display: flex; flex-direction: column; gap: 5px; max-width: 560px; }
+.gate-bar { display: grid; grid-template-columns: 150px 1fr 36px; align-items: center; gap: 10px; font-size: 12px; }
+.gate-bar .g { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gate-bar .track { display: block; height: 9px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
+.gate-bar .track em { display: block; height: 100%; background: #d9534f; border-radius: 4px; }
+.gate-bar .v { text-align: right; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* ---------- 等人工队列 ---------- */
+.duty-human { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .duty-human { grid-template-columns: 1fr; } }
+.duty-human-col { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.duty-human-title { font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+.duty-human-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border); font-size: 12.5px; color: var(--text); text-decoration: none; }
+.duty-human-row:first-of-type { border-top: none; }
+a.duty-human-row:hover .title { color: var(--accent-2); }
+.duty-human-row .repo { color: var(--accent-2); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.duty-human-row .title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.duty-human-row .age { color: var(--muted); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
