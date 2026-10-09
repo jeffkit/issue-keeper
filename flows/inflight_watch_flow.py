@@ -195,16 +195,24 @@ def run(input):
                                  "summary": "%s 执行已终态（%s）但 keeper 仍算在途 %.0f 分钟——收尸滞后"
                                             % (label, st, age), "escalate": True})
             continue
-        # ① 最强信号：有节点时间戳、无在跑节点、最后一个节点早已结束 → 流程该动没动
+        # ① 末节点结束已久：**先分清长节点与卡死**——impl 类节点单跑 60-120 分钟且
+        # 中途不写状态，所以「末节点结束 60 分钟」本身正常（2026-10-09 实测：据此
+        # 30/45 分钟阈值把三条健康长节点的 run 连推 4 次 HITL，全是误报）。
+        # 判据改为：越过长节点预算（stall=60 只 warn）后，再看进度龄是否也已越过
+        # keeper 僵尸线（hard=120）——两者的交集才是「keeper 都收不走」的真卡死，
+        # 此时才 critical + 自动 resume（避免 resume 打断健康长节点造成重复劳动）。
         lne = it.get("last_node_ended_age_min")
+        pa2 = it.get("progress_age_min")
         if st == "running" and it.get("has_node_ts") and not it.get("in_progress_nodes") \
                 and lne is not None and lne > stall:
-            sev = "critical" if lne > hard else "warn"
+            hard_stall = lne > hard and (pa2 is None or pa2 > hard)
+            sev = "critical" if hard_stall else "warn"
             if sev == "critical":
                 stalled.append(it)
             findings.append({"severity": sev,
-                             "summary": "%s 末节点结束已 %.0f 分钟仍无下一个节点（在途 %.0f 分钟，%s 节点，flow=%s）"
-                                        % (label, lne, age, it.get("nodes"), it.get("flow_id")),
+                             "summary": "%s 末节点结束已 %.0f 分钟仍无下一个节点（在途 %.0f 分钟，进度龄 %s，%s 节点，flow=%s）%s"
+                                        % (label, lne, age, pa2, it.get("nodes"), it.get("flow_id"),
+                                           "——超过 keeper 僵尸线仍未收，判定真卡死" if hard_stall else "（长节点进行中或需留意）"),
                              "escalate": sev == "critical"})
         # ② 次强：无节点时间戳（长节点进行中，impl 常 60-120 分钟）→ 只在超长时报
         elif st == "running" and pa is not None and pa > long_min:
@@ -338,9 +346,12 @@ def run(input):
         try:
             script = input.get("hitl_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/hitl_notify.py"
             body = "\\n".join("- " + f.get("summary", "") for f in crit[:5])
-            import hashlib
-            dkey = "inflight:" + hashlib.sha1(
-                "|".join(sorted(f.get("summary", "") for f in crit)).encode()).hexdigest()[:12]
+            # 去重键按「受影响的 run + 告警种类」稳定化：摘要里带分钟数，用内容哈希
+            # 会导致同一卡死每轮都被当成新告警（实测 30 分钟内推了 4 次）。
+            import hashlib, re as _re
+            runs = sorted(set(_re.findall(r"[a-z-]+#\d+", " ".join(f.get("summary", "") for f in crit))))
+            dkey = "inflight:" + ("|".join(runs) if runs else
+                                  hashlib.sha1("|".join(sorted(f.get("summary", "") for f in crit)).encode()).hexdigest()[:12])
             cmd = ("python3 %s --title %s --body %s --dedupe-key %s --wait-secs %d "
                    "--feedback-url https://github.com/jeffkit/infra4agent/issues/2"
                    % (script, json.dumps("在途异常 " + str(input.get("report") or "")[:50], ensure_ascii=False).replace("'", ""),
