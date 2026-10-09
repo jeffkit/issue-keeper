@@ -123,6 +123,23 @@ run_deadline_margin_secs: 300
 # 内判「排队中」（不动作不重派），超期仍 404 才走 engine_error 自愈路径。必须
 # > 最长排队等待（背压队列 + worker 满载时的排队是设计内行为）。
 console_queue_grace_secs: 1800
+# engine=v2-console 活性停滞判死（秒）：节点史里最新 ended_at 停滞超过它且
+# 无租约/心跳/在跑节点 → 确证死亡收尸。必须远大于节点间调度空档（上一节点
+# 结束到下一节点启动、末节点结束到终态落盘只有秒级窗口），否则 reaper 轮询
+# 落进空档会误杀健康 run（重复执行 + git 撞合并）。
+console_node_stale_secs: 1800
+# engine=v2-console 僵尸/滞后兜底（秒，plaita#28）：只对「无任何活性判据」
+# （无节点史无心跳）的刚起步 run 生效——last_update_time 年龄超阈判死。此
+# 阈值须 ≥ 最长节点预算。
+console_zombie_secs: 7200
+# engine=v2-console run 级在途预算（秒，plaita#28 验收 2）：在途总时长越过它
+# 即按 engine_error 收尾重派，不要求任何「0 租约」前提——治理「执行键无 TTL
+# 永不消失 + console 终态滞后 → run 无限期挂在在途集合」。取值须 ≥ 该 flow
+# **全程总时长**上限：节点预算之和（不是单节点上限）再叠加节点重试放大
+# （实测单节点重试过 4 次，plaita#28）；健康长跑贴近总预算属正常形态，靠
+# console_node_stale_secs 的活性判据区分死活，不要靠压低预算。0 = 关闭兜底
+# 线，只靠 zombie 判据。
+console_inflight_budget_secs: 10800
 
 # ─── per-repo 管线契约（pipeline_repos，v0.3 2026-09-30）──────────────
 # 每个仓自带：基线分支 / 依赖安装 / 质量门（单命令或多门清单）/ 交付策略 /

@@ -242,10 +242,24 @@ class Config:
     # 桥子进程整跑超时（秒）：到点 killpg 整个进程组（agent 子树一并清）
     pipeline_timeout_secs: int = 5400
     # ── engine=v2-console（G5/G6，2026-10-02）────────────────────────
-    # zombie 判定阈（秒）：running 执行的 last_update_time 年龄超过它 → 判死
-    # （cancel + 台账 engine_error 行走重派）。last_update_time 只在步界持久化
-    # 时刷新——长 impl 节点（≤70min）期间正常老化，阈值须高于最长节点预算。
+    # zombie 判定兜底阈（秒）：running 执行既无活性信号也无节点史时，
+    # last_update_time 年龄超过它 → 判死（cancel + 台账 engine_error 行走重派）。
+    # last_update_time 只在步界持久化时刷新——长 impl 节点（≤70min）期间正常
+    # 老化，阈值须高于最长节点预算。
     console_zombie_secs: int = 7200
+    # 活性停滞判死阈（秒）：节点史里最新 ended_at 停滞超过它且无租约/心跳/
+    # 在跑节点 → 确证死亡收尸。必须远大于节点间调度空档（末节点结束到下一
+    # 节点启动/终态落盘只有秒级）以免 reaper 误杀健康 run，但应明显小于
+    # console_zombie_secs（有节点史的 run 不该再等满无 TTL 键的兜底线）。
+    console_node_stale_secs: int = 1800
+    # 兜底收尸线（秒，plaita#28 验收第 2 条）：v2-console run 在途总时长越过它
+    # 即按 engine_error 收尾重派——**不要求**先满足「0 租约/无心跳」。治理
+    # 「执行键无 TTL 永不消失 + console 终态滞后（plaita#52）→ run 无限期挂在
+    # 在途集合」。取值须 ≥ 该 flow 全程总时长上限：节点预算之和（非单节点
+    # 上限）再叠加节点重试放大（实测单节点重试过 4 次，plaita#28）——健康
+    # 长跑贴近总预算属正常形态，靠心跳/节点活性区分死活，不要靠压低预算。
+    # 0 = 关闭兜底线，只靠 zombie 判据。
+    console_inflight_budget_secs: int = 10800
     # error 执行 resume-retry 次数上限（G1：续原 execution 从断点步进，免整跑
     # 重做）。超限落 engine_error 台账行走既有重派/升级语义。
     console_retry_max: int = 1
@@ -703,6 +717,9 @@ def load_config(path: str | os.PathLike) -> Config:
         # 排队 > 默认 1800s 时 404 仍被误判 engine_error → 重派（plaita#18）。
         console_queue_grace_secs=max(0, int(raw.get("console_queue_grace_secs", 1800))),
         console_zombie_secs=max(0, int(raw.get("console_zombie_secs", 7200))),
+        console_node_stale_secs=max(0, int(raw.get("console_node_stale_secs", 1800))),
+        console_inflight_budget_secs=max(
+            0, int(raw.get("console_inflight_budget_secs", 10800))),
         console_retry_max=max(0, int(raw.get("console_retry_max", 1))),
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
