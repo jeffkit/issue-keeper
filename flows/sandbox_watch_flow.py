@@ -121,9 +121,30 @@ def run(input):
                          "summary": "AGS 实例清单获取失败：%s" % str(input.get("error"))[:120],
                          "escalate": True})
 
-    report = ("实例 %d（孤儿 %d / 卡死 %d）" % (len(inst), len(orphans), len(stalled))) \
+    # 浪费口径（2026-10-09 增，jeffkit 点名「孤儿没察觉」）：
+    # 孤儿由 act 击杀，但**浪费已经发生**——原先只报个数、不折算成本、也不递单，
+    # 于是「3 个 paused 且执行已终态的实例白占 2-2.5h」没有任何工单路径，只有人问
+    # 才看得见。现在折算实例小时（instance-hours），超阈值递单（成本视角，非每轮噪音）。
+    waste_h = 0.0
+    for it in orphans:
+        waste_h += float(it.get("age_h") or 0)
+    paused_idle = [it for it in inst if it.get("state") == "paused"
+                   and (it.get("exec_status") or "") in TERMINAL | {"unknown", "query-failed"}]
+    for it in paused_idle:
+        if it not in orphans:
+            waste_h += float(it.get("age_h") or 0)
+    waste_h = round(waste_h, 2)
+    if waste_h >= 2.0:
+        findings.append({"severity": "critical",
+                         "summary": "沙箱浪费累计 %.1f 实例小时（孤儿 %d / paused 空闲 %d）——查清扫链路"
+                                    % (waste_h, len(orphans), len(paused_idle)),
+                         "escalate": True})
+
+    report = ("实例 %d（孤儿 %d / 卡死 %d）· 浪费 %.2f 实例小时"
+              % (len(inst), len(orphans), len(stalled), waste_h)) \
         if inst or not input.get("error") else "清单失败"
-    return {"orphans": orphans, "stalled": stalled, "findings": findings, "report": report}
+    return {"orphans": orphans, "stalled": stalled, "findings": findings, "report": report,
+            "waste_h": waste_h, "paused_idle": len(paused_idle)}
 """)
 
     # ── ③ act（只杀孤儿：复用已验证的 ags-orphan-sweep.py）──────────────
