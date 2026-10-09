@@ -7,8 +7,8 @@
 |---|---|---|
 | flow 心跳 | ctrl-watch */30 | 只看 A/B/主控 flow 有没有跑，不看单条 run |
 | AGS 实例 | sandbox-watch */30 | 只看沙箱实例（孤儿/实例级卡死） |
-| keeper 僵尸线 | keeper reaper | 判据是「console running + **0 租约** + worker 空闲」——
-  | 而租约键 `plaita:execution:<eid>` 是**无 TTL 的持久记录**，判据永不成立（#28 就这样漏了 228 分钟） |
+| keeper 僵尸线 | keeper reaper | 判据=「status=running 且 `last_update_time` 年龄 > `console_zombie_secs`（默认 **2h**）」——
+  | 阈值取 2h 是为容忍长节点（impl 60-120min），所以**失败后要等满 2h** 才收尸（#28 等了 229 分钟） |
 | 管线统计 | pipeline-patrol 0 */4 | 4h 一次，且只看已终态 run 的聚合 |
 | **run 进度** | **无人** | **console 说 running、87 分钟零节点进展 → 无人发现** |
 
