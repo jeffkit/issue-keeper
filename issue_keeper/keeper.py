@@ -2042,6 +2042,13 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         return {"status": "engine_error", "comment_posted": False}
 
     flow_id = pc.console_flow_id or "self-improve-v2"
+    # 正文截断 16000 字符。除了「别让 prompt 爆掉」这个显然理由，它还**顺带
+    # 保住一条隐含约束**（2026-10-11 评审提示，已量化核实）：agentproc 的
+    # cursor executor 把整个 prompt 放在 **argv**（`cursor-agent -p <message>`），
+    # 而 recursive 走 stdin。Linux/macOS 的 `ARG_MAX` = 1MB，生产实测 impl 段
+    # prompt 上界 ≈16KB（383 样本最大 16094 字符）⇒ **占用 1.53%**，余量充足；
+    # 但若将来放大这个截断值（或改经 config `max_chars`），**换 executor 后
+    # 会比 recursive 更早撞 argv 上限**——届时须同步评估。
     goal = f"#{res.number} {res.title or ''}\n\n{(res.body or '')[:16000]}".strip()
     (artifact_dir / "v2-goal.md").write_text(goal, encoding="utf-8")
     run_id = f"pipeline-{res.number}-{_time.strftime('%m%d%H%M%S')}"
