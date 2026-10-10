@@ -202,8 +202,15 @@ class RepoBinding:
 
     @property
     def repo_slug(self) -> str:
-        """repo 标识里非法字符替换为 -，用于 session id / 状态 key。"""
-        return self.repo.replace("/", "-").replace(":", "-")
+        """repo 标识里非法字符替换为 -，用于 session id / 状态 key。
+
+        只保留 [A-Za-z0-9_.-]，其余（包括 / : + ~ 空格等）统一替换为 -，
+        并合并连续 -，避免污染文件系统路径与 JSON key。
+        """
+        import re
+        slug = re.sub(r"[^\w.\-]", "-", self.repo)
+        slug = re.sub(r"-{2,}", "-", slug)
+        return slug.strip("-")
 
 
 @dataclass

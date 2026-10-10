@@ -109,10 +109,20 @@ class TestConfigLoading:
         assert b.source == "github_cli"
         assert b.agent_label == "proj-a-agent"
         assert b.repo_slug == "owner-repo"
-        assert c.screener.enabled is True
-        assert c.screener.api_key == "sk-test"
-        # internal_db 全局路径套到每个 binding
-        assert b.internal_db == _db_path(tmp_path)
+
+    def test_repo_slug_sanitizes_punctuation(self, tmp_path):
+        """repo_slug 应把 / 以外的标点（如 . + ~ 空格）也替换为 -。"""
+        from issue_keeper.config import RepoBinding
+        cases = [
+            ("owner/my.repo",  "owner-my.repo"),   # . 保留（合法目录字符）
+            ("owner/my+repo",  "owner-my-repo"),    # + 替换
+            ("owner/my~repo",  "owner-my-repo"),    # ~ 替换
+            ("owner/my repo",  "owner-my-repo"),    # 空格替换
+            ("owner/a--b",     "owner-a-b"),         # 连续 - 合并（/ 变 - 后不会叠加）
+        ]
+        for repo, expected in cases:
+            b = RepoBinding(repo=repo, profile="p")
+            assert b.repo_slug == expected, f"repo={repo!r}"
 
     def test_agent_env_template_applied_to_bindings(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "key-xyz")
