@@ -120,6 +120,19 @@ def main() -> None:
            "--goal-file", str(gf), "--repo", main_clone, "--run-id", run_id,
            "--agent", payload.get("agent") or "glm53-flash",
            "--reviewer", payload.get("reviewer") or "glm53-flash"]
+    # 按段档位键（impl_agent / gatefix_agent / fix_agent / landfix_agent）——
+    # **必须一并转发**，否则 keeper 侧配置了也到不了 flow（本文件是显式白名单
+    # 转发，不转发即静默丢弃；2026-10-11 实测：keeper 已恒下发这 4 键，而此处
+    # 零转发 ⇒ 整条分段功能是死代码，且**不报错**——正是评审 A 项警告的形态）。
+    #
+    # 用**派生式**而非再抄一份键名：凡 payload 里以 `_agent`/`_reviewer` 结尾
+    # 的身份键都转发（与 self_improve_bridge_v2 的 `_is_identity_key` 同约定）。
+    # 这样将来新增分档键**只需在 keeper 定义**，不会再漏这一环。
+    for _k in sorted(k for k in payload
+                     if k.endswith(("_agent", "_reviewer"))):
+        _v = payload.get(_k)
+        if _v:
+            cmd += ["--" + _k.replace("_", "-"), str(_v)]
     if payload.get("dry_run"):
         cmd.append("--dry-run")
 
