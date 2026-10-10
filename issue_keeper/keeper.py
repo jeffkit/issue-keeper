@@ -2051,16 +2051,18 @@ def _identity_payload(config: Config, pc: "PipelineRepoConfig") -> dict:
     # 说明该键的接线有缺口——此时**响亮记录**而非静默。用 warning 而非 raise：
     # 派发主链路不该因一个可选档位键而整体失败（那会把「配错」放大成「不派发」，
     # 违背 keeper 的可用性优先原则），但**必须留下可被值守/探针抓到的痕迹**。
+    # **总是**下发全部按段键（未显式配置时 = agent 的值）。
+    #
+    # 为什么必须「总是」而不是「配了才发」（2026-10-11 实测教训，harness s29 抓到）：
+    # `_refresh_identity` 只刷新 **params 里出现过** 的键。若某段键在首派时缺失
+    # （因为没配），它就不会进 context；而 flow 侧 `impl_agent = INPUT.impl_agent
+    # or agent` 一旦被引擎记入 $NODE，恢复轮就会出现**不一致刷新**：`agent` 被
+    # 刷成本次派发的新值、而 `impl_agent` 仍固化为首派旧值 ⇒ flow 读 `impl_agent`
+    # ⇒ **拿到陈旧档位**。这正是评审 A 项警告的静默失效，且**只在恢复轮出现**、
+    # 日志看着正常（显示的是旧模型名）。恒下发即消除该整类不一致。
     _segment = getattr(pc, "segment_agents", None) or {}
-    for key, val in sorted(_segment.items()):
-        if val:
-            payload[key] = val
-    if _segment:
-        _missing = [k for k, v in _segment.items() if v and k not in payload]
-        if _missing:  # pragma: no cover —— 防御性；当前实现不会命中
-            log.warning(
-                "分档档位 %s 未能进入派发 payload（接线缺口，会静默回退到 agent）",
-                _missing)
+    for key in ("impl_agent", "gatefix_agent", "fix_agent", "landfix_agent"):
+        payload[key] = _segment.get(key) or agent
     return payload
 
 

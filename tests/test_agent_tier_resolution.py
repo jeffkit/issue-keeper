@@ -106,10 +106,16 @@ def test_all_dispatch_sites_use_global_tier():
     pc_empty = types.SimpleNamespace(agent="", reviewer="")
     pc_rp = types.SimpleNamespace(agent="cursor-sonnet46", reviewer="glm53-flash")
 
-    assert keeper._identity_payload(cfg, pc_empty) == {
-        "agent": "deepseek-flash", "reviewer": "deepseek-flash"}, "无 per-repo 时应落到全局层"
-    assert keeper._identity_payload(cfg, pc_rp) == {
-        "agent": "cursor-sonnet46", "reviewer": "glm53-flash"}, "per-repo 应优先"
+    base = keeper._identity_payload(cfg, pc_empty)
+    assert base["agent"] == "deepseek-flash" and base["reviewer"] == "deepseek-flash", \
+        "无 per-repo 时应落到全局层"
+    # 按段键恒下发且未配置时 = agent（见 _identity_payload 的长注释：
+    # 缺失会导致恢复轮「agent 刷了、impl_agent 没刷」的不一致）
+    for k in ("impl_agent", "gatefix_agent", "fix_agent", "landfix_agent"):
+        assert base[k] == "deepseek-flash", f"{k} 未配置时应等于 agent"
+    rp = keeper._identity_payload(cfg, pc_rp)
+    assert rp["agent"] == "cursor-sonnet46" and rp["reviewer"] == "glm53-flash", \
+        "per-repo 应优先"
 
     cfg_blank = types.SimpleNamespace(
         pipeline_default_agent="", pipeline_default_reviewer="")
@@ -172,11 +178,20 @@ def test_yaml_absent_keeps_empty_default(tmp_path):
 
 
 def test_segment_agents_passthrough_and_zero_regression():
-    """按段档位键的透传 + 零回归（2026-10-11，评审 A 项防线）。
+    """按段档位键**恒下发**，未配置时 = agent（2026-10-11 实测修正）。
 
-    评审的核心担忧：新增分档键后链路任一环节漏改 ⇒ **不报错、只静默回退**。
-    消掉 keeper 内重复源解决了一半；此处钉死「配置了就一定带得出去」，
-    并保证**未配置时输出与改动前逐键相同**（零回归）。
+    ## 为什么是「恒下发」而不是「配了才发」
+
+    初版设计是「配置了才进 payload」，但 harness s29 **实测变红**，暴露了
+    评审 A 项警告的静默失效的具体形态：
+
+    `_refresh_identity` 只刷新 **params 里出现过** 的键。若某段键首派缺失，
+    它就不进 context；而 flow 侧 `impl_agent = INPUT.impl_agent or agent` 一旦
+    被引擎记入 `$NODE`，恢复轮就会**不一致刷新**——`agent` 刷成本次派发新值、
+    `impl_agent` 仍固化首派旧值 ⇒ flow 读 `impl_agent` ⇒ **拿到陈旧档位**，
+    且**只在恢复轮出现、日志看着正常**（显示旧模型名）。
+
+    恒下发即消除该整类不一致（代价：payload 多 4 个键）。
     """
     import types
 
@@ -184,24 +199,21 @@ def test_segment_agents_passthrough_and_zero_regression():
 
     cfg = types.SimpleNamespace(
         pipeline_default_agent="deepseek-flash", pipeline_default_reviewer="")
+    seg_keys = ("impl_agent", "gatefix_agent", "fix_agent", "landfix_agent")
 
-    # ① 零回归：未配置段位 ⇒ 输出恰为原来的两键
-    pc_plain = types.SimpleNamespace(agent="", reviewer="")
-    assert keeper._identity_payload(cfg, pc_plain) == {
-        "agent": "deepseek-flash", "reviewer": "deepseek-flash"}, \
-        "未配置段位键时输出必须与改动前完全一致（零回归）"
+    # ① 未配置段位 ⇒ 键仍在，且**等于 agent**（保证恢复轮可刷、不残留旧值）
+    plain = keeper._identity_payload(cfg, types.SimpleNamespace(agent="", reviewer=""))
+    for k in seg_keys:
+        assert plain[k] == plain["agent"], f"{k} 未配置时必须等于 agent，实得 {plain.get(k)!r}"
 
-    # ② 透传：配置了就一定在 payload 里（只带非空的）
-    pc_seg = types.SimpleNamespace(
+    # ② 配置了就取配置值；未配置的其他段仍 = agent
+    seg = keeper._identity_payload(cfg, types.SimpleNamespace(
         agent="", reviewer="",
-        segment_agents={"impl_agent": "cursor-sonnet46",
-                        "gatefix_agent": "deepseek-flash",
-                        "fix_agent": ""})       # 空值不应出现
-    out = keeper._identity_payload(cfg, pc_seg)
-    assert out["impl_agent"] == "cursor-sonnet46"
-    assert out["gatefix_agent"] == "deepseek-flash"
-    assert "fix_agent" not in out, "空段位不应进入 payload（避免覆盖下游默认）"
+        segment_agents={"impl_agent": "cursor-sonnet46"}))
+    assert seg["impl_agent"] == "cursor-sonnet46"
+    for k in seg_keys[1:]:
+        assert seg[k] == seg["agent"], f"{k} 未配置时应跟随 agent"
 
-    # ③ 兼容：pc 没有 segment_agents 属性时不得抛（旧配置对象/测试桩）
+    # ③ 兼容：pc 无 segment_agents 属性时不得抛（旧配置对象/测试桩）
     out2 = keeper._identity_payload(cfg, types.SimpleNamespace(agent="", reviewer=""))
-    assert set(out2) == {"agent", "reviewer"}
+    assert set(seg_keys).issubset(out2), "无该属性时仍须恒下发全部按段键"
