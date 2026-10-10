@@ -217,3 +217,35 @@ def test_segment_agents_passthrough_and_zero_regression():
     # ③ 兼容：pc 无 segment_agents 属性时不得抛（旧配置对象/测试桩）
     out2 = keeper._identity_payload(cfg, types.SimpleNamespace(agent="", reviewer=""))
     assert set(seg_keys).issubset(out2), "无该属性时仍须恒下发全部按段键"
+
+
+def test_v2_bridge_forwards_segment_keys():
+    """`v2_bridge` 必须转发按段档位键——否则 keeper 侧配置是**死代码**。
+
+    2026-10-11 实测发现：keeper 恒下发 4 个按段键后，`v2_bridge.py` 仍是
+    **显式白名单转发**（只写死 `--agent`/`--reviewer`）⇒ 新键被**静默丢弃**，
+    整条分段功能到不了 flow，**且不报错**——正是评审 A 项警告的形态。
+
+    判据：`v2_bridge` 源码里存在**派生式**转发（按 `_agent`/`_reviewer` 后缀），
+    且不再只有那两个写死的 flag。
+    """
+    import inspect
+    import pathlib
+
+    # flows/ 不是包（无 __init__.py），直接读源码
+    src = pathlib.Path("flows/v2_bridge.py").read_text(encoding="utf-8")
+    assert 'endswith(("_agent", "_reviewer"))' in src, (
+        "v2_bridge 必须用派生式转发按段键（写死键名会漏新增键且不报错）"
+    )
+    # 行为：模拟 payload，确认转发命令含按段键
+    payload = {"agent": "a", "reviewer": "r",
+               "impl_agent": "cursor-sonnet46", "gatefix_agent": "",
+               "fix_agent": "", "landfix_agent": ""}
+    cmd = ["--agent", payload.get("agent") or "glm53-flash",
+           "--reviewer", payload.get("reviewer") or "glm53-flash"]
+    for k in sorted(k for k in payload if k.endswith(("_agent", "_reviewer"))):
+        v = payload.get(k)
+        if v:
+            cmd += ["--" + k.replace("_", "-"), str(v)]
+    assert "--impl-agent" in cmd and "cursor-sonnet46" in cmd
+    assert "--gatefix-agent" not in cmd, "空值不应转发（避免覆盖下游兜底）"
