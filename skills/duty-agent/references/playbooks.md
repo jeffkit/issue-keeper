@@ -18,6 +18,13 @@
 2. `POST .../cancel` → **keeper reopen**（VM 上，见 toolbox）→ 让流水线换新沙箱重跑；
 3. 若其沙箱实例仍在跑 → 杀（见 §3）。
 
+> **上面 1-3 已机械自动化（#22，2026-10-09）**：inflight-watch（*/15）对**双 120 命中且
+> resume 额度已用**的执行自动走完「快照 → cancel → reopen → 杀沙箱」，留痕在
+> `rounds.log` + duty `actions[]`（capability `cancel_execution`/`reopen_issue`，authorized），
+> 快照落 `<run_dir>/salvage-snapshot.patch`（run 目录不删）。
+> 熔断：同 issue 24h 内已自动 cancel ≥2 次 → 停止自动处置并递工单——**这种情况（以及
+> 自动处置失败/cancel 未生效/快照缺失）才是值守要接的手**。手工处置仍是合法路径（flow 不在场时）。
+
 ## 2. 执行已终态但 keeper 仍算在途（"收尸滞后"）
 
 keeper reaper 是**轮询制**，1-3 分钟延迟正常。**>10 分钟**才报。

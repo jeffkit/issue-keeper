@@ -18,7 +18,7 @@
 | `keeper-watch`（B 值守） | `40 */2` | B 班轮报：值守落地 + 简报 + handoff |
 | `ctrl-watch`（主控） | `*/30` | **meta 看门狗**：A/B 心跳、shadow 派单对账、调度健康 → 递工单（不再直发 #2） |
 | `sandbox-watch`（沙箱） | `*/30` | AGS 实例：孤儿清查（杀）+ 静默卡死判定 + 配额压力 |
-| `inflight-watch`（在途） | `*/15` | run 级进度：末节点停滞 / 终态未收尸 / 超长跑 → 递工单；真卡死自动 resume 一次 |
+| `inflight-watch`（在途） | `*/15` | run 级进度：末节点停滞 / 终态未收尸 / 超长跑 → 递工单；真卡死自动 resume 一次；双 120 死档直接机械处置（快照 → cancel → reopen → 杀沙箱），**失败/熔断/快照缺失的那一张**才递工单 |
 | `pipeline-patrol`（管线） | `0 */4` | L3 巡检：台账/metrics/keeper 日志 → 观测报告 + 契约变更提案（**跑在 VM 上**，数据在那） |
 | `disk-hygiene`（磁盘） | `*/30` | 磁盘观测 + 清 >24h run worktree + 清磁盘守卫退避（6h 退避曾让整线瘫） |
 | `hitl-inbox`（HITL 收件箱） | `*/5` | 轮询 HITL 会话取人回复 → 留痕 → 落 issue → **回填工单**（闭环） |
@@ -35,7 +35,9 @@ requests/req-*.json        ★ 决策工单（flow → 值守 Agent 的唯一正
 handoffs/                  B 班 handoff
 roster.json                值班表
 hitl-notifications.jsonl  我发出的 HITL 通知留痕（session_id / status / 回复）
-inflight-resume.json       在途巡检的"每个执行只自动 resume 一次"账本
+inflight-resume.json       在途巡检账本：`resumed`（每个执行只自动 resume 一次；死档的
+                           **失败尝试**也记——否则额度永不消耗，它永远等不到机械处置）
+                           + `cancelled`（#22 双 120 自动 cancel 记录，供 24h ≥2 次熔断）
 ```
 规范与 schema：`issue-keeper/docs/duty/{DUTY-PROTOCOL,CAPABILITY-MATRIX}.md`、`docs/duty/schema/`。
 **三层协同与值守 Agent 定位**见 DUTY-PROTOCOL.md 末节。

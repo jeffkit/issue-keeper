@@ -50,7 +50,7 @@ PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src
 
 | 事件 | 谁发现 | 怎么到达我 |
 |---|---|---|
-| run 卡死 / 终态未收尸 / 超长跑 | `inflight-watch` `*/15` | 写工单 `duty/requests/`（critical 且越线时还会自动 resume 一次） |
+| run 卡死 / 终态未收尸 / 超长跑 | `inflight-watch` `*/15` | 写工单 `duty/requests/`（critical 且越线时还会自动 resume 一次；**双 120 死档已机械处置**——快照 → cancel → reopen → 杀沙箱，只有处置失败/熔断/快照缺失才递到我这里） |
 | AGS 孤儿 / 实例级卡死 | `sandbox-watch` `*/30`（+ launchd `ags-orphan-sweep`） | 写工单 / 直接杀孤儿 |
 | 磁盘逼近守卫线 / 守卫退避挡住流水线 | `disk-hygiene` `*/30` | 自动清理 + 清退避 + 写工单 |
 | 体系自身停摆（心跳/调度） | `ctrl-watch` `*/30` + launchd `external-watchdog` `*/5` | `ctrl-watch` 写工单（不再直发 GitHub） |
