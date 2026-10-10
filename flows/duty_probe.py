@@ -289,12 +289,32 @@ def probe_retry_storm(window_min: int = 30, threshold: int = 5) -> dict:
             by_exec[m.group(3)[:8]] += 1
             ordinals[m.group(2)] += 1
     worst = by_exec.most_common(1)[0] if by_exec else ("", 0)
+
+    # 终态交叉校验（2026-10-10 补）：本探针只读 worker **日志文本**，
+    # 因此无法知道那些执行**是否已经结束**——重投是「失败 → 重投」的瞬时记录，
+    # 执行在重投若干次后正常终态化（error/limited）时，日志里仍留着那一串
+    # `第 N/5 次重试`。实测（18:00/18:30 两轮）：被报「风暴进行中」的
+    # 8f48db8c / 4617281d **都已 terminalized**（status=error），属滞后读数。
+    # 这里对「窗口内重投最多的几个执行」查 console 终态，全部终态则不算 active。
+    alive = []
+    for eid8, _cnt in by_exec.most_common(5):
+        try:
+            d = _get(f"/api/executions?limit=200")
+            exs = d.get("executions") if isinstance(d, dict) else d
+            hit = next((e for e in (exs or [])
+                        if str(e.get("execution_id", "")).startswith(eid8)), None)
+            if hit is None or hit.get("status") == "running":
+                alive.append(eid8)
+        except Exception:
+            alive.append(eid8)      # 查不到就保守当作仍在跑（宁可多报）
     return {"window_min": window_min, "total": total, "recent10": recent10,
             "by_exec": dict(by_exec.most_common(5)), "ordinals": dict(ordinals),
             "worst_exec": worst[0], "worst_count": worst[1], "threshold": threshold,
+            "alive_execs": alive,
             # 只有「仍在进行」才算问题：停息后 30 分钟窗口里仍留着一堆历史计数，
             # 若据此报警会连续误报（2026-10-09 18:3x 实测：近 30min 92 次但近 10min 为 0）。
-            "active": recent10 >= 3}
+            # 且**必须**有执行仍处 running —— 全部已终态说明重投已收敛（2026-10-10 补）。
+            "active": recent10 >= 3 and bool(alive)}
 
 
 def main() -> int:
