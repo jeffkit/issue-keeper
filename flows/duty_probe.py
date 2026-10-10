@@ -297,16 +297,24 @@ def probe_retry_storm(window_min: int = 30, threshold: int = 5) -> dict:
     # 8f48db8c / 4617281d **都已 terminalized**（status=error），属滞后读数。
     # 这里对「窗口内重投最多的几个执行」查 console 终态，全部终态则不算 active。
     alive = []
+    try:
+        _d = _get("/api/executions?limit=200")
+        _exs = (_d.get("executions") if isinstance(_d, dict) else _d) or []
+        _status = {str(e.get("execution_id", "")): str(e.get("status") or "")
+                   for e in _exs}
+    except Exception:
+        _status = None          # API 不可达：无法交叉校验
+
     for eid8, _cnt in by_exec.most_common(5):
-        try:
-            d = _get(f"/api/executions?limit=200")
-            exs = d.get("executions") if isinstance(d, dict) else d
-            hit = next((e for e in (exs or [])
-                        if str(e.get("execution_id", "")).startswith(eid8)), None)
-            if hit is None or hit.get("status") == "running":
-                alive.append(eid8)
-        except Exception:
-            alive.append(eid8)      # 查不到就保守当作仍在跑（宁可多报）
+        if _status is None:
+            alive.append(eid8)          # 查不到状态，保守当作仍在跑（宁可多报）
+            continue
+        hit = next((v for k2, v in _status.items() if k2.startswith(eid8)), None)
+        # 查无此执行 = 已从 console 列表消失（TTL/清理）⇒ **不算活着**——
+        # 此前把 None 当 alive 会让一个已消失的 id 永久压住判据（2026-10-10
+        # 18:3x 实测：8f48db8c 已 error 且不在列表，却令 active 恒为 True）。
+        if hit == "running":
+            alive.append(eid8)
     return {"window_min": window_min, "total": total, "recent10": recent10,
             "by_exec": dict(by_exec.most_common(5)), "ordinals": dict(ordinals),
             "worst_exec": worst[0], "worst_count": worst[1], "threshold": threshold,
