@@ -169,3 +169,39 @@ def test_yaml_absent_keeps_empty_default(tmp_path):
     c = load_config(str(cfg_file))
     assert c.pipeline_default_agent == ""
     assert c.pipeline_default_reviewer == ""
+
+
+def test_segment_agents_passthrough_and_zero_regression():
+    """按段档位键的透传 + 零回归（2026-10-11，评审 A 项防线）。
+
+    评审的核心担忧：新增分档键后链路任一环节漏改 ⇒ **不报错、只静默回退**。
+    消掉 keeper 内重复源解决了一半；此处钉死「配置了就一定带得出去」，
+    并保证**未配置时输出与改动前逐键相同**（零回归）。
+    """
+    import types
+
+    from issue_keeper import keeper
+
+    cfg = types.SimpleNamespace(
+        pipeline_default_agent="deepseek-flash", pipeline_default_reviewer="")
+
+    # ① 零回归：未配置段位 ⇒ 输出恰为原来的两键
+    pc_plain = types.SimpleNamespace(agent="", reviewer="")
+    assert keeper._identity_payload(cfg, pc_plain) == {
+        "agent": "deepseek-flash", "reviewer": "deepseek-flash"}, \
+        "未配置段位键时输出必须与改动前完全一致（零回归）"
+
+    # ② 透传：配置了就一定在 payload 里（只带非空的）
+    pc_seg = types.SimpleNamespace(
+        agent="", reviewer="",
+        segment_agents={"impl_agent": "cursor-sonnet46",
+                        "gatefix_agent": "deepseek-flash",
+                        "fix_agent": ""})       # 空值不应出现
+    out = keeper._identity_payload(cfg, pc_seg)
+    assert out["impl_agent"] == "cursor-sonnet46"
+    assert out["gatefix_agent"] == "deepseek-flash"
+    assert "fix_agent" not in out, "空段位不应进入 payload（避免覆盖下游默认）"
+
+    # ③ 兼容：pc 没有 segment_agents 属性时不得抛（旧配置对象/测试桩）
+    out2 = keeper._identity_payload(cfg, types.SimpleNamespace(agent="", reviewer=""))
+    assert set(out2) == {"agent", "reviewer"}
