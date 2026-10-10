@@ -239,6 +239,68 @@ def probe_sandbox() -> dict:
     return out
 
 
+def probe_worker_skew() -> dict:
+    """worker 代码滞后检测（2026-10-11 值守侧补，同类事故已三次）。
+
+    **为什么需要**：Python 模块在 import 时载入内存，**改文件不会让运行中的
+    worker 生效**。当日我三次栽在「改了代码以为修好了」：VM worker 重启前跑旧
+    代码、console 进程 08:18 启动而 executions.py 14:44 才更新（导致 API 500
+    一整天）、plaita-nodes 的修复未同步到 worker。每次都要人工比对
+    「进程启动时间 vs 源文件 mtime」才发现，代价是数小时误判。
+
+    **判据**：读 worker 自己的服务注册表（`plaita:registry:flow_worker:*`，
+    含 `start_time`），与指定源文件的 mtime 比对；**文件比进程新 ⇒ 该进程跑的是
+    旧代码**。
+
+    局限（如实说明）：只能看**本地可达**的 Redis 与文件；跨机（VM worker 看
+    VM 上的文件）需在该机各跑一次。本探针用于值守所在的机器。
+    """
+    import glob
+    import os
+    import time
+
+    watched = [
+        "~/projects/infra4agent/plaita/plaita/server/flow_worker.py",
+        "~/projects/infra4agent/plaita-nodes/src/plaita_nodes/config.py",
+        "~/projects/infra4agent/plaita-nodes/src/plaita_nodes/agent_run.py",
+        "~/projects/infra4agent/agentproc/sdk/python/src/agentproc/executors.py",
+        "~/projects/infra4agent/agentproc/sdk/python/src/agentproc/runner.py",
+    ]
+    files: list = []
+    for pat in watched:
+        p = os.path.expanduser(pat)
+        if os.path.exists(p):
+            files.append((p, os.path.getmtime(p)))
+    if not files:
+        return {"checked": 0, "stale": [], "error": ""}
+
+    try:
+        import redis as _redis
+
+        r = _redis.Redis(host="127.0.0.1", port=16379,
+                         password="6ace3bde72955c70b9f264e24f57b343",
+                         db=1, decode_responses=True, socket_timeout=10)
+        stale = []
+        for key in r.scan_iter("plaita:registry:flow_worker:*", count=100):
+            import json as _json
+
+            d = _json.loads(r.get(key) or "{}")
+            st = str(d.get("start_time") or "")
+            if not st:
+                continue
+            try:
+                started = time.mktime(time.strptime(st[:19], "%Y-%m-%dT%H:%M:%S"))
+            except Exception:
+                continue
+            newer = [os.path.basename(f) for f, m in files if m > started + 5]
+            if newer:
+                stale.append({"worker": str(d.get("instance_id") or key),
+                              "started": st[:19], "newer_files": newer})
+        return {"checked": len(files), "stale": stale, "error": ""}
+    except Exception as e:  # noqa: BLE001 — 探测失败不该让体检崩
+        return {"checked": len(files), "stale": [], "error": f"{type(e).__name__}: {e}"[:100]}
+
+
 def probe_retry_storm(window_min: int = 30, threshold: int = 5) -> dict:
     """重投风暴探针（2026-10-09 盲区补丁，另一值守实例的发现）。
 
@@ -336,6 +398,7 @@ def main() -> int:
     dk = probe_disk()
     sb = probe_sandbox()
     rs = probe_retry_storm(30)
+    wk = probe_worker_skew()
 
     reasons = []
     level = "OK"
@@ -352,6 +415,17 @@ def main() -> int:
             "在跑）**全部不可信**，不得据此判断系统健康。首个错误：%s"
             % (len(errs), errs[0])
         )
+    # worker 代码滞后：**改了代码但进程没重启**（同类事故已三次，代价数小时）。
+    # 判为 DEGRADED 而非 BLOCKED——它不直接代表故障，但**所有基于新代码的判断
+    # 都不成立**，必须显式告知，否则会拿旧行为当结论。
+    if wk.get("stale"):
+        level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
+        for w in wk["stale"][:2]:
+            reasons.append(
+                "worker %s 启动于 %s，但源文件在其后有更新（%s）⇒ **该进程跑旧代码**"
+                "——基于新代码的验证结论不成立，需重启服务"
+                % (w["worker"], w["started"], "/".join(w["newer_files"][:3]))
+            )
     if tk["n_critical"] > 0:
         level = "BLOCKED"
         reasons.append("%d 张 critical 工单未处置" % tk["n_critical"])
@@ -414,6 +488,13 @@ def main() -> int:
             print("  产出: 近%dm 派发 %d / 落地 %d / 磁盘挡回 %d / engine_error %d / cancelled %d / 在跑 %d"
                   % (args.window_min, tp["attempts"], tp["landed"], tp["blocked_disk"],
                      tp["engine_error"], tp["cancelled"], tp["running"]))
+        _sk = wk.get("stale") or []
+        if _sk:
+            print("  worker: ⚠️ %d 个跑旧代码（改了没重启）：%s"
+                  % (len(_sk), "，".join("%s→%s" % (w["worker"][:18], "/".join(w["newer_files"][:2]))
+                                        for w in _sk[:3])))
+        elif wk.get("checked"):
+            print("  worker: 代码新鲜（比对 %d 个源文件）" % wk["checked"])
         print("  磁盘: mac %sG / vm %sG（线 %.0fG）"
               % (dk["mac"]["free_gib"], dk["vm"]["free_gib"], dk["min_gib"]))
         print("  沙箱: 实例 %d / 孤儿 %d / paused 空闲 %d / 浪费 %.2f 实例小时"
