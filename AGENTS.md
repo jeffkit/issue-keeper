@@ -28,7 +28,8 @@ Dashboard 提供 REST + 前端看板。
 - `issue_keeper/dashboard/` — FastAPI 看板 API
 - `frontend/src/` — 看板前端
 - `flows/` — issue-pipeline flow（pipeline_mode 时新 issue 首响应的 plaita 管线）
-  + `flows/gates/gate_runner.py`（多门调度器：per-gate 预算 + diff 路径条件）
+  + `flows/gates/gate_runner.py`（多门调度器：per-gate 预算 + diff 路径条件 +
+  跑门前命令头预检——执行环境缺工具即 PRECHECK fail-fast，不逐门撞 exit=127）
 - `config.example.yaml` — 全局配置模板（screener / patrol / reply_polish /
   pipeline_repos 等）
 - `tests/` — pytest
