@@ -101,11 +101,20 @@ def run(input):
     # exited 1`（无可用凭据）→ 判可重试 → 重投 → 再次失败……
     # keeper 侧只切了 `pipeline_default_agent`（全局层）与 `agent_env`，
     # **管不到 flow 里写死的 agent**，于是 ctrl 队列每 5 分钟攒一个
-    # 卡在 running（$LAST_NODE=triage）的僵尸执行，实测累积 656 个、
+    # 卡在 running（$LAST_NODE=triage）的僵尸执行，实测累积 667 个、
     # 最老 40 小时，并连带把 ctrl-watch 的「B 班心跳」判为超期。
-    # 修法：走 INPUT 注入（与 pipeline 的 agent 同款优先级语义），
-    # 默认值保持 glm53-flash，切档时只需改 keeper 配置不必改 flow 源码。
-    watch = AGENTRUN(agent=INPUT.watch_agent or "glm53-flash",
+    #
+    # 修法演进（2026-10-10 13:3x 实测修正）：
+    # 上一版把 INPUT 注入写对了（$F.or($INPUT.watch_agent, "glm53-flash")），
+    # 但**实测 cron 入队消息的 params 恒为 {}** —— 对照 inflight-watch /
+    # sandbox-watch / ctrl-watch 的 params 都正常，只有 keeper-watch 是空，
+    # 即 INPUT 注入在这条链路上取不到值，**默认值才是实际生效值**。
+    # 默认写死 glm53-flash ⇒ GLM 烧穿期该节点必然 429 失败（事故本体）。
+    #
+    # 故默认值改为 deepseek-flash：**保证 watcher 现在能跑**（止血）。
+    # INPUT 注入保留：链路修好后可由调度 params 覆盖档位，无需改源码。
+    # 「params 丢失」已作为独立缺陷立单跟踪。
+    watch = AGENTRUN(agent=INPUT.watch_agent or "deepseek-flash",
                      repo="/Users/kong/projects/infra4agent",
                      timeout_secs=2700,
                      prompt=F.concat(
