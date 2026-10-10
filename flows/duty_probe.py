@@ -74,6 +74,13 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
     import time
     cutoff = time.time() - window_min * 60
 
+    # 观测失败计数（2026-10-10 jeffkit 抓到的严重问题）：
+    # 此前 `/api/executions` 失败（如 500）被 `except: continue` **静默吞掉**，
+    # 统计全部归零，输出成「近90m 派发 0 / 落地 0 / 在跑 0」——**与真实「没有
+    # 工作」完全不可区分**。值守据此连报数轮「一切正常」，实际是探针瞎了。
+    # 现在显式计数，供上层把它标成 DEGRADED/BLOCKED 而不是 OK。
+    probe_errors: list = []
+
     def _ts(v):
         try:
             return time.mktime(time.strptime(str(v)[:19], "%Y-%m-%dT%H:%M:%S"))
@@ -84,7 +91,8 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
     for fid in FLOWS:
         try:
             d = _get(f"/api/executions?flow_id={fid}&limit=30")
-        except Exception:
+        except Exception as e:  # noqa: BLE001 — 但**必须留痕**，不可静默归零
+            probe_errors.append(f"列表 {fid}: {type(e).__name__}: {str(e)[:80]}")
             continue
         exs = d if isinstance(d, list) else d.get("executions") or []
         for e in exs:
@@ -105,7 +113,7 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
     stats = {"attempts": sum(1 for r in rows if r["in_window_dispatch"]),
              "landed": 0, "blocked_disk": 0, "blocked_other": 0,
              "engine_error": 0, "cancelled": 0, "running": 0, "completed_no_land": 0,
-             "block_reasons": {}, "landed_runs": []}
+             "block_reasons": {}, "landed_runs": [], "probe_errors": probe_errors}
     for r in rows:
         if r["status"] == "running":
             stats["running"] += 1
@@ -117,7 +125,8 @@ def probe_throughput(window_min: int, max_fetch: int = 18) -> dict:
             continue
         try:
             full = _get(f"/api/executions/{r['eid']}", timeout=12)
-        except Exception:
+        except Exception as e:  # noqa: BLE001 — 留痕，不可静默
+            probe_errors.append(f"详情 {r['eid'][:12]}: {type(e).__name__}: {str(e)[:60]}")
             continue
         fetched += 1
         nd = (full.get("context") or {}).get("$NODE") or {}
@@ -302,6 +311,19 @@ def main() -> int:
 
     reasons = []
     level = "OK"
+    # 观测链路自检**必须最先判**（2026-10-10 jeffkit 抓到的严重问题）：
+    # 若 console API 读不到，下面所有统计都是 0，而 0 会被误读成「没有工作」。
+    # 观测失败 = 探针本身不可信 ⇒ 直接 BLOCKED（不是 DEGRADED：这不是「有点
+    # 异常」，而是「你根本不知道发生了什么」）。此前靠静默 except 归零，
+    # 值守连续数轮拿着假 OK 汇报。
+    errs = tp.get("probe_errors") or []
+    if errs:
+        level = "BLOCKED"
+        reasons.append(
+            "**观测链路失败**：console API 有 %d 处读取失败，以下统计（派发/落地/"
+            "在跑）**全部不可信**，不得据此判断系统健康。首个错误：%s"
+            % (len(errs), errs[0])
+        )
     if tk["n_critical"] > 0:
         level = "BLOCKED"
         reasons.append("%d 张 critical 工单未处置" % tk["n_critical"])
@@ -354,9 +376,16 @@ def main() -> int:
     else:
         print("VERDICT=%s | %s" % (level, "；".join(reasons) if reasons else "四路信号正常"))
         print("  工单: 待处置 %d（critical %d）" % (tk["n_open"], tk["n_critical"]))
-        print("  产出: 近%dm 派发 %d / 落地 %d / 磁盘挡回 %d / engine_error %d / cancelled %d / 在跑 %d"
-              % (args.window_min, tp["attempts"], tp["landed"], tp["blocked_disk"],
-                 tp["engine_error"], tp["cancelled"], tp["running"]))
+        if errs:
+            # 不给裸 0 —— 裸 0 会被读成「没有工作」。显式标注为「不可读」。
+            print("  产出: **不可读**（console API %d 处失败，下面的 0 不代表没有工作）"
+                  % len(errs))
+            for e in errs[:3]:
+                print("        · %s" % e)
+        else:
+            print("  产出: 近%dm 派发 %d / 落地 %d / 磁盘挡回 %d / engine_error %d / cancelled %d / 在跑 %d"
+                  % (args.window_min, tp["attempts"], tp["landed"], tp["blocked_disk"],
+                     tp["engine_error"], tp["cancelled"], tp["running"]))
         print("  磁盘: mac %sG / vm %sG（线 %.0fG）"
               % (dk["mac"]["free_gib"], dk["vm"]["free_gib"], dk["min_gib"]))
         print("  沙箱: 实例 %d / 孤儿 %d / paused 空闲 %d / 浪费 %.2f 实例小时"
