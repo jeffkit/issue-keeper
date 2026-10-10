@@ -95,8 +95,17 @@ def run(input):
     return {"findings": findings, "report": report}
 """)
 
-    # ── ③ watch（AGENTRUN：glm53-flash 宿主直跑；值守动作权+红线写死提示词）───
-    watch = AGENTRUN(agent="glm53-flash",
+    # ── ③ watch（AGENTRUN：档位可覆盖——GLM 烧穿时须能切 DeepSeek）────────
+    # 2026-10-10 事故：此处原为硬编码 `agent="glm53-flash"`。GLM 报 1310
+    # （周/月上限，10-15 才恢复）后，watch 节点每次派发都 `executor 'recursive'
+    # exited 1`（无可用凭据）→ 判可重试 → 重投 → 再次失败……
+    # keeper 侧只切了 `pipeline_default_agent`（全局层）与 `agent_env`，
+    # **管不到 flow 里写死的 agent**，于是 ctrl 队列每 5 分钟攒一个
+    # 卡在 running（$LAST_NODE=triage）的僵尸执行，实测累积 656 个、
+    # 最老 40 小时，并连带把 ctrl-watch 的「B 班心跳」判为超期。
+    # 修法：走 INPUT 注入（与 pipeline 的 agent 同款优先级语义），
+    # 默认值保持 glm53-flash，切档时只需改 keeper 配置不必改 flow 源码。
+    watch = AGENTRUN(agent=INPUT.watch_agent or "glm53-flash",
                      repo="/Users/kong/projects/infra4agent",
                      timeout_secs=2700,
                      prompt=F.concat(
