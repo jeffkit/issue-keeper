@@ -2019,6 +2019,29 @@ def _console_exec_record(artifact_dir: Path) -> dict | None:
         return None
 
 
+def _identity_payload(config: Config, pc: "PipelineRepoConfig") -> dict:
+    """派发 payload 里的「谁在跑」档位键（agent/reviewer）。
+
+    **为什么抽成一处**（2026-10-11 评审指出「新增键须同步改 N 处白名单」，
+    我复核时发现比评审说的还多一处）：本文件原有 **3 处**各自手写这套映射
+    （`_dispatch_console_execution` / `_dispatch_shadow_execution` /
+    `_dispatch_pipeline`），且**优先级不一致**——前两处是
+    `per-repo → 全局 → 硬编码兜底`，而 `_dispatch_pipeline` 只写了 `pc.agent`，
+    **漏了全局层**（全局配了 `pipeline_default_agent` 时该路径静默拿不到）。
+
+    以后新增按段档位键（impl_agent / gatefix_agent / …）**只需改这一处**，
+    不会再出现「改了三处漏一处、且不报错」的静默失败。
+
+    优先级（与既有契约一致）：per-repo → 全局 → 硬编码兜底。
+    `reviewer` 的兜底链多一层「跟随 agent」（keeper 层语义；注意 bridge 层
+    的默认值各自独立，见 self_improve_bridge_v2.py）。
+    """
+    agent = pc.agent or config.pipeline_default_agent or "glm53-flash"
+    reviewer = (pc.reviewer or config.pipeline_default_reviewer
+                or config.pipeline_default_agent or "glm53-flash")
+    return {"agent": agent, "reviewer": reviewer}
+
+
 def _dispatch_console_execution(config, binding, res, it, label: str,
                                 pc: PipelineRepoConfig, artifact_dir: Path,
                                 body_file: Path) -> dict:
@@ -2062,9 +2085,7 @@ def _dispatch_console_execution(config, binding, res, it, label: str,
         # 档位优先级：per-repo → 全局 → 硬编码兜底（2026-10-10 加全局层：
         # 沙箱流的 agent 端点来自 plaita-nodes provider 翻译，与 keeper
         # agent_env 是两条路；GLM 配额烧穿时只改 agent_env 管不到沙箱）。
-        "agent": pc.agent or config.pipeline_default_agent or "glm53-flash",
-        "reviewer": (pc.reviewer or config.pipeline_default_reviewer
-                     or config.pipeline_default_agent or "glm53-flash"),
+        **_identity_payload(config, pc),
     }
     # per-repo 门禁注入（2026-10-06，多仓支持）：v2 flow 原为 recursive(Rust)
     # 硬编码 cargo 门——跑别的仓必然假红（plaita#41 实证：cargo fmt 在 Python
@@ -2162,9 +2183,7 @@ def _dispatch_shadow_execution(config, binding, res, label: str,
         "run_dir": f"{binding.cwd.rstrip('/')}/.flowcast/runs/{run_id}",
         # 档位优先级同 _dispatch_pipeline：per-repo → 全局 → 硬编码兜底
         # （影子副本走同一 provider 翻译，配额烧穿时同样要能切）
-        "agent": pc.agent or config.pipeline_default_agent or "glm53-flash",
-        "reviewer": (pc.reviewer or config.pipeline_default_reviewer
-                     or config.pipeline_default_agent or "glm53-flash"),
+        **_identity_payload(config, pc),
         "shadow": True,          # 供 flow/worker 侧识别并强制不落地（阶段 1a 后启用）
     }
     try:
@@ -2446,8 +2465,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         "allow_github_paths": pc.allow_github_paths if _declares_ci_fix(res.body) else [],
         "review_mode": pc.resolved_review_mode(config.pipeline_review_mode),
         "push_mode": pc.resolved_push_mode(config.pipeline_push_mode),
-        "agent": pc.agent,
-        "reviewer": pc.reviewer,
+        **_identity_payload(config, pc),
         "engine_env": _engine_env_with_run_deadline(config, pc, now, label),
         "investigate_timeout": timeouts["investigate"],
         "plan_timeout": timeouts["plan"],

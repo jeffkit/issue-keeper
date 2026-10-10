@@ -82,19 +82,48 @@ class TestAgentTierResolution:
         assert getattr(c, "pipeline_default_reviewer", None) == ""
 
 
-def test_both_dispatch_sites_use_global_tier():
-    """两处派发（主 + 影子）都必须接线全局档位——只改一处会留半吊子。"""
+def test_all_dispatch_sites_use_global_tier():
+    """**全部**派发点都必须接线全局档位——只改一处会留半吊子。
+
+    判据演进（2026-10-11）：旧版数 `config.pipeline_default_agent` 在源码里的
+    **字面出现次数 ≥4**，是「两处派发各两条解析」的**脆弱代理指标**。该断言在
+    把三处重复逻辑抽成 `_identity_payload()` 后必然失败（引用从 4 次降到 1 次），
+    但**行为反而更正确**——数出现次数是在测实现形状，不是在测契约。
+
+    现改为**行为契约**：直接调 helper 验三层优先级，并断言**所有**派发点都走它
+    （用「不再残留内联解析」做反向检查）。
+    """
     import inspect
+    import types
 
     from issue_keeper import keeper
 
     src = inspect.getsource(keeper)
-    assert src.count("config.pipeline_default_agent") >= 4, (
-        "主/影子两处派发各需 agent 与 reviewer 两条解析，共 ≥4 次引用；"
-        f"实际 {src.count('config.pipeline_default_agent')} 次"
+
+    # ① 行为：per-repo → 全局 → 硬编码兜底（含 reviewer 跟随 agent）
+    cfg = types.SimpleNamespace(
+        pipeline_default_agent="deepseek-flash", pipeline_default_reviewer="")
+    pc_empty = types.SimpleNamespace(agent="", reviewer="")
+    pc_rp = types.SimpleNamespace(agent="cursor-sonnet46", reviewer="glm53-flash")
+
+    assert keeper._identity_payload(cfg, pc_empty) == {
+        "agent": "deepseek-flash", "reviewer": "deepseek-flash"}, "无 per-repo 时应落到全局层"
+    assert keeper._identity_payload(cfg, pc_rp) == {
+        "agent": "cursor-sonnet46", "reviewer": "glm53-flash"}, "per-repo 应优先"
+
+    cfg_blank = types.SimpleNamespace(
+        pipeline_default_agent="", pipeline_default_reviewer="")
+    assert keeper._identity_payload(cfg_blank, pc_empty)["agent"] == "glm53-flash", \
+        "全局也空时应落到硬编码兜底（不改变未配置部署的行为）"
+
+    # ② 覆盖：所有派发点都经 helper（不得残留内联解析——那正是「漏改一处」的来源）
+    assert src.count("**_identity_payload(config, pc)") >= 3, (
+        "三处派发（主/影子/legacy）都应经统一 helper；"
+        f"实际 {src.count('**_identity_payload(config, pc)')} 处"
     )
-    # 不得残留写死的 glm 兜底（应经全局层再兜底）
-    assert '"agent": pc.agent or "glm53-flash"' not in src, "主派发仍有写死兜底"
+    for legacy in ('"agent": pc.agent or config.pipeline_default_agent',
+                   '"agent": pc.agent,'):
+        assert legacy not in src, f"仍有内联档位解析残留：{legacy}"
 
 
 def test_yaml_values_are_actually_loaded(tmp_path):
