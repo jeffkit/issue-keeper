@@ -2039,7 +2039,29 @@ def _identity_payload(config: Config, pc: "PipelineRepoConfig") -> dict:
     agent = pc.agent or config.pipeline_default_agent or "glm53-flash"
     reviewer = (pc.reviewer or config.pipeline_default_reviewer
                 or config.pipeline_default_agent or "glm53-flash")
-    return {"agent": agent, "reviewer": reviewer}
+    payload = {"agent": agent, "reviewer": reviewer}
+
+    # ── fail-loud：按段档位键的「接线完整性」自检（2026-10-11，评审 A 项）──
+    # 评审的核心担忧：新增分档键后，链路任一环节漏改 ⇒ **不报错、只静默回退
+    # 到 agent**，于是「改了配置却用错模型」，且验收也难发现。消掉重复源
+    # （上面已把 3 处收成 1 处）解决了 keeper 内部这一环；**跨仓环节**（bridge
+    # 的 --xxx 转发、flow 的 INPUT 读取）仍需另一道防线。
+    #
+    # 做法：per-repo 或全局**显式配置了**某分档键时，必须能把它带出去；带不出去
+    # 说明该键的接线有缺口——此时**响亮记录**而非静默。用 warning 而非 raise：
+    # 派发主链路不该因一个可选档位键而整体失败（那会把「配错」放大成「不派发」，
+    # 违背 keeper 的可用性优先原则），但**必须留下可被值守/探针抓到的痕迹**。
+    _segment = getattr(pc, "segment_agents", None) or {}
+    for key, val in sorted(_segment.items()):
+        if val:
+            payload[key] = val
+    if _segment:
+        _missing = [k for k, v in _segment.items() if v and k not in payload]
+        if _missing:  # pragma: no cover —— 防御性；当前实现不会命中
+            log.warning(
+                "分档档位 %s 未能进入派发 payload（接线缺口，会静默回退到 agent）",
+                _missing)
+    return payload
 
 
 def _dispatch_console_execution(config, binding, res, it, label: str,
