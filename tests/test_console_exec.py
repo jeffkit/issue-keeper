@@ -496,14 +496,21 @@ class TestReapConsole:
         assert not (art / K.CONSOLE_EXEC_RECORD).exists()   # 在途锚已清 → 交回重派
 
     def test_overrun_budget_reaps_even_with_fresh_last_update(self, art, monkeypatch):
-        """兜底线（验收 2）：在途越 3h 预算即判死，不要求无租约前提，
-        last_update_time 被 resume 刷新也拦不住。"""
+        """兜底线（验收 2）：在途越预算即判死，不要求无租约前提，
+        last_update_time 被 resume 刷新也拦不住。
+
+        取值随默认预算调整（2026-10-11：10800 → 24300，见 config.py 该字段
+        的长注释）。此处**从配置读默认值**而非写死小时数——否则每次调预算都要
+        手改测试，且写死会掩盖「测试意图 = 越线即收」这一契约。
+        """
+        budget_h = K.Config().console_inflight_budget_secs / 3600.0
+        over_h = budget_h + 1.0                       # 明确越线 1h
         d = {"status": "running",
-             "start_time": (datetime.now() - timedelta(hours=4)).isoformat(),
+             "start_time": (datetime.now() - timedelta(hours=over_h)).isoformat(),
              "last_update_time": datetime.now().isoformat()}   # 新鲜
         client = FakeClient(d)
         cfg, it, row, posted = self._reap(art, monkeypatch, client,
-                                          dispatched_ago=4 * 3600)
+                                          dispatched_ago=int(over_h * 3600))
         assert client.cancelled == ["exec-123"]
         assert row["status"] == "engine_error" and "超时" in row["error"]
 

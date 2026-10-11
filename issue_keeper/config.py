@@ -266,7 +266,22 @@ class Config:
     # 上限）再叠加节点重试放大（实测单节点重试过 4 次，plaita#28）——健康
     # 长跑贴近总预算属正常形态，靠心跳/节点活性区分死活，不要靠压低预算。
     # 0 = 关闭兜底线，只靠 zombie 判据。
-    console_inflight_budget_secs: int = 10800
+    #
+    # ── 取值修正（2026-10-11，jeffkit 授权）────────────────────────────
+    # 旧默认 10800(3.0h) **违反本节自己写下的规则**：它小于
+    # 「节点预算之和」，而 VM 又把 `RECURSIVE_IMPL_TIMEOUT` 设为 14400(4.0h)
+    # ⇒ 各段之和（含 env 覆盖）= 14400 + (14100-4200) = **24300s(6.75h)**。
+    # 后果（生产实证，425 样本）：超 10800s 的执行 13 个 → **12 个被 cancel、
+    # 仅 1 个 completed** ⇒ **健康的 impl 长跑跑到 3h 就被兜底线误杀**，
+    # 而它自己的预算是 4h。
+    #
+    # 新值 24300 的依据：
+    #   · 恰好等于「各段之和（含 env 覆盖）」——即规则要求的下限；
+    #   · 实测 248 个 completed 执行：中位 0h、P90 1.03h、**最长 4.23h、
+    #     超 6.75h 的为 0 个** ⇒ 6.75h 覆盖全部已观测健康长跑且有余量。
+    # 未再叠加「节点重试放大」（最坏 22.75h）——那会让真僵尸多活近 20h，
+    # 而僵尸另有 zombie 判据（末节点 ended_at 停滞）兜底，无需靠预算线防。
+    console_inflight_budget_secs: int = 24300
     # error 执行 resume-retry 次数上限（G1：续原 execution 从断点步进，免整跑
     # 重做）。超限落 engine_error 台账行走既有重派/升级语义。
     console_retry_max: int = 1
@@ -740,7 +755,7 @@ def load_config(path: str | os.PathLike) -> Config:
         console_zombie_secs=max(0, int(raw.get("console_zombie_secs", 7200))),
         console_node_stale_secs=max(0, int(raw.get("console_node_stale_secs", 1800))),
         console_inflight_budget_secs=max(
-            0, int(raw.get("console_inflight_budget_secs", 10800))),
+            0, int(raw.get("console_inflight_budget_secs", 24300))),
         console_retry_max=max(0, int(raw.get("console_retry_max", 1))),
         # 2026-09-30 修复：此前 yaml 旋钮 pipeline_max_in_flight 无人读取，
         # 恒为 dataclass 默认 2（「调并发」实际不生效）。
