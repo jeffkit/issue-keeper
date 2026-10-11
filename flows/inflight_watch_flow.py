@@ -663,8 +663,37 @@ print(json.dumps({"rc": r.returncode, "out": (r.stdout or "")[-400:].strip(),
     }, code="""
 def run(input):
     import glob, json, os, subprocess
-    probe = os.environ.get("DUTY_PROBE_SCRIPT") or \\
-        "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_probe.py"
+    def _find_probe():
+        cands = []
+        env = os.environ.get("DUTY_PROBE_SCRIPT")
+        if env:
+            cands.append(env)
+        dd = str(input.get("duty_dir") or "").strip()
+        if dd:
+            cands.append(os.path.join(dd, "flows", "duty_probe.py"))
+        rs = str(input.get("requests_script") or "").strip()
+        if rs:
+            root = os.path.dirname(os.path.dirname(os.path.abspath(rs)))
+            cands.append(os.path.join(root, "flows", "duty_probe.py"))
+        cur = os.path.abspath(os.getcwd())
+        for _ in range(5):
+            cands.append(os.path.join(cur, "flows", "duty_probe.py"))
+            cands.append(os.path.join(cur, "issue-keeper", "flows", "duty_probe.py"))
+            nxt = os.path.dirname(cur)
+            if nxt == cur:
+                break
+            cur = nxt
+        for c in cands:
+            c = str(c or "").strip()
+            if c and os.path.exists(c):
+                return c
+        return ""
+
+    probe = _find_probe()
+    if not probe:
+        # 显式失败，绝不把「获取失败」静默渲染成「实例 0 · 浪费 0.00」
+        return {"level": "unknown", "error": "duty_probe.py 未找到（便携解析失败）",
+                "raised": None, "reasons": []}
     try:
         r = subprocess.run(["python3", probe, "--json", "--window-min", "90"],
                            capture_output=True, text=True, timeout=300)
@@ -839,7 +868,26 @@ def run(input):
     req = {"id": None, "why": "无 critical"}
     if crit_ticket:
         try:
-            rs = input.get("requests_script") or "/Users/kong/projects/infra4agent/issue-keeper/flows/duty_request.py"
+            # 便携解析（2026-10-11）：VM 上无 /Users/kong/... ⇒ 硬编码会让
+            # 「递工单」这一步在 VM 侧静默失效（同 sandbox-watch 事故）。
+            rs = str(input.get("requests_script") or "").strip()
+            if not rs or not os.path.exists(rs):
+                cur = os.path.abspath(os.getcwd())
+                for _ in range(5):
+                    hit = ""
+                    for cand in (os.path.join(cur, "flows", "duty_request.py"),
+                                 os.path.join(cur, "issue-keeper", "flows",
+                                              "duty_request.py")):
+                        if os.path.exists(cand):
+                            hit = cand
+                            break
+                    if hit:
+                        rs = hit
+                        break
+                    nxt = os.path.dirname(cur)
+                    if nxt == cur:
+                        break
+                    cur = nxt
             ctx = json.dumps({"flow": "inflight-watch", "report": input.get("report"),
                               "findings": [f.get("summary") for f in crit_ticket[:6]],
                               "rows": input.get("rows") or []}, ensure_ascii=False)
