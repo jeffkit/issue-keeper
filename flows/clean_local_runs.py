@@ -52,12 +52,18 @@ def _dir_size(path: pathlib.Path) -> int:
 #: /tmp 下验证临时目录的命名模式（验证类 agent 自行 clone+构建的产物）。
 #: 只匹配这三类**明确是验证副产物**的名字，避免误伤无关的 /tmp 内容。
 TMP_PATTERNS = [
-    re.compile(r"^i\d+-target$"),      # i173-target
+    re.compile(r"^i\d+(-target)?$"),   # i181 / i173-target
     re.compile(r"^verify\d+.*$"),      # verify173 / verify184
     re.compile(r"^wt\d+.*$"),          # wt176 / wt183
     re.compile(r"^v\d+(-target)?$"),   # v3 / v183
     re.compile(r"^issue\d+-verify$"),  # issue173-verify
 ]
+# 说明（2026-10-12 补）：`i<NNN>`（无 -target 后缀）是同一类验证工作目录
+# ——实测 `/tmp/i181` 单目录 **6.1G**，内含 e2e_compile.log/gates.log，
+# 是六轮磁盘告警中最大的一笔。首版模式只写了 `i\d+-target` 因而**漏掉它**
+# （clean_local_runs 实跑时 removed 列表里没有 i181）。补为 `i\d+(-target)?`。
+# 安全性不靠"名字像不像"，而靠下游**双条件**（mtime 陈旧 + lsof 无占用）：
+# 实测 i181 在构建期间 lsof 非空会被 `tmp_skipped_busy` 跳过，构建结束后才可清。
 
 
 def tmp_enabled() -> bool:
