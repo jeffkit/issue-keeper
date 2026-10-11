@@ -224,6 +224,13 @@ def _ts_age(ts: str, now: float | None = None) -> float | None:
         return None
 
 
+#: 「在跑节点」作为活证据时，容许的状态停更上限（秒）。
+#: 超此值即认为该「在跑」不再可信（进程可能已死而 node_timings 未更新）——
+#: 2026-10-11 实测：健康 impl 中位 23min / 最长 75min 且期间持续刷新，
+#: 故 1h 停更判死是安全的；无此判据会出现「两条线都漏」的孤儿永生。
+_NODE_LIVENESS_STALE_SECS = 3600.0
+
+
 def worker_alive(detail: dict, lease_ttl_secs: float = 120.0,
                  now: float | None = None,
                  node_stale_secs: float = 1800.0) -> bool | None:
@@ -252,11 +259,30 @@ def worker_alive(detail: dict, lease_ttl_secs: float = 120.0,
     # ① 节点在跑：有 started 无 ended 的节点视为活证据（impl 节点跑 1-2h 正常，
     # 但 started 已超 1 天的「在跑」节点不会再产出任何状态刷新，不作活证据——
     # 它是死证据还是观测残缺交给 ③/兜底，不在此处下结论）
+    # ① 的「活证据」**必须带新鲜度**（2026-10-11 修，实测漏收一例）：
+    # 原判据只要「有 started 无 ended 的节点且 started 未超 1 天」就判活，
+    # **不看状态是否还在刷新**。于是进程已消失、租约已释放、last_update 停摆
+    # 近 3h 的执行仍被判「活着」，永久不被收尸（实测 execution 77228014：
+    # impl 起于 08:29、进程已无、无租约、last_update 停 2.9h，而 status 恒
+    # running）。
+    #
+    # 为什么会暴露：预算线刚从 10800 抬到 24300（本日另一改动）⇒ 3h 的孤儿
+    # **够不到预算线**，而 zombie 线又因本条判活 ⇒ **两条线都漏**。故本处必须
+    # 补新鲜度，否则「抬预算」会换来「孤儿永生」。
+    #
+    # 阈值 3600s 的依据（生产实测）：健康 impl 中位 23min、P90 55min、
+    # **最长 75min**，且期间 worker 持续写 node_progress ⇒ 正常刷新间隔远小于
+    # 1h。1h 无任何状态刷新 + 无租约 ⇒ 判死是安全的。
+    _lu_age = _ts_age(str(detail.get("last_update_time") or ""), now=now)
+    _stale = _lu_age is not None and _lu_age > _NODE_LIVENESS_STALE_SECS
     for v in (detail.get("node_timings") or {}).values():
         if not isinstance(v, dict) or not v.get("started_at") or v.get("ended_at"):
             continue
         age = _ts_age(str(v.get("started_at")), now=now)
         if age is None or age <= 86400:
+            # 在跑节点但状态已停更超阈 ⇒ 不作活证据，继续看 ②/③
+            if _stale:
+                continue
             return True
 
     # ② 租约/心跳字段（console/worker 侧显式上报的活性；带 TTL 语义才可信。

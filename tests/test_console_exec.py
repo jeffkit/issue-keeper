@@ -185,13 +185,34 @@ class TestZombieAliveMerge:
                                        - timedelta(hours=2, minutes=50)).isoformat()}}}
         assert ce.zombie(d, 7200) is True
 
-    def test_alive_worker_not_killed_by_old_last_update(self):
-        """长 impl 节点在跑（无 ended）：last_update_time 老化是正常形态，不判死。"""
+    def test_alive_worker_with_fresh_updates_not_killed(self):
+        """长 impl 节点在跑 + 状态**仍在刷新** ⇒ 判活，不判死。
+
+        判据演进（2026-10-11 实测修正）：原用例用「impl 在跑 + last_update
+        已老化 3h」来代表「健康长跑」，**这个假设是错的**——健康长跑期间
+        worker 会**持续写 node_progress**（生产实测：健康 impl 中位 23min、
+        最长 75min，期间刷新不断），所以「在跑节点 + 状态停更数小时」恰恰是
+        **进程已死的形态**。
+
+        实测孤儿 execution 77228014 正是此形：impl 起于 08:29、进程已无、
+        无租约、last_update 停 2.9h，而 status 恒 running——旧判据因「有在跑
+        节点」永久判活，两条收尸线（zombie / 预算）**都漏**。
+
+        故本用例改为断言**正确**契约：在跑节点 + 新鲜刷新 ⇒ 不判死。
+        """
+        d = {"status": "running",
+             "last_update_time": (datetime.now() - timedelta(minutes=2)).isoformat(),
+             "node_timings": {"impl": {"started_at": (datetime.now()
+                                        - timedelta(hours=2)).isoformat()}}}
+        assert ce.zombie(d, 7200) is False
+
+    def test_inflight_node_with_stale_updates_is_dead(self):
+        """在跑节点但状态停更超阈 ⇒ 判死（防「孤儿永生」，见上用例注释）。"""
         d = {"status": "running",
              "last_update_time": (datetime.now() - timedelta(hours=3)).isoformat(),
              "node_timings": {"impl": {"started_at": (datetime.now()
                                         - timedelta(hours=2)).isoformat()}}}
-        assert ce.zombie(d, 7200) is False
+        assert ce.zombie(d, 7200) is True
 
     def test_recent_node_end_falls_back_to_last_update(self):
         """reviewer blocking case 全链路：末节点 30s 前结束 → worker_alive=None，
