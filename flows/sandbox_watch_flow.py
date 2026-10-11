@@ -26,6 +26,13 @@
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
         python3 flows/build_flows.py sandbox-watch
+
+执行宿主纪律（2026-10-11 事故）：
+- 本 flow 由 plaita-flow-worker **在 VM 上**执行（PLAITA_CODE_BACKEND=subprocess），
+  故 CODE 节点里**不得出现 Mac 专属绝对路径**：解释器走 sys.executable（= flow-worker
+  自己的 venv python）优先解析，辅助脚本按 flow 文件相对定位，见 facts/act 的 _pick_py。
+- 清单获取是三态的：ok / empty（合法无实例）/ failed；failed 一律 critical + escalate，
+  **绝不**允许渲染成「实例 0 · 浪费 0.00 实例小时」（成本闸不允许瞎成"报绿"）。
 """
 from __future__ import annotations
 
@@ -42,26 +49,115 @@ def sandbox_watch(INPUT):
         "venv_py": INPUT.venv_py, "lister": INPUT.lister, "console_key": INPUT.console_key,
     }, code="""
 def run(input):
-    import datetime, json, subprocess, time, urllib.request
+    import datetime, json, os, shutil, subprocess, sys, time, urllib.request
 
-    VENV = input.get("venv_py") or "/Users/kong/projects/infra4agent/plaita/.venv/bin/python"
-    LISTER = input.get("lister") or "/Users/kong/projects/infra4agent/issue-keeper/flows/ags-list.py"
+    # ── 解释器/脚本路径解析（2026-10-11 便携化）─────────────────────────
+    # 为什么不再硬编码：本 flow 由 plaita-flow-worker **在 VM tcloud_gz 上**执行
+    # （PLAITA_CODE_BACKEND=subprocess），Mac 专属的 /Users/kong/... 在 VM 上不存在
+    # ⇒ lister 起不来（exit=127）⇒ 清单恒失败。解析顺序（含理由）：
+    #   ① 显式 input.venv_py（调度侧可覆盖，永远最大优先级）；
+    #   ② sys.executable —— CODE 节点的 subprocess 后端就是 [sys.executable, "-c",
+    #      runner]（plaita/node/code.py），故它 == flow-worker 自己的 venv python
+    #      （VM: ~/.venvs/issuekeeper/bin/python），**该 venv 里装了 e2b**；
+    #   ③ <repo>/.venv/bin/python（bash 手工跑 flow 时的常见布局）；
+    #   ④ 同目录 .venv（本仓就在 flows/ 里）；
+    #   ⑤ env AGS_LISTER_PY / ISSUEKEEPER_PY（部署侧显式钉死）；
+    #   ⑥ shutil.which("python3")（最后兜底）。
+    def _root(path, marker="flows", limit=4):
+        # 从 CODE 节点落地的文件路径回溯仓根：<repo>/flows/xxx.py → <repo>
+        d = os.path.dirname(os.path.abspath(path))
+        for _ in range(limit):
+            if os.path.isdir(os.path.join(d, marker)):
+                return d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+        return ""
+
+    def _pick_py(explicit):
+        # ⚠️ 本函数在 3 处逐字复制：sandbox_watch_flow.py 的 facts + act、
+        # inflight_watch_flow.py 的 facts。CODE 节点的 code 是**自包含源码字符串**
+        # （编译进 .flow.json，各节点独立 subprocess 执行），无法 import 复用——
+        # 故只能靠"逐字一致 + 本标注"防漂移。**改任何一处必须同步三处**，
+        # 否则解释器解析会按节点静默分叉（2026-10-11 验收：act 那份曾漏 AGS_LISTER_PY）。
+        for c in [explicit, sys.executable,
+                  os.path.join(ROOT, ".venv", "bin", "python") if ROOT else "",
+                  os.path.join(FLOW_DIR, ".venv", "bin", "python"),
+                  os.environ.get("AGS_LISTER_PY"), os.environ.get("ISSUEKEEPER_PY"),
+                  shutil.which("python3")]:
+            c = str(c or "").strip()
+            if c and os.path.exists(c) and os.access(c, os.X_OK):
+                return c
+        # 全都不存在：返回"最该存在"的那个（错误文本里要能看见它，便于下次定位）
+        return str(explicit or sys.executable or "python3")
+
+    def _pick_script(explicit, name):
+        cands = [str(explicit or "").strip()]
+        cands.append(os.path.join(FLOW_DIR, name))                       # 与 flow 同目录
+        if ROOT:
+            cands.append(os.path.join(ROOT, "flows", name))              # 仓根/flows
+        cands += [os.environ.get("ISSUEKEEPER_FLOWS_DIR", "") and
+                  os.path.join(os.environ["ISSUEKEEPER_FLOWS_DIR"], name),
+                  os.path.join(os.getcwd(), "flows", name)]
+        for c in cands:
+            if c and os.path.exists(c):
+                return c
+        return cands[1] if len(cands) > 1 else name
+
+    # 这条字符串会随 flow 源码"编译"进 code 节点，故必须保持对**执行宿主**成立：
+    # 用 <repo>/flows 作为基准（两处部署点都有它），再逐级回退。
+    _frame = __file__ if "__file__" in dir() else ""
+    FLOW_DIR = os.path.dirname(os.path.abspath(
+        _frame or os.path.join(os.getcwd(), "flows", "sandbox_watch_flow.py")))
+    ROOT = _root(FLOW_DIR)
+    VENV = _pick_py(input.get("venv_py"))
+    LISTER = _pick_script(input.get("lister"), "ags-list.py")
     KEY = input.get("console_key") or "***REMOVED***"
-    ENV = ("E2B_DOMAIN=ap-guangzhou.tencentags.com "
-           "E2B_API_KEY=***REMOVED*** ")
+    # 环境由父进程白名单传递（subprocess 后端的 env 白名单），这里按需补齐，
+    # 不再依赖 shell 前缀赋值（cmd 走 argv 列表，不经 shell）。
+    ENVV = dict(os.environ)
+    ENVV.setdefault("E2B_DOMAIN", "ap-guangzhou.tencentags.com")
+    ENVV.setdefault("E2B_API_KEY", "***REMOVED***")
 
-    def sh(cmd, timeout=60):
+    def sh(argv, timeout=60):
+        # 返回 (returncode, stdout, stderr, why)：**绝不吞 stderr**——旧实现把非零
+        # 退出/超时/命令不存在一律折叠成 ""，于是"底层不可用"与"输出为空"不可区分，
+        # 真故障被渲染成"实例 0 · 浪费 0.00"（假阴性，成本闸瞎眼）。
         try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-            return (r.stdout or "").strip()
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=ENVV)
+            return (r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip(), "")
+        except FileNotFoundError as e:
+            return (127, "", "", "解释器不存在: %s" % str(e)[:120])
+        except subprocess.TimeoutExpired:
+            return (124, "", "", "超时 %ss 未返回" % timeout)
         except Exception as e:
-            return ""
+            return (1, "", "", "%s: %s" % (type(e).__name__, str(e)[:120]))
 
-    out = sh(ENV + VENV + " " + LISTER)
-    try:
-        items = json.loads(out)
-    except Exception:
-        items = []
+    # 三态判定的**唯一依据 = 子进程 returncode**（不再用 stdout 空串的真值性）
+    rc, out, err, why = sh([VENV, LISTER])
+    state, detail, items = "ok", "", []
+    if rc != 0:
+        state = "failed"
+        detail = why or "lister 退出码 %d" % rc
+        if err:
+            detail += " | stderr: " + err[-400:]
+    elif not out:
+        state = "failed"
+        detail = "lister 退出码 0 但 stdout 为空（无 JSON 可解析）"
+    else:
+        try:
+            items = json.loads(out)
+            if not isinstance(items, list):
+                raise ValueError("顶层不是数组: %s" % type(items).__name__)
+        except Exception as e:
+            # ⚠️ 必须把 items 重置为 []：json.loads 已把**非数组**赋给了 items，
+            # 只改 state/detail 会让下游 `for it in items` 崩
+            # （AttributeError: 'str' object has no attribute 'get'）。
+            # 与 inflight_watch_flow.py 的同款位置保持逐字一致。
+            items = []
+            state = "failed"
+            detail = "JSON 解析失败（%s）| stdout[:200]=%r" % (str(e)[:120], out[:200])
 
     now = time.time()
 
@@ -130,13 +226,19 @@ def run(input):
                      "open_node": open_node, "last_node_end_age_sec": last_end_age,
                      "impl_budget_sec": budget, "flow_id": (d or {}).get("flow_id") or "",
                      "goal": str(inp.get("goal") or "")[:60], "node_summary": node})
-    return {"instances": rows, "count": len(rows), "now": now, "error": None if items else out[:200]}
+    if state == "ok" and not rows:
+        state = "empty"          # 合法的"当前无运行中实例"，**不是**故障
+    return {"instances": rows, "count": len(rows), "now": now,
+            "state": state, "detail": detail, "stderr": err[-400:],
+            "lister": LISTER, "interpreter": VENV,
+            "error": detail if state == "failed" else None}
 """)
 
     # ── ② triage（纯规则 + 活性探针）────────────────────────────────────
     triage = CODE(id="triage", lang="python", input={
         "instances": NODE.facts.instances, "count": NODE.facts.count,
-        "error": NODE.facts.error,
+        "error": NODE.facts.error, "state": NODE.facts.state, "detail": NODE.facts.detail,
+        "lister": NODE.facts.lister, "interpreter": NODE.facts.interpreter,
         "orphan_min_age_h": INPUT.orphan_min_age_h, "stall_min": INPUT.stall_min,
         "quota_warn": INPUT.quota_warn, "default_impl_budget": INPUT.default_impl_budget_secs,
     }, code="""
@@ -145,6 +247,14 @@ def run(input):
 
     TERMINAL = {"completed", "failed", "cancelled", "error"}
     inst = input.get("instances") or []
+    # 三态（2026-10-11 判据硬化）：ok = 跑通且列到实例；empty = 跑通但当前无实例
+    # （合法，健康）；failed = 非零退出/超时/解释器缺失/JSON 不可解析。旧实现用
+    # `error = out[:200]` 的空串真值性兼作"有无错误"，stdout 恰为空时真故障被判成
+    # 健康（渲染成"实例 0 · 浪费 0.00"）——成本闸瞎眼且瞎成"报绿"。
+    state = str(input.get("state") or ("failed" if input.get("error") else "ok"))
+    if state not in ("ok", "empty", "failed"):
+        state = "failed"
+    failed = state == "failed"
     orphan_h = float(input.get("orphan_min_age_h") or 0.5)
     stall_min = float(input.get("stall_min") or 30)
     quota_warn = int(input.get("quota_warn") or 6)
@@ -236,10 +346,18 @@ def run(input):
         findings.append({"severity": "warn",
                          "summary": "AGS 实例数 %d ≥ %d，配额压力（成本/并发受限）" % (len(inst), quota_warn),
                          "escalate": False})
-    if input.get("error"):
+    if failed:
+        # escalate: true —— 连续多轮"清单失败"必须出声（2026-10-11 实测：11:45→12:46
+        # 连续 5 轮失败，findings=1 一直跳却没有任何工单/HITL，无人被告知）。
         findings.append({"severity": "critical",
-                         "summary": "AGS 实例清单获取失败：%s" % str(input.get("error"))[:120],
-                         "escalate": True})
+                         "summary": "AGS 实例清单获取失败（无法判定成本状态）：%s"
+                                    "｜解释器=%s ｜lister=%s"
+                                    % (str(input.get("detail") or input.get("error"))[:200],
+                                       input.get("interpreter") or "?", input.get("lister") or "?"),
+                         "escalate": True,
+                         "evidence": {"state": state, "interpreter": input.get("interpreter"),
+                                      "lister": input.get("lister"),
+                                      "detail": str(input.get("detail") or "")[:400]}})
 
     # 浪费口径（2026-10-09 增，jeffkit 点名「孤儿没察觉」）：
     # 孤儿由 act 击杀，但**浪费已经发生**——原先只报个数、不折算成本、也不递单，
@@ -260,11 +378,17 @@ def run(input):
                                     % (waste_h, len(orphans), len(paused_idle)),
                          "escalate": True})
 
-    report = ("实例 %d（孤儿 %d / 卡死 %d）· 浪费 %.2f 实例小时"
-              % (len(inst), len(orphans), len(stalled), waste_h)) \
-        if inst or not input.get("error") else "清单失败"
+    # 报告字符串必须三态都truthful：failed **绝不**能渲染成"实例 0 · 浪费 0.00"
+    # （那就是把真故障洗成健康）；empty 与 ok 都照实报数。
+    if failed:
+        report = "清单失败（成本状态未知）：%s" % str(
+            input.get("detail") or input.get("error") or "未知原因")[:100]
+    else:
+        report = ("实例 %d（孤儿 %d / 卡死 %d）· 浪费 %.2f 实例小时%s"
+                  % (len(inst), len(orphans), len(stalled), waste_h,
+                     "｜清单为空（无运行中实例）" if state == "empty" else ""))
     return {"orphans": orphans, "stalled": stalled, "findings": findings, "report": report,
-            "waste_h": waste_h, "paused_idle": len(paused_idle)}
+            "waste_h": waste_h, "paused_idle": len(paused_idle), "state": state}
 """)
 
     # ── ③ act（只杀孤儿：复用已验证的 ags-orphan-sweep.py）──────────────
@@ -273,22 +397,69 @@ def run(input):
         "sweeper": INPUT.sweeper, "dryrun": INPUT.dryrun,
     }, code="""
 def run(input):
-    import subprocess
-    VENV = input.get("venv_py") or "/Users/kong/projects/infra4agent/plaita/.venv/bin/python"
-    SWEEP = input.get("sweeper") or "/Users/kong/projects/infra4agent/issue-keeper/flows/ags-orphan-sweep.py"
+    import os, shutil, subprocess, sys
+
+    # 与 facts 同款便携解析（同一个执行宿主，绝不能硬编码 /Users/kong/...）：
+    # 显式参数 → sys.executable（CODE 节点 subprocess 后端即 flow-worker 的 venv
+    # python，VM 上为 ~/.venvs/issuekeeper/bin/python，装 e2b）→ <repo>/.venv →
+    # env → which。sweep 只需 python3 + stdlib，但 venv 能拿到 e2b/requests。
+    def _root(path, marker="flows", limit=4):
+        d = os.path.dirname(os.path.abspath(path))
+        for _ in range(limit):
+            if os.path.isdir(os.path.join(d, marker)):
+                return d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+        return ""
+
+    _frame = __file__ if "__file__" in dir() else ""
+    FLOW_DIR = os.path.dirname(os.path.abspath(
+        _frame or os.path.join(os.getcwd(), "flows", "sandbox_watch_flow.py")))
+    ROOT = _root(FLOW_DIR)
+
+    def _pick_py(explicit):
+        # ⚠️ 本函数在 3 处逐字复制：sandbox_watch_flow.py 的 facts + act、
+        # inflight_watch_flow.py 的 facts。CODE 节点的 code 是**自包含源码字符串**
+        # （编译进 .flow.json，各节点独立 subprocess 执行），无法 import 复用——
+        # 故只能靠"逐字一致 + 本标注"防漂移。**改任何一处必须同步三处**，
+        # 否则解释器解析会按节点静默分叉（2026-10-11 验收：act 那份曾漏 AGS_LISTER_PY）。
+        for c in [explicit, sys.executable,
+                  os.path.join(ROOT, ".venv", "bin", "python") if ROOT else "",
+                  os.path.join(FLOW_DIR, ".venv", "bin", "python"),
+                  os.environ.get("AGS_LISTER_PY"), os.environ.get("ISSUEKEEPER_PY"),
+                  shutil.which("python3")]:
+            c = str(c or "").strip()
+            if c and os.path.exists(c) and os.access(c, os.X_OK):
+                return c
+        return str(explicit or sys.executable or "python3")
+
+    VENV = _pick_py(input.get("venv_py"))
+    SWEEP = ""
+    for c in [str(input.get("sweeper") or "").strip(),
+              os.path.join(FLOW_DIR, "ags-orphan-sweep.py"),
+              os.path.join(ROOT, "flows", "ags-orphan-sweep.py") if ROOT else ""]:
+        if c and os.path.exists(c):
+            SWEEP = c
+            break
+    if not SWEEP:
+        SWEEP = os.path.join(FLOW_DIR, "ags-orphan-sweep.py")
     n_orphans = len(input.get("orphans") or [])
     if not n_orphans:
         return {"killed": 0, "out": "无孤儿"}
     if input.get("dryrun"):
         return {"killed": 0, "out": "dryrun：将清 %d 个孤儿" % n_orphans}
-    cmd = "%s %s --min-age 0.5" % (VENV, SWEEP)
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        # argv 列表（不经 shell），与 facts 的调用姿势一致
+        r = subprocess.run([VENV, SWEEP, "--min-age", "0.5"],
+                           capture_output=True, text=True, timeout=120)
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         killed = out.count("→ kill=True")
-        return {"killed": killed, "out": out[-600:]}
+        return {"killed": killed, "out": out[-600:], "rc": r.returncode}
     except Exception as e:
-        return {"killed": 0, "out": "sweep 异常: %s" % str(e)[:200]}
+        return {"killed": 0, "out": "sweep 异常（%s %s）: %s"
+                % (VENV, SWEEP, str(e)[:200]), "rc": None}
 """)
 
     # ── ④ finish（duty state-sandbox + rounds.log 一行）─────────────────

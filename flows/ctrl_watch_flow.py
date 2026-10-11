@@ -43,7 +43,7 @@ def ctrl_watch(INPUT):
         "duty_dir": INPUT.duty_dir, "rounds_log": INPUT.rounds_log,
     }, code="""
 def run(input):
-    import json, os, subprocess, time
+    import json, os, subprocess, tempfile, time
 
     def sh(cmd, timeout=30):
         try:
@@ -88,6 +88,60 @@ def run(input):
     if mt.strip().isdigit():
         shadow_age = max(0, now - int(mt.strip()))
 
+    # ── 在途「空转」探测（2026-10-11 无限交接风暴后补）──────────────────────
+    # 为什么补：本日 11:21–13:40 两台 worker 因「宿主归属自锁」全线空转
+    # （近 300 行日志 292 行是「不亲和」、6 条在途零产出、队列恒定 6），
+    # 而**所有心跳都是健康的**（A/B/shadow 全绿）⇒ ctrl-watch 连报 3 轮
+    # 「全线正常」。**心跳只证「进程活着」，不证「工作在进行」**——
+    # 这正是 meta-watchdog 的盲区：看门狗自己没死，但整个体系产能为零。
+    #
+    # 判据取「队列长度 + 在途条数」这个**不依赖心跳**的产能信号：
+    # 若队列有积压（>0）且长时间毫无变化，说明消费侧在空转（领了就退/踢皮球）。
+    # 刻意用**两次采样比对**（相隔 queue_stall_secs）而非单次阈值：
+    # 单看「队列非空」会误报（正常排队也有），必须**不动**才算停摆。
+    def _queue_snapshot():
+        # VM 侧 v2 队列长度（在途积压的产能信号）。取不到返回 None（不报警）。
+        # 注意：本 flow 是 CODE 源码字符串，codeflow 编译时会吃掉反斜杠转义
+        # （引号转义与换行转义都会被吞 ⇒ 产物语法错误）。故本函数内**不出现
+        # 任何反斜杠**：单引号/换行一律用 chr() 构造。
+        # 另：远端脚本用 **base64** 传输，彻底绕开「ssh 单引号 + heredoc +
+        # python -c」三层引号互相吃掉的坑（实测 heredoc 形式恒返回空）。
+        import base64 as _b64
+        _SQ = chr(39)
+        _REDIS_PW = "***REMOVED***"
+        _script = (
+            "import redis" + chr(10)
+            + "r = redis.Redis(host=" + _SQ + "127.0.0.1" + _SQ
+            + ", port=6379, db=1, password=" + _SQ + _REDIS_PW + _SQ
+            + ", socket_timeout=8)" + chr(10)
+            + "print(r.xlen(" + _SQ + "plaita:flow:queue:v2" + _SQ + "))" + chr(10)
+        )
+        _enc = _b64.b64encode(_script.encode()).decode()
+        qcmd = ("ssh -o ConnectTimeout=8 tcloud_gz "
+                + _SQ + "echo " + _enc + " | base64 -d | ~/.venvs/issuekeeper/bin/python -"
+                + _SQ + " 2>/dev/null")
+        out = sh(qcmd, timeout=40)
+        lines = [x.strip() for x in (out or "").splitlines() if x.strip()]
+        s = lines[-1] if lines else ""
+        return int(s) if s.isdigit() else None
+
+    qlen_now = _queue_snapshot()
+    # 上次采样（存 duty 目录，供两轮比对；缺失则只记基线，不报警）
+    qprev_path = os.path.join(duty, "ctrl-queue-watch.json")
+    qprev, qprev_at = None, None
+    try:
+        _p = json.load(open(qprev_path))
+        qprev, qprev_at = _p.get("len"), _p.get("at")
+    except Exception:
+        pass
+    try:
+        _fd, _tmp = tempfile.mkstemp(dir=duty, prefix=".tmp-qw-")
+        with os.fdopen(_fd, "w") as _fh:
+            _fh.write(json.dumps({"len": qlen_now, "at": now}))
+        os.replace(_tmp, qprev_path)
+    except Exception:
+        pass
+
     def parse_hm(s):
         try:
             import calendar
@@ -105,13 +159,16 @@ def run(input):
 
     return {"now": now, "a": a, "a_ts": parse_iso((a or {}).get("at") or ""),
             "b": b, "b_ts": parse_hm((b or {}).get("at") or ""),
-            "shadow_age": shadow_age}
+            "shadow_age": shadow_age,
+            "qlen_now": qlen_now, "qlen_prev": qprev, "qlen_prev_at": qprev_at}
 """)
 
     # ── ② triage（纯规则；fail-safe：读不到心跳 = 按最坏报 critical）────────
     triage = CODE(id="triage", lang="python", input={
         "now": NODE.facts.now, "a": NODE.facts.a, "a_ts": NODE.facts.a_ts,
         "b": NODE.facts.b, "b_ts": NODE.facts.b_ts, "shadow_age": NODE.facts.shadow_age,
+        "qlen_now": NODE.facts.qlen_now, "qlen_prev": NODE.facts.qlen_prev,
+        "qlen_prev_at": NODE.facts.qlen_prev_at,
         "a_stale_min": INPUT.a_stale_min, "b_stale_min": INPUT.b_stale_min,
         "shadow_stale_min": INPUT.shadow_stale_min,
     }, code="""
@@ -154,6 +211,26 @@ def run(input):
         f.append({"severity": str(e.get("severity") or "warn"),
                   "summary": "A 班轮%s 报请：%s" % (a.get("round"), str(e.get("summary"))[:200]),
                   "escalate": True})
+
+    # ── 在途空转（产能）判据（2026-10-11 无限交接风暴后补）──────────────────
+    # 心跳全绿 ≠ 工作在推进。本日两台 worker 空转 2h+（队列恒定 6、6 条在途零
+    # 产出），而 A/B/shadow 心跳全健康 ⇒ 本看门狗连报 3 轮「全线正常」。
+    # 判据：**两次采样队列长度都 >0 且完全相同**（相隔 ≥ 一个调度周期）。
+    # 单次非空不算（正常排队也存在）；只有「积压且毫无变化」才是消费侧停摆。
+    # 取不到队列长度（ssh/redis 失败）时**不报**——那是另一类故障，由下方心跳/
+    # shadow 判据覆盖，避免此处误报。
+    qn, qp = input.get("qlen_now"), input.get("qlen_prev")
+    qp_at = input.get("qlen_prev_at")
+    if (isinstance(qn, int) and isinstance(qp, int) and not isinstance(qn, bool)
+            and qn > 0 and qn == qp and isinstance(qp_at, (int, float))):
+        stalled_min = (now - float(qp_at)) / 60.0
+        # 只在与上次采样相隔 ≥20min 时才下结论（避免把「刚记基线」当成停摆）
+        if stalled_min >= 20:
+            f.append({"severity": "critical",
+                      "summary": "队列积压 %d 条且 %.0fmin 毫无变化——消费侧疑似空转"
+                                 "（心跳正常但零推进；查 worker 日志是否有重复"
+                                 "「不亲和」/踢皮球）" % (qn, stalled_min),
+                      "escalate": True})
 
     need = any(x.get("escalate") and x.get("severity") == "critical" for x in f)
     report = "; ".join(x["summary"] for x in f) if f else "全线正常"

@@ -48,6 +48,11 @@
 
 编译：PYTHONPATH=~/projects/infra4agent/plaita:~/projects/infra4agent/plaita-nodes/src \
         python3 flows/build_flows.py inflight-watch
+
+执行宿主纪律（2026-10-11 事故，同 sandbox-watch）：CODE 节点在 VM 上执行
+（plaita-flow-worker / PLAITA_CODE_BACKEND=subprocess），**不得硬编码 Mac 绝对路径**；
+解释器优先 sys.executable（= flow-worker 自己的 venv python，装 e2b），辅助脚本按
+flow 文件相对定位。沙箱清单三态 ok/empty/failed，failed 一律 critical + escalate。
 """
 from __future__ import annotations
 
@@ -65,12 +70,58 @@ def inflight_watch(INPUT):
         "venv_py": INPUT.venv_py, "lister": INPUT.lister,
     }, code="""
 def run(input):
-    import json, subprocess, urllib.request
+    import json, os, shutil, subprocess, sys, urllib.request
 
     HOST = input.get("ssh_host") or "tcloud_gz"
     KEY = input.get("console_key") or "***REMOVED***"
-    VENV = input.get("venv_py") or "/Users/kong/projects/infra4agent/plaita/.venv/bin/python"
-    LISTER = input.get("lister") or "/Users/kong/projects/infra4agent/issue-keeper/flows/ags-list.py"
+
+    # ── 解释器/脚本路径便携解析（2026-10-11 同 sandbox-watch 事故）────────
+    # 本节点同样在 VM 上执行（plaita-flow-worker / PLAITA_CODE_BACKEND=subprocess），
+    # Mac 专属 /Users/kong/... 在 VM 上不存在 ⇒ lister 起不来 ⇒ 沙箱成本线索恒空。
+    # 顺序：显式 venv_py → sys.executable（CODE 节点 subprocess 后端 == flow-worker
+    # 自己的 venv python，VM 上 ~/.venvs/issuekeeper/bin/python，装 e2b）→
+    # <repo>/.venv → <flows>/.venv → env → which("python3")。
+    def _root(path, marker="flows", limit=4):
+        d = os.path.dirname(os.path.abspath(path))
+        for _ in range(limit):
+            if os.path.isdir(os.path.join(d, marker)):
+                return d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+        return ""
+
+    def _pick_py(explicit):
+        # ⚠️ 本函数在 3 处逐字复制：sandbox_watch_flow.py 的 facts + act、
+        # inflight_watch_flow.py 的 facts。CODE 节点的 code 是**自包含源码字符串**
+        # （编译进 .flow.json，各节点独立 subprocess 执行），无法 import 复用——
+        # 故只能靠"逐字一致 + 本标注"防漂移。**改任何一处必须同步三处**，
+        # 否则解释器解析会按节点静默分叉（2026-10-11 验收：act 那份曾漏 AGS_LISTER_PY）。
+        for c in [explicit, sys.executable,
+                  os.path.join(ROOT, ".venv", "bin", "python") if ROOT else "",
+                  os.path.join(FLOW_DIR, ".venv", "bin", "python"),
+                  os.environ.get("AGS_LISTER_PY"), os.environ.get("ISSUEKEEPER_PY"),
+                  shutil.which("python3")]:
+            c = str(c or "").strip()
+            if c and os.path.exists(c) and os.access(c, os.X_OK):
+                return c
+        return str(explicit or sys.executable or "python3")
+
+    def _pick_script(explicit, name):
+        for c in [str(explicit or "").strip(), os.path.join(FLOW_DIR, name),
+                  os.path.join(ROOT, "flows", name) if ROOT else "",
+                  os.path.join(os.getcwd(), "flows", name)]:
+            if c and os.path.exists(c):
+                return c
+        return os.path.join(FLOW_DIR, name)
+
+    _frame = __file__ if "__file__" in dir() else ""
+    FLOW_DIR = os.path.dirname(os.path.abspath(
+        _frame or os.path.join(os.getcwd(), "flows", "inflight_watch_flow.py")))
+    ROOT = _root(FLOW_DIR)
+    VENV = _pick_py(input.get("venv_py"))
+    LISTER = _pick_script(input.get("lister"), "ags-list.py")
 
     remote = r'''
 import json, os, time
@@ -198,22 +249,50 @@ print(json.dumps(rows, ensure_ascii=False))
         elif err:
             it["last_error"] = str(err)[:200]
 
-    sbx = []
+    # 沙箱线索三态（与 sandbox-watch 同判据）：ok / empty / failed。
+    # 旧实现 `except Exception: pass` + 只读 stdout，把"非零退出/超时/解释器缺失"
+    # 一律折叠成 sbx=[]，"没有实例"与"查不到"不可区分（假阴性）。
+    sbx, sbx_state, sbx_detail = [], "ok", ""
     try:
-        r2 = subprocess.run(
-            "E2B_DOMAIN=ap-guangzhou.tencentags.com "
-            "E2B_API_KEY=***REMOVED*** %s %s" % (VENV, LISTER),
-            shell=True, capture_output=True, text=True, timeout=90)
-        sbx = json.loads((r2.stdout or "[]").strip() or "[]")
-    except Exception:
-        pass
-    return {"rows": rows, "instances": sbx, "error": None}
+        envv = dict(os.environ)
+        envv.setdefault("E2B_DOMAIN", "ap-guangzhou.tencentags.com")
+        envv.setdefault("E2B_API_KEY", "***REMOVED***")
+        r2 = subprocess.run([VENV, LISTER], capture_output=True, text=True,
+                            timeout=90, env=envv)
+        if r2.returncode != 0:
+            sbx_state = "failed"
+            sbx_detail = "lister 退出码 %d | stderr: %s" % (
+                r2.returncode, (r2.stderr or "").strip()[-400:])
+        elif not (r2.stdout or "").strip():
+            sbx_state = "failed"
+            sbx_detail = "lister 退出码 0 但 stdout 为空（无 JSON 可解析）"
+        else:
+            try:
+                sbx = json.loads((r2.stdout or "").strip())
+                if not isinstance(sbx, list):
+                    raise ValueError("顶层不是数组")
+            except Exception as e:
+                sbx, sbx_state = [], "failed"
+                sbx_detail = "JSON 解析失败（%s）| stdout[:200]=%r" % (
+                    str(e)[:120], (r2.stdout or "")[:200])
+    except subprocess.TimeoutExpired:
+        sbx_state, sbx_detail = "failed", "lister 超时 90s 未返回"
+    except Exception as e:
+        sbx_state, sbx_detail = "failed", "%s: %s" % (type(e).__name__, str(e)[:200])
+    if sbx_state == "ok" and not sbx:
+        sbx_state = "empty"      # 合法的"当前无运行中实例"
+    # 解释器/lister 一并回报：失败 finding 要能直接指出是哪个路径没起来
+    return {"rows": rows, "instances": sbx, "error": None,
+            "sandbox_state": sbx_state, "sandbox_detail": sbx_detail,
+            "interpreter": VENV, "lister": LISTER}
 """)
 
     # ── ② triage（三类规则 + 找可救的 stalled + 双 120 死档）────────────
     triage = CODE(id="triage", lang="python", input={
         "rows": NODE.facts.rows, "instances": NODE.facts.instances,
-        "error": NODE.facts.error,
+        "error": NODE.facts.error, "sandbox_state": NODE.facts.sandbox_state,
+        "sandbox_detail": NODE.facts.sandbox_detail,
+        "interpreter": NODE.facts.interpreter, "lister": NODE.facts.lister,
         "stall_min": INPUT.stall_min, "hard_min": INPUT.hard_min, "long_min": INPUT.long_min,
         "terminal_lag_min": INPUT.terminal_lag_min, "dead_min": INPUT.dead_min,
     }, code="""
@@ -221,6 +300,12 @@ def run(input):
     TERMINAL = {"completed", "failed", "cancelled", "error"}
     rows = input.get("rows") or []
     inst = input.get("instances") or []
+    # 沙箱清单三态（2026-10-11 判据硬化）：ok / empty（合法无实例）/ failed。
+    # failed 一律 critical + escalate——沙箱成本线索查不到时不能装作"没有孤儿"。
+    sbx_state = str(input.get("sandbox_state")
+                    or ("failed" if input.get("error") else "ok"))
+    if sbx_state not in ("ok", "empty", "failed"):
+        sbx_state = "failed"
     stall = float(input.get("stall_min") or 30)
     hard = float(input.get("hard_min") or 45)
     long_min = float(input.get("long_min") or 180)
@@ -308,6 +393,18 @@ def run(input):
     if input.get("error"):
         findings.append({"severity": "critical", "summary": str(input.get("error"))[:160],
                          "escalate": True})
+    if sbx_state == "failed":
+        # escalate: true —— 沙箱线索连续失败必须出声（同 sandbox-watch 事故教训）
+        findings.append({"severity": "critical", "source": "sandbox-lister",
+                         "summary": "沙箱实例清单获取失败（孤儿/成本线索缺失）：%s"
+                                    "｜解释器=%s ｜lister=%s"
+                                    % (str(input.get("sandbox_detail"))[:200],
+                                       input.get("interpreter") or "?", input.get("lister") or "?"),
+                         "escalate": True,
+                         "evidence": {"state": sbx_state,
+                                      "interpreter": input.get("interpreter"),
+                                      "lister": input.get("lister"),
+                                      "detail": str(input.get("sandbox_detail"))[:400]}})
 
     # 沙箱成本线索：终态执行却仍有活实例（孤儿），提示 sweep
     alive = {str(i.get("exec") or ""): i for i in inst if i.get("exec")}
@@ -319,10 +416,13 @@ def run(input):
                                         % ("%s#%s" % (it.get("repo"), it.get("num")),
                                            i2.get("short"), i2.get("age_h")),
                              "escalate": False})
+    # 报告三态 truthful：清单失败必须在轮报里显形（不能悄悄退化成"在途 N（…0）"）
     report = "在途 %d（终态滞后 %d / 零进展 %d / 双120死档 %d）" % (
         len(rows), len(terminal_lag), len(stalled), len(dead_rows))
+    if sbx_state == "failed":
+        report += " ｜ 沙箱清单失败：%s" % str(input.get("sandbox_detail"))[:80]
     return {"findings": findings, "stalled": stalled, "terminal_lag": terminal_lag,
-            "hard_dead": dead_rows, "report": report, "rows": rows}
+            "hard_dead": dead_rows, "report": report, "rows": rows, "sandbox_state": sbx_state}
 """)
 
     # ── ③ act（两阶梯，全为 authorized 机械动作）────────────────────────
