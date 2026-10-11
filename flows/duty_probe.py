@@ -30,9 +30,38 @@ import time
 import urllib.request
 
 CONSOLE = "http://127.0.0.1:8323"
-KEY = os.environ.get("PLAITA_CONSOLE_ADMIN_API_KEY") or __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
-REQ_DIR = pathlib.Path("~/.issue-keeper/duty/requests").expanduser()
+def _resolve_console_key() -> str:
+    """console admin key 解析：env → `~/.issue-keeper/env.sh` → `~/.plaita-console/env.sh`。
+
+    **为什么不能只读 env**（2026-10-12 实测）：key 实际写在
+    `~/.issue-keeper/env.sh`，要靠调用方先 `source` 才进环境。任何忘了 source
+    的调用（值守轮次、cron、手跑）都会拿到空 key ⇒ console 返 **401**，而
+    探针把它渲染成「产出**不可读**」——**看起来像系统故障，实为调用姿势问题**，
+    极易误导排查方向（本日即为此绕了一圈）。
+
+    故此处自带兜底：env 缺失时直接从 env.sh 解析，**不要求调用方记得 source**。
+    """
+    v = (os.environ.get("PLAITA_CONSOLE_ADMIN_API_KEY") or "").strip()
+    if v:
+        return v
+    for cand in (IK / ".issue-keeper" / "env.sh",
+                 pathlib.Path("~/.plaita-console/env.sh").expanduser()):
+        try:
+            for line in cand.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line.startswith("export PLAITA_CONSOLE_ADMIN_API_KEY"):
+                    continue
+                raw = line.split("=", 1)[1].strip().strip('"').strip("'")
+                if raw:
+                    return raw
+        except Exception:
+            continue
+    return ""
+
+
 IK = pathlib.Path("~/projects/infra4agent/issue-keeper").expanduser()
+KEY = _resolve_console_key()
+REQ_DIR = pathlib.Path("~/.issue-keeper/duty/requests").expanduser()
 FLOWS = ("self-improve-v2", "self-improve-v2-sbx")
 # 终态标志：落到基线的成功路径 vs 被 preflight 挡回
 LANDED_MARK = ("ok_eq_true", "_n14")
