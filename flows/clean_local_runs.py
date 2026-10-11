@@ -178,6 +178,51 @@ def main() -> int:
             except OSError as e:
                 print("warn: 跳过 %s: %s" % (sp, str(e)[:80]), file=sys.stderr)
 
+    # ── 主仓构建缓存 `<repo>/target`（2026-10-12 加，/tmp 类被管住后的新增长点）──
+    # 现象：/tmp 验证目录遗留已被本脚本管住后，VM 的新增长点换成 **主仓 target/**
+    # （实测 `recursive/target` 6.8G，内容仅 CACHEDIR.TAG/debug/tmp = 可重建的
+    # 构建产物）。
+    # 判据与上面完全同款（**双条件**）：mtime 陈旧（> keep_hours）+ **无进程持有**
+    # （lsof 计数为 0；探测失败保守跳过）——缺一即会打断正在跑的 cargo/rustc。
+    # 只清**一级** `<repo>/target`，不递归（避免误伤 runs 内的 worktree target，
+    # 那些随 run 目录整体回收）。
+    if ROOT.is_dir():
+        for base in sorted(ROOT.iterdir()):
+            tgt = base / "target"
+            if not tgt.is_dir():
+                continue
+            sp = str(tgt)
+            if any(bad in sp for bad in FORBID):
+                continue
+            try:
+                if tgt.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            out["scanned"] += 1
+            try:
+                held = _sp.run(["lsof", "-w", "+D", sp], capture_output=True,
+                               text=True, timeout=30).stdout.strip()
+            except Exception:
+                held = "unknown"
+            if held:
+                out.setdefault("tmp_skipped_busy", []).append(base.name + "/target")
+                continue
+            sz = _dir_size(tgt)
+            if args.dry_run:
+                out["removed"] += 1
+                out["freed_gib"] = round(out["freed_gib"] + sz / 2 ** 30, 2)
+                out["removed_dirs"].append(base.name + "/target")
+                continue
+            try:
+                shutil.rmtree(tgt)
+                out["removed"] += 1
+                out["freed_gib"] = round(out["freed_gib"] + sz / 2 ** 30, 2)
+                if len(out["removed_dirs"]) < 20:
+                    out["removed_dirs"].append(base.name + "/target")
+            except OSError as e:
+                print("warn: 跳过 %s: %s" % (sp, str(e)[:80]), file=sys.stderr)
+
     out["free_after"] = round(_free_gib(), 1)
     print(json.dumps(out, ensure_ascii=False))
     return 0
