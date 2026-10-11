@@ -459,8 +459,15 @@ def main() -> int:
     if rs["active"]:
         ordinal_hint = "（全为第 1/5 → 疑 #73 预算键被清零）" if set(rs["ordinals"]) <= {"1"} else ""
         level = max(level, "DEGRADED", key=["OK", "DEGRADED", "BLOCKED"].index)
-        reasons.append("重投风暴进行中：执行 %s 近 %dmin 重投 %d 次、近 10min %d 次%s"
-                       % (rs["worst_exec"], rs["window_min"], rs["worst_count"], rs["recent10"], ordinal_hint))
+        # 文案必须点名**仍在跑的那个**执行，而不是「重投次数最多的那个」。
+        # 二者常常不同：最多的那个可能**已终态**（重投收敛了），真正卡住的是
+        # 另一个仍在 running 的。2026-10-11 实测踩到——告警说 54800b1b 在风暴中，
+        # 而它 08:39 已 completed，真正活着的是 77228014 ⇒ 排查时被误导。
+        _alive_txt = "、".join(rs.get("alive_execs") or []) or "（none）"
+        reasons.append("重投风暴进行中：仍存活 %s；计数最多者为 %s（近 %dmin %d 次、"
+                       "近 10min %d 次%s）"
+                       % (_alive_txt, rs["worst_exec"], rs["window_min"],
+                          rs["worst_count"], rs["recent10"], ordinal_hint))
 
     verdict = {"level": level, "reasons": reasons, "tickets": tk, "throughput": tp,
                "disk": dk, "sandbox": sb, "retry_storm": rs}
