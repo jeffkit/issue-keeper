@@ -143,10 +143,26 @@ def run(input):
                          "escalate": True})
     need_clean = ((free is not None and free < mn + margin)
                   or (lfree is not None and lfree < mn + margin))
-    report = "VM %.1fGiB / Mac %sGiB（阈值 %.0f）· 挡单 %d · worktree VM%d/Mac%s" % (
-        free if free is not None else -1, lfree if lfree is not None else "?",
-        mn, len(disk_blocked), input.get("n_runs") or 0,
-        input.get("local_n_runs") if input.get("local_n_runs") is not None else "?")
+    # ⚠️ 「读不到」**不能**渲染成数值（2026-10-12 实测事故）：原实现 VM 侧用
+    # `free if free is not None else -1`，于是 **ssh 超时/采集失败**会产出
+    #   「[磁盘] VM -1.0GiB …」——**看起来是「磁盘负值 = 已满」**，
+    # 触发最紧急的那一档响应，而实测 VM 有 22GiB（采集失败而已）。
+    # 本工单的 findings 里其实写明了 `ssh/state 读取失败: … timed out`，
+    # 但**标题**先入为主把人引偏。Mac 侧原本用 `"?"` 是对的——统一成 `"?"`，
+    # 并在标题里显式标注 **UNKNOWN**，让「读不到」永远不与「读数低」混淆。
+    _vm_s = "%.1f" % free if free is not None else "?"
+    if free is None:
+        report = ("VM **UNKNOWN**（采集失败，非磁盘满） / Mac %sGiB（阈值 %.0f）"
+                  "· 挡单 %d · worktree VM%s/Mac%s" % (
+                      lfree if lfree is not None else "?",
+                      mn, len(disk_blocked),
+                      input.get("n_runs") if input.get("n_runs") is not None else "?",
+                      input.get("local_n_runs") if input.get("local_n_runs") is not None else "?"))
+    else:
+        report = "VM %sGiB / Mac %sGiB（阈值 %.0f）· 挡单 %d · worktree VM%d/Mac%s" % (
+            _vm_s, lfree if lfree is not None else "?",
+            mn, len(disk_blocked), input.get("n_runs") or 0,
+            input.get("local_n_runs") if input.get("local_n_runs") is not None else "?")
     return {"findings": findings, "need_clean": need_clean, "disk_blocked": disk_blocked,
             "report": report}
 """)
