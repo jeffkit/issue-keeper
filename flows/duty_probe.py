@@ -30,7 +30,7 @@ import time
 import urllib.request
 
 CONSOLE = "http://127.0.0.1:8323"
-KEY = os.environ.get("PLAITA_CONSOLE_ADMIN_API_KEY") or "***REMOVED***"
+KEY = os.environ.get("PLAITA_CONSOLE_ADMIN_API_KEY") or __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
 REQ_DIR = pathlib.Path("~/.issue-keeper/duty/requests").expanduser()
 IK = pathlib.Path("~/projects/infra4agent/issue-keeper").expanduser()
 FLOWS = ("self-improve-v2", "self-improve-v2-sbx")
@@ -194,7 +194,7 @@ def probe_sandbox() -> dict:
     """沙箱浪费：实例 exist 但执行已终态（孤儿）或 paused 且无活跃执行。"""
     out = {"instances": 0, "orphans": 0, "paused_idle": 0, "waste_instance_hours": 0.0, "detail": []}
     env = dict(os.environ, E2B_DOMAIN="ap-guangzhou.tencentags.com",
-               E2B_API_KEY=os.environ.get("E2B_API_KEY", "***REMOVED***"))
+               E2B_API_KEY=os.environ.get("E2B_API_KEY", __import__("os").environ.get("E2B_API_KEY", "")))
     py = str(IK.parent / "plaita/.venv/bin/python")
     try:
         r = subprocess.run([py, str(IK / "flows/ags-list.py")], capture_output=True, text=True,
@@ -278,7 +278,7 @@ def probe_worker_skew() -> dict:
         import redis as _redis
 
         r = _redis.Redis(host="127.0.0.1", port=16379,
-                         password="***REMOVED***",
+                         password=__import__("os").environ.get("PLAITA_REDIS_PASSWORD", ""),
                          db=1, decode_responses=True, socket_timeout=10)
         stale = []
         for key in r.scan_iter("plaita:registry:flow_worker:*", count=100):

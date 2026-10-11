@@ -16,9 +16,9 @@ import sys
 import urllib.request
 
 E2B_DOMAIN = "ap-guangzhou.tencentags.com"
-E2B_API_KEY = "***REMOVED***"
+E2B_API_KEY = __import__("os").environ.get("E2B_API_KEY", "")
 CONSOLE = "http://127.0.0.1:8323/api"
-CONSOLE_KEY = "***REMOVED***"
+CONSOLE_KEY = __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
 TERMINAL = {"completed", "failed", "cancelled", "error"}
 
 

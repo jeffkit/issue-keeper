@@ -58,7 +58,7 @@ def run(input):
         disp = {"raw_head": shadow[:300]}
 
     q = sh("ssh -o ConnectTimeout=8 tcloud_gz "
-           "'docker exec langfuse-v4-redis-1 redis-cli -a ***REMOVED*** -n 1 "
+           "'docker exec langfuse-v4-redis-1 redis-cli -n 1 "
            "--no-auth-warning XINFO GROUPS plaita:flow:queue:ctrl'")[:400]
 
     return {"df_remote": df_remote, "keeper_err_tail": keeper_err,

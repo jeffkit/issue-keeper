@@ -10,7 +10,7 @@
 #   5. 僵尸锚：in_flight_since > 125min 计数（keeper 僵尸线 2h 应收）
 # 日志：stdout + ~/.issue-keeper/duty/nightwatch-20261009.log
 LOG=~/.issue-keeper/duty/nightwatch-20261009.log
-KEY="***REMOVED***"
+KEY="${PLAITA_CONSOLE_ADMIN_API_KEY:?set in env, see ~/.plaita-console/env.sh}"
 say() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG"; }
 
 say "=== 夜间看护启动（窗口至 02:50）==="

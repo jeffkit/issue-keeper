@@ -108,7 +108,7 @@ def run(input):
         # python -c」三层引号互相吃掉的坑（实测 heredoc 形式恒返回空）。
         import base64 as _b64
         _SQ = chr(39)
-        _REDIS_PW = "***REMOVED***"
+        _REDIS_PW = __import__("os").environ.get("PLAITA_REDIS_PASSWORD", "")
         _script = (
             "import redis" + chr(10)
             + "r = redis.Redis(host=" + _SQ + "127.0.0.1" + _SQ

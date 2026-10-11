@@ -55,9 +55,9 @@ inflight-resume.json       在途巡检账本：`resumed`（每个执行只自�
 
 ## plaita console / 队列
 
-- API：`http://127.0.0.1:8323/api/{flows,executions,schedules}`，头 `X-Admin-API-Key: ***REMOVED***`。
+- API：`http://127.0.0.1:8323/api/{flows,executions,schedules}`，头 `X-Admin-API-Key: ${PLAITA_CONSOLE_ADMIN_API_KEY}`。
 - 发布：`PUT /flows/<id>/versions/<v>`（体 `{definition: "<JSON 字符串>", layout:"{}", created_by:"jeffkit"}`）→ `POST /flows/<id>/publish {"version":"<v>"}`。
-- 队列（Redis db1，密码 `***REMOVED***`，Mac 隧道 `127.0.0.1:16379`）：
+- 队列（Redis db1，密码 `${PLAITA_REDIS_PASSWORD}`，Mac 隧道 `127.0.0.1:16379`）：
   `plaita:flow:queue:v2`（执行：Mac 3 + VM 1）、`plaita:flow:queue:ctrl`（值守：Mac 1）。
 - 执行详情：`GET /api/executions/<eid>`（**时间戳是本地 naive，别当 UTC**）；`resume`/`cancel` 见 toolbox。
 

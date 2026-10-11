@@ -113,12 +113,12 @@ def run(input):
     ROOT = _root(FLOW_DIR)
     VENV = _pick_py(input.get("venv_py"))
     LISTER = _pick_script(input.get("lister"), "ags-list.py")
-    KEY = input.get("console_key") or "***REMOVED***"
+    KEY = input.get("console_key") or __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
     # 环境由父进程白名单传递（subprocess 后端的 env 白名单），这里按需补齐，
     # 不再依赖 shell 前缀赋值（cmd 走 argv 列表，不经 shell）。
     ENVV = dict(os.environ)
     ENVV.setdefault("E2B_DOMAIN", "ap-guangzhou.tencentags.com")
-    ENVV.setdefault("E2B_API_KEY", "***REMOVED***")
+    ENVV.setdefault("E2B_API_KEY", __import__("os").environ.get("E2B_API_KEY", ""))
 
     def sh(argv, timeout=60):
         # 返回 (returncode, stdout, stderr, why)：**绝不吞 stderr**——旧实现把非零

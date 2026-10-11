@@ -73,7 +73,7 @@ def run(input):
     import json, os, shutil, subprocess, sys, urllib.request
 
     HOST = input.get("ssh_host") or "tcloud_gz"
-    KEY = input.get("console_key") or "***REMOVED***"
+    KEY = input.get("console_key") or __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
 
     # ── 解释器/脚本路径便携解析（2026-10-11 同 sandbox-watch 事故）────────
     # 本节点同样在 VM 上执行（plaita-flow-worker / PLAITA_CODE_BACKEND=subprocess），
@@ -256,7 +256,7 @@ print(json.dumps(rows, ensure_ascii=False))
     try:
         envv = dict(os.environ)
         envv.setdefault("E2B_DOMAIN", "ap-guangzhou.tencentags.com")
-        envv.setdefault("E2B_API_KEY", "***REMOVED***")
+        envv.setdefault("E2B_API_KEY", __import__("os").environ.get("E2B_API_KEY", ""))
         r2 = subprocess.run([VENV, LISTER], capture_output=True, text=True,
                             timeout=90, env=envv)
         if r2.returncode != 0:
@@ -439,7 +439,7 @@ def run(input):
 def run(input):
     import json, os, subprocess, time, urllib.request, fcntl
 
-    KEY = input.get("console_key") or "***REMOVED***"
+    KEY = input.get("console_key") or __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
     HOST = input.get("ssh_host") or "tcloud_gz"
     # keeper 真值机（VM）的配方，与 playbook/toolbox 的手工处置逐字对齐
     VM = {"py": "/home/ubuntu/.venvs/issuekeeper/bin/python",
@@ -601,7 +601,7 @@ print(json.dumps({"rc": r.returncode, "out": (r.stdout or "")[-400:].strip(),
                 try:
                     os.environ.setdefault("E2B_DOMAIN", "ap-guangzhou.tencentags.com")
                     os.environ.setdefault(
-                        "E2B_API_KEY", "***REMOVED***")
+                        "E2B_API_KEY", __import__("os").environ.get("E2B_API_KEY", ""))
                     from e2b import Sandbox
                     steps["sandbox"] = bool(Sandbox.kill(str(i2["id"])))
                 except Exception as e:

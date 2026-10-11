@@ -1,6 +1,6 @@
 # 工具与端点速查
 
-变量：`KEY=***REMOVED***`（console admin key）、
+变量：`KEY=${PLAITA_CONSOLE_ADMIN_API_KEY}`（console admin key）、
 `IK=~/projects/infra4agent/issue-keeper`、`PY=~/.venvs/issuekeeper/bin/python`（在 VM 上；Mac 上用系统 python3 即可跑 flows 脚本）。
 
 ## 工单（我的收件箱）
@@ -68,7 +68,7 @@ python3 -c "import json;st=json.load(open('/home/ubuntu/.issue-keeper/state.json
 ## 沙箱（AGS）
 
 ```bash
-export E2B_DOMAIN=ap-guangzhou.tencentags.com E2B_API_KEY=***REMOVED***
+export E2B_DOMAIN=ap-guangzhou.tencentags.com E2B_API_KEY=${E2B_API_KEY}
 /Users/kong/projects/infra4agent/plaita/.venv/bin/python $IK/flows/ags-list.py      # 实例清单（JSON）
 /Users/kong/projects/infra4agent/plaita/.venv/bin/python $IK/flows/ags-orphan-sweep.py --min-age 0.5
 # 杀单个：plaita/.venv/bin/python -c "from e2b import Sandbox; print(Sandbox.kill('<完整 sandbox_id>'))"

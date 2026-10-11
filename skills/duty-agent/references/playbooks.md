@@ -34,7 +34,7 @@ keeper reaper 是**轮询制**，1-3 分钟延迟正常。**>10 分钟**才报�
 ## 3. AGS 沙箱实例（成本）
 
 ```bash
-export E2B_DOMAIN=ap-guangzhou.tencentags.com E2B_API_KEY=***REMOVED***
+export E2B_DOMAIN=ap-guangzhou.tencentags.com E2B_API_KEY=${E2B_API_KEY}
 /Users/kong/projects/infra4agent/plaita/.venv/bin/python ~/projects/infra4agent/issue-keeper/flows/ags-list.py
 # 杀：Sandbox.kill(<完整 sandbox_id>)  ← 必须完整 ID（截断会 404）
 ```

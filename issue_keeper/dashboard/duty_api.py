@@ -29,10 +29,10 @@ DUTY_DIR = Path("~/.issue-keeper/duty").expanduser()
 CONTROLLER_DIR = Path("~/.issue-keeper/pipeline/controller").expanduser()
 PLAITA_VENV_PY = "/Users/kong/projects/infra4agent/plaita/.venv/bin/python"
 CONSOLE = "http://127.0.0.1:8323/api"
-CONSOLE_KEY = "***REMOVED***"
+CONSOLE_KEY = __import__("os").environ.get("PLAITA_CONSOLE_ADMIN_API_KEY", "")
 E2B_ENV = {
     "E2B_DOMAIN": "ap-guangzhou.tencentags.com",
-    "E2B_API_KEY": "***REMOVED***",
+    "E2B_API_KEY": __import__("os").environ.get("E2B_API_KEY", ""),
 }
 
 _CACHE: dict[str, tuple[float, Any]] = {}
@@ -128,7 +128,7 @@ def _vm_facts() -> dict:
         "echo SCHED=$(systemctl is-active plaita-schedule-service 2>/dev/null);"
         "echo KEEPER=$(systemctl is-active issue-keeper-worker 2>/dev/null);"
         "echo DISK=$(df -h / | tail -1 | awk \"{print \\$4}\");"
-        "echo DLQ=$(docker exec langfuse-v4-redis-1 redis-cli -a ***REMOVED*** "
+        "echo DLQ=$(docker exec langfuse-v4-redis-1 redis-cli "
         "-n 1 --no-auth-warning XLEN plaita:flow:queue:ctrl:dlq 2>/dev/null);"
         "'",
         timeout=30,
