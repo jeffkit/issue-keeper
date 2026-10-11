@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import json
 import os
 import pathlib
@@ -46,6 +47,22 @@ def _dir_size(path: pathlib.Path) -> int:
             except OSError:
                 pass
     return total
+
+
+#: /tmp 下验证临时目录的命名模式（验证类 agent 自行 clone+构建的产物）。
+#: 只匹配这三类**明确是验证副产物**的名字，避免误伤无关的 /tmp 内容。
+TMP_PATTERNS = [
+    re.compile(r"^i\d+-target$"),      # i173-target
+    re.compile(r"^verify\d+.*$"),      # verify173 / verify184
+    re.compile(r"^wt\d+.*$"),          # wt176 / wt183
+    re.compile(r"^v\d+(-target)?$"),   # v3 / v183
+    re.compile(r"^issue\d+-verify$"),  # issue173-verify
+]
+
+
+def tmp_enabled() -> bool:
+    """清 /tmp 验证目录的开关（默认开；`CLEAN_TMP=0` 关闭便于回滚）。"""
+    return os.environ.get("CLEAN_TMP", "1") not in ("0", "false", "no")
 
 
 def main() -> int:
@@ -88,6 +105,57 @@ def main() -> int:
                 if p.stat().st_mtime >= cutoff:
                     continue
             except OSError:
+                continue
+            sz = _dir_size(p)
+            if args.dry_run:
+                out["removed"] += 1
+                out["freed_gib"] = round(out["freed_gib"] + sz / 2 ** 30, 2)
+                out["removed_dirs"].append(p.name)
+                continue
+            try:
+                shutil.rmtree(p)
+                out["removed"] += 1
+                out["freed_gib"] = round(out["freed_gib"] + sz / 2 ** 30, 2)
+                if len(out["removed_dirs"]) < 20:
+                    out["removed_dirs"].append(p.name)
+            except OSError as e:
+                print("warn: 跳过 %s: %s" % (sp, str(e)[:80]), file=sys.stderr)
+
+    # ── /tmp 验证临时目录（2026-10-12 加，连续六轮磁盘告警的根因）──────
+    # 现象：VM 反复在 40min~1h 内被顶到守卫线以下，甚至「挡单」。
+    # 定位：验证类 agent（`agentproc → claude → bash → timeout → cargo → rustc`）
+    # 自行在 /tmp 下 clone+构建，命名形如 `i<NNN>-target` / `verify<NNN>` /
+    # `wt<NNN>`；**任务结束即遗留且无回收**，单个可占 6G+。
+    #
+    # ⚠️ 必须**双条件**，缺一即会误杀在途构建（本轮实测反例：/tmp/i181
+    # 6.2G 且 30s 内仍 +5M，删它会打断正在跑的 cargo/rustc）：
+    #   ① mtime 陈旧（>keep_hours，默认 24h）；
+    #   ② **无进程持有**（lsof 计数为 0）。
+    # 只在空间闸触发时执行（与上方 runs 清理同一门槛），平时不做无谓扫描。
+    if tmp_enabled():
+        import subprocess as _sp
+        for p in sorted(pathlib.Path("/tmp").glob("*")):
+            if not p.is_dir():
+                continue
+            if not any(pat.match(p.name) for pat in TMP_PATTERNS):
+                continue
+            sp = str(p)
+            if any(bad in sp for bad in FORBID):
+                continue
+            try:
+                if p.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            out["scanned"] += 1
+            # ② 无进程持有：lsof 有输出即跳过（保守，宁可漏清不可误杀）
+            try:
+                held = _sp.run(["lsof", "-w", "+D", sp], capture_output=True,
+                               text=True, timeout=30).stdout.strip()
+            except Exception:
+                held = "unknown"          # 探测失败 ⇒ 保守跳过
+            if held:
+                out.setdefault("tmp_skipped_busy", []).append(p.name)
                 continue
             sz = _dir_size(p)
             if args.dry_run:
