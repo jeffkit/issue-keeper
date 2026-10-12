@@ -21,16 +21,30 @@ JSON=0
 issues=()
 note() { issues+=("$1"); }
 
+# ⚠ 坑（2026-10-13 实测）：`launchctl list` 在受限/沙箱环境下**返回 0 行**，
+# 而 job 其实好好地加载着（`launchctl print` 有 49 行输出）。
+# 若用 `launchctl list` 判活，会**误报 WATCHER_DOWN / SWEEP_DOWN** ——
+# 监控脚本自己说谎，正是本会话反复撞见的"静默的坏"。
+# 改用 `launchctl print gui/<uid>/<label>`：能取到输出即视为已加载。
+job_loaded() {  # $1=label
+    launchctl print "gui/$(id -u)/$1" >/dev/null 2>&1
+}
+
+# 取 job 的最近退出码（从 print 输出里解析 last exit code；取不到则回显 "-"）
+job_last_rc() {  # $1=label
+    launchctl print "gui/$(id -u)/$1" 2>/dev/null \
+        | awk -F'= ' '/last exit code/{gsub(/[^0-9-]/,"",$2); print $2; found=1; exit} END{if(!found) print "-"}'
+}
+
 # ── 1. watcher 是否还活着（核心：静默≠健康）─────────────────────────────
 wt_log="$HOME/.plaita-console/delivery-watch.log"
-wt_stat=$(launchctl list 2>/dev/null | awk '$3=="cc.agentstudio.delivery-watch"{print $1" "$2}')
-if [[ -z "$wt_stat" ]]; then
+if ! job_loaded cc.agentstudio.delivery-watch; then
     note "WATCHER_DOWN: cc.agentstudio.delivery-watch 未加载 —— 交付检测**已失效**"
 else
-    wt_rc="${wt_stat##* }"
+    wt_rc="$(job_last_rc cc.agentstudio.delivery-watch)"
     # 退出码 10=无变化、0=有变化 都正常；其它（如 78=找不到 gh）是配置故障
     case "$wt_rc" in
-        0|10) ;;
+        ""|-|0|10) ;;
         *) note "WATCHER_ERR: delivery-watch 退出码 $wt_rc（78=找不到 gh？）" ;;
     esac
     # 日志有内容说明检测到过变化，值得看一眼
@@ -40,12 +54,14 @@ else
 fi
 
 # ── 2. 我负责的运维任务健康（曾静默死 14h 的那个）──────────────────────
-sw_stat=$(launchctl list 2>/dev/null | awk '$3=="cc.agentstudio.ags-orphan-sweep"{print $1" "$2}')
-if [[ -z "$sw_stat" ]]; then
+if ! job_loaded cc.agentstudio.ags-orphan-sweep; then
     note "SWEEP_DOWN: ags-orphan-sweep 未加载"
 else
-    sw_rc="${sw_stat##* }"
-    [[ "$sw_rc" != "0" ]] && note "SWEEP_ERR: ags-orphan-sweep 退出码 $sw_rc"
+    sw_rc="$(job_last_rc cc.agentstudio.ags-orphan-sweep)"
+    case "$sw_rc" in
+        ""|-|0) ;;
+        *) note "SWEEP_ERR: ags-orphan-sweep 退出码 $sw_rc" ;;
+    esac
 fi
 
 # ── 3. main 漂移（有没有我不知道的提交）────────────────────────────────
