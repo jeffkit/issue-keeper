@@ -89,6 +89,31 @@ if [[ -x "$SCRIPT_DIR/../scripts/lint-shell-cjk-vars.sh" ]]; then
     fi
 fi
 
+# ── 2c. 队列/DLQ 只读观测（**绝不 purge** —— 用户铁律）───────────────────
+# ⚠ key 名必须准确：实测存在 `plaita:flow:queue:v2:dlq`（真 DLQ，224 条）
+# 与 `plaita:flow:queue:ctrl:dlq`（控制面，1 条）两个**不同**的 DLQ；
+# 而 `plaita:flow:queue:dlq` **根本不存在**（`TYPE` 返回 none）。
+# 我自己曾用错 key 得出"DLQ 从 224 清零"的**假警报** —— 故 key 硬编码在此并注明。
+# 本项只做**观测**：DLQ 增长说明消费端在丢消息。
+# **任何情况下都不清除**（铁律：恒不 purge DLQ）。
+RCLI="${PATROL_REDIS_CLI:-redis-cli}"
+RPORT="${PATROL_REDIS_PORT:-16379}"
+RPASS="${PATROL_REDIS_PASS:-c2f9036c06e32474b39e291f1af50b274d2b1defa461084a}"
+rlen() { "$RCLI" -h 127.0.0.1 -p "$RPORT" -a "$RPASS" -n 1 --no-auth-warning XLEN "$1" 2>/dev/null; }
+if command -v "$RCLI" >/dev/null 2>&1; then
+    d="$(rlen "plaita:flow:queue:v2:dlq")"
+    if [[ -n "$d" ]]; then
+        # 只报**增长**（首次跑记基线），避免每轮重复报历史存量——否则又是一次警报疲劳。
+        dq_seen="$SCRIPT_DIR/../.patrol-dlq-baseline"
+        prev_d="$(cat "$dq_seen" 2>/dev/null || echo "")"
+        if [[ -z "$prev_d" ]]; then
+            printf '%s' "$d" > "$dq_seen" 2>/dev/null
+        elif [[ "$d" =~ ^[0-9]+$ && "$prev_d" =~ ^[0-9]+$ && "$d" -gt "$prev_d" ]]; then
+            note "DLQ_GROWTH: DLQ $prev_d → ${d}（消费端在丢消息；**不 purge**，仅报告）"
+            printf '%s' "$d" > "$dq_seen" 2>/dev/null
+        fi
+    fi
+fi
 
 local_head=$(git rev-parse main 2>/dev/null)
 remote_head=$(git rev-parse origin/main 2>/dev/null)

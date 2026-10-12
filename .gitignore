@@ -24,3 +24,4 @@ frontend/dist/
 .patrol-seen-issues
 
 .watch-log-seen
+.patrol-dlq-baseline
