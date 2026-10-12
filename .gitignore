@@ -22,3 +22,5 @@ state.json
 frontend/node_modules/
 frontend/dist/
 .patrol-seen-issues
+
+.watch-log-seen

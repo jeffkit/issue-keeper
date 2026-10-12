@@ -41,6 +41,13 @@ job_last_rc() {  # $1=label
 
 # ── 1. watcher 是否还活着（核心：静默≠健康）─────────────────────────────
 wt_log="$HOME/.plaita-console/delivery-watch.log"
+# 已读位置：沙箱下我**改不动** watcher 的日志（launchd 在沙箱外，它能写、我不能清），
+# 所以用**自己的**已读文件名记录"处理到哪一条日志了"，避免 WATCHER_HIT 永久卡住。
+wt_seen="$HOME/.issue-keeper/duty/watch-log-seen"
+if [[ ! -w "$(dirname "$wt_seen")" ]] 2>/dev/null; then
+    wt_seen="$SCRIPT_DIR/../.watch-log-seen"
+fi
+touch "$wt_seen" 2>/dev/null
 if ! job_loaded cc.agentstudio.delivery-watch; then
     note "WATCHER_DOWN: cc.agentstudio.delivery-watch 未加载 —— 交付检测**已失效**"
 else
@@ -50,9 +57,14 @@ else
         ""|-|0|10) ;;
         *) note "WATCHER_ERR: delivery-watch 退出码 $wt_rc（78=找不到 gh？）" ;;
     esac
-    # 日志有内容说明检测到过变化，值得看一眼
+    # 日志有内容说明检测到过变化，值得看一眼。
+    # 但只在**内容与我上次处理的不同**时报——否则会永久重复（沙箱下我清不掉该日志）。
     if [[ -s "$wt_log" ]]; then
-        note "WATCHER_HIT: 日志非空 —— $(tail -1 "$wt_log" | sed 's/^ *//')"
+        cur_sig="$(wc -c < "$wt_log" 2>/dev/null | tr -d ' ')-$(tail -1 "$wt_log" 2>/dev/null)"
+        if [[ "$cur_sig" != "$(cat "$wt_seen" 2>/dev/null)" ]]; then
+            note "WATCHER_HIT: 有新的检测结果 —— $(tail -1 "$wt_log" | sed 's/^ *//')"
+            printf '%s' "$cur_sig" > "$wt_seen" 2>/dev/null
+        fi
     fi
 fi
 

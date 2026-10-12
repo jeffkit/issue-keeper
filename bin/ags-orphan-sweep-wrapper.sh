@@ -42,4 +42,23 @@ for k in E2B_API_KEY PLAITA_CONSOLE_ADMIN_API_KEY; do
     fi
 done
 
+# ⚠ 代理环境变量：本机 shell/worker.env 可能带 `http_proxy=http://127.0.0.1:7897`，
+# 而 `NO_PROXY` **不含** tencentags.com。带上它时该主机连不通（实测 `000`），
+# 清掉后可通。故此处显式 unset，不依赖调用方环境。
+#
+# ⚠⚠ 但请注意（2026-10-13 分层实测的结论）：**清掉代理并不能修好本脚本**。
+# 同一台机器上，对 `api.ap-guangzhou.tencentags.com`：
+#
+#   curl                              → 401（HTTP 往返正常）
+#   python 裸 ssl + 手写 HTTP/1.1     → 401（正常）
+#   python 裸 ssl 握手（含各种 ALPN）  → 成功，证书链有效（DigiCert/腾讯）
+#   python **httpx / pyqwest**        → ConnectError: SSL: UNEXPECTED_EOF_WHILE_READING
+#
+# ⇒ 网络、DNS、TCP、TLS、服务端**都正常**；失败的只有 **httpx/pyqwest 这条传输栈**，
+# 且失败发生在**握手之后**（裸 socket 同 ALPN 可正常收发）。
+# ⇒ 这是 e2b 客户端与其依赖（pyqwest/httpx 0.28.x）在本机的兼容性问题，
+# **不是** AGS 故障，也不是凭据问题——**不要**把它误报成"AGS 挂了"。
+# 排查/修复方向：升级或降级 `pyqwest`/`httpx`，或让 e2b 走 requests 传输。
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy 2>/dev/null || true
+
 exec "$PY" "$SCRIPT" "$@"
