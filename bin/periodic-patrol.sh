@@ -113,9 +113,29 @@ done <<< "$new_issues"
 if [[ -n "$unseen" ]]; then
     note "NEW_ISSUES: 有未见过的单（记入 $SEEN_FILE 后不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
 fi
-for n in 68 69; do
-    c=$(gh issue view "$n" --repo jeffkit/plaita --json comments -q '.comments|length' 2>/dev/null)
-    [[ -n "$c" && "$c" -gt 1 ]] && note "DELIVERY?: #$n 有 $c 条评论（可能已交付，watcher 应已捕获）"
+# 待验收的交付出现在"对方的**最后一条**评论"里。
+# ⚠ 不能用 `评论数 > 1` 这种**静态阈值**——我一回帖它就永久为真，
+# 于是每轮都报同一件已处理的事（**警报疲劳**；本会话已因此修过 NEW_ACTIVITY
+# 与 WATCHER_HIT 两处，这是第三次同因）。
+# 正确判据：**最后一条评论不是我自己发的**。
+# 进一步细化（避免误报"认领/状态"类评论）：
+#   · 只查**仍 OPEN** 的单（已 CLOSED 的不再需要验收）；
+#   · 末条**不是我**发的；
+#   · 末条**不是** claim/status 类（那类不需要我动作）。
+ME="$(gh api user --jq .login 2>/dev/null || echo jeffkit)"
+for n in 68 69 55 133 136 137; do
+    st="$(gh issue view "$n" --repo jeffkit/plaita --json state -q .state 2>/dev/null)"
+    [[ "$st" != "OPEN" ]] && continue          # 已关闭 ⇒ 无需验收
+    last="$(gh issue view "$n" --repo jeffkit/plaita --json comments \
+        -q 'if (.comments|length)>0 then .comments[-1].author.login else "" end' 2>/dev/null)"
+    [[ -z "$last" || "$last" == "$ME" ]] && continue
+    body="$(gh issue view "$n" --repo jeffkit/plaita --json comments \
+        -q 'if (.comments|length)>0 then .comments[-1].body else "" end' 2>/dev/null)"
+    # 认领/排期类评论不需要我动作
+    case "$body" in
+        *"Claim —"*|*"out of the automated pipeline"*) continue ;;
+    esac
+    note "DELIVERY?: #$n 最后一条来自 ${last}（非我，且非认领类）— 可能待验收"
 done
 
 # ── 5. 无人认领的单是否被他人接管 ──────────────────────────────────────
