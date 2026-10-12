@@ -74,6 +74,11 @@ def tmp_enabled() -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep-hours", type=float, default=24.0)
+    #: target/ 是**可重建的构建缓存**，不必等 24h（实测：recursive/target 长到
+    #: 5.8G 而 mtime 仅 1.7h ⇒ 24h 阈值下**永远清不到**，磁盘被反复顶穿）。
+    #: 但仍需一个下限以免打断刚跑完、马上要复用的构建 ⇒ 默认 3h。
+    ap.add_argument("--target-keep-hours", type=float, default=3.0,
+                    help="主仓 target/ 的独立陈旧阈值（可重建缓存，默认 3h）")
     ap.add_argument("--min-free-gib", type=float, default=20.0, help="守卫线（与 preflight 对齐）")
     ap.add_argument("--margin-gib", type=float, default=5.0, help="低于 守卫线+余量 才动手")
     ap.add_argument("--dry-run", action="store_true")
@@ -186,6 +191,8 @@ def main() -> int:
     # （lsof 计数为 0；探测失败保守跳过）——缺一即会打断正在跑的 cargo/rustc。
     # 只清**一级** `<repo>/target`，不递归（避免误伤 runs 内的 worktree target，
     # 那些随 run 目录整体回收）。
+    # target 用**独立**的更短阈值（见 --target-keep-hours 说明）
+    target_cutoff = time.time() - args.target_keep_hours * 3600
     if ROOT.is_dir():
         for base in sorted(ROOT.iterdir()):
             tgt = base / "target"
@@ -195,7 +202,7 @@ def main() -> int:
             if any(bad in sp for bad in FORBID):
                 continue
             try:
-                if tgt.stat().st_mtime >= cutoff:
+                if tgt.stat().st_mtime >= target_cutoff:
                     continue
             except OSError:
                 continue
