@@ -21,3 +21,4 @@ state.json
 # 前端构建产物与依赖
 frontend/node_modules/
 frontend/dist/
+.patrol-seen-issues

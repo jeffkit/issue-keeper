@@ -13,7 +13,10 @@
 # 输出：每条一行；**全绿时打印 `ALL OK` 后 exit 0**；任一异常 exit 1。
 # 用法：periodic-patrol.sh [--json]
 set -uo pipefail
-cd "$(dirname "$0")/../../plaita" 2>/dev/null || cd "$HOME/projects/infra4agent/plaita"
+# ⚠ 必须在 `cd` **之前**解析脚本自身目录——`cd` 之后 `dirname $0` 会解析成错的地方
+#（实测踩过：得到 `/`，状态文件落到 `/.patrol-seen-issues`）。
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/../../plaita" 2>/dev/null || cd "$HOME/projects/infra4agent/plaita"
 
 JSON=0
 [[ "${1:-}" == "--json" ]] && JSON=1
@@ -72,12 +75,31 @@ if [[ -n "$local_head" && -n "$remote_head" && "$local_head" != "$remote_head" ]
     note "MAIN_DRIFT: 本地 $local_head ≠ origin/main $remote_head"
 fi
 
-# ── 4. 视野之外的新 issue / 新 PR（watcher 只盯已知 5 个目标）──────────
-recent=$(gh issue list --repo jeffkit/plaita --state all --limit 40 \
-    --json number,state,createdAt,updatedAt \
-    --jq '[.[] | select((.updatedAt > (now-3600|todate)) or (.createdAt > (now-3600|todate)))] | length' 2>/dev/null)
-if [[ -n "$recent" && "$recent" != "0" ]]; then
-    note "NEW_ACTIVITY: 近 1h 有 $recent 个 issue 变动（watcher 视野外请核）"
+# ── 4. 视野之外的新 issue / 新 PR（watcher 只盯已知目标）──────────────
+#
+# ⚠ 设计修正（2026-10-13）：最初按"近 1h 有变动"判，那是**时间窗**而非**未读状态**
+# ⇒ 同一批 issue 会被连续报警 1 小时，训练我忽略它（**警报疲劳**，
+# 与"监控自己说谎"同类的坏味道）。
+# 现改为**已读集合**：把处理过的 issue 号记进 seen 文件，只报**没见过的**。
+# 状态文件：优先 ~/.issue-keeper（沙箱下可能不可写，实测 `Operation not permitted`），
+# 退化到**仓内**路径。用开头已解析好的 SCRIPT_DIR（绝对路径）。
+SEEN_FILE="${PATROL_SEEN_FILE:-$HOME/.issue-keeper/duty/patrol-seen-issues}"
+if ! mkdir -p "$(dirname "$SEEN_FILE")" 2>/dev/null || ! touch "$SEEN_FILE" 2>/dev/null; then
+    SEEN_FILE="$SCRIPT_DIR/../.patrol-seen-issues"
+    touch "$SEEN_FILE" 2>/dev/null
+fi
+new_issues=$(gh issue list --repo jeffkit/plaita --state all --limit 40 \
+    --json number,updatedAt,createdAt,title \
+    --jq '[.[] | select((.updatedAt > (now-86400|todate)) or (.createdAt > (now-86400|todate)))] | .[] | "\(.number)\t\(.title)"' 2>/dev/null)
+unseen=""
+while IFS=$'\t' read -r num title; do
+    [[ -z "$num" ]] && continue
+    if ! grep -qx "$num" "$SEEN_FILE" 2>/dev/null; then
+        unseen+="  #${num} ${title:0:44}"$'\n'
+    fi
+done <<< "$new_issues"
+if [[ -n "$unseen" ]]; then
+    note "NEW_ISSUES: 有未见过的单（记入 $SEEN_FILE 后不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
 fi
 for n in 68 69; do
     c=$(gh issue view "$n" --repo jeffkit/plaita --json comments -q '.comments|length' 2>/dev/null)
