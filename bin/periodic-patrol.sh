@@ -108,10 +108,15 @@ while IFS=$'\t' read -r num title; do
     [[ -z "$num" ]] && continue
     if ! grep -qx "$num" "$SEEN_FILE" 2>/dev/null; then
         unseen+="  #${num} ${title:0:44}"$'\n'
+        # ⚠ 必须**落盘**——否则每轮都报同一批（"警报疲劳"）。
+        # 我第一版只 report 不 write，导致 #138–#141 连续两轮重复报；
+        # 与 NEW_ACTIVITY 的时间窗、WATCHER_HIT 的"非空"是**同一类错**：
+        # 判据依赖"我处理到哪了"，就必须把状态持久化。
+        printf '%s\n' "$num" >> "$SEEN_FILE" 2>/dev/null
     fi
 done <<< "$new_issues"
 if [[ -n "$unseen" ]]; then
-    note "NEW_ISSUES: 有未见过的单（记入 $SEEN_FILE 后不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
+    note "NEW_ISSUES: 有未见过的单（已记入 $SEEN_FILE，不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
 fi
 # 待验收的交付出现在"对方的**最后一条**评论"里。
 # ⚠ 不能用 `评论数 > 1` 这种**静态阈值**——我一回帖它就永久为真，
