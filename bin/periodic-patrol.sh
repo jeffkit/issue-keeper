@@ -55,7 +55,7 @@ else
     # 退出码 10=无变化、0=有变化 都正常；其它（如 78=找不到 gh）是配置故障
     case "$wt_rc" in
         ""|-|0|10) ;;
-        *) note "WATCHER_ERR: delivery-watch 退出码 $wt_rc（78=找不到 gh？）" ;;
+        *) note "WATCHER_ERR: delivery-watch 退出码 ${wt_rc}（78=找不到 gh？）" ;;
     esac
     # 日志有内容说明检测到过变化，值得看一眼。
     # 但只在**内容与我上次处理的不同**时报——否则会永久重复（沙箱下我清不掉该日志）。
@@ -79,8 +79,17 @@ else
     esac
 fi
 
-# ── 3. main 漂移（有没有我不知道的提交）────────────────────────────────
-git fetch -q origin main 2>/dev/null
+# ── 2b. 我自己的 shell 脚本是否有 bash 3.2 崩溃隐患 ─────────────────────
+# `$VAR` 紧跟全角标点会被 bash 3.2 吞进变量名 ⇒ unbound variable（本会话踩了 4 次，
+# 其中 external-watchdog.sh 是**看门狗**：一旦告警就崩，恰在最需要它的时候）。
+# 把 lint 接进巡检，避免只在"下次手滑时"才发现。
+if [[ -x "$SCRIPT_DIR/../scripts/lint-shell-cjk-vars.sh" ]]; then
+    if ! lint_out="$(bash "$SCRIPT_DIR/../scripts/lint-shell-cjk-vars.sh" 2>&1)"; then
+        note "SHELL_LINT: $(printf '%s' "$lint_out" | grep -c '^  /') 处 \$VAR 紧跟全角标点（bash 3.2 会崩）"
+    fi
+fi
+
+
 local_head=$(git rev-parse main 2>/dev/null)
 remote_head=$(git rev-parse origin/main 2>/dev/null)
 if [[ -n "$local_head" && -n "$remote_head" && "$local_head" != "$remote_head" ]]; then
@@ -116,7 +125,7 @@ while IFS=$'\t' read -r num title; do
     fi
 done <<< "$new_issues"
 if [[ -n "$unseen" ]]; then
-    note "NEW_ISSUES: 有未见过的单（已记入 $SEEN_FILE，不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
+    note "NEW_ISSUES: 有未见过的单（已记入 ${SEEN_FILE}，不再重复报）：$(printf '%s' "$unseen" | tr '\n' ' ')"
 fi
 # 待验收的交付出现在"对方的**最后一条**评论"里。
 # ⚠ 不能用 `评论数 > 1` 这种**静态阈值**——我一回帖它就永久为真，
@@ -144,9 +153,17 @@ for n in 68 69 55 133 136 137; do
 done
 
 # ── 5. 无人认领的单是否被他人接管 ──────────────────────────────────────
-for n in 113 118 109 106 117 110; do
-    c=$(gh issue view "$n" --repo jeffkit/plaita --json comments -q '.comments|length' 2>/dev/null)
-    [[ -n "$c" && "$c" -gt 0 ]] && note "CLAIMED?: #$n 有 $c 条评论（原为 0，可能被认领）"
+# ⚠ 判据必须**同时看 state**：只用"评论数 > 0"会在单被认领并**关闭**后永久为真
+#（实测：`#106` 我落地关闭后仍每轮报 `CLAIMED?`）。本会话第五次同因——
+# 判据必须是"当前需要我关注吗"，而不是"历史上发生过什么"。
+for n in 113 118 109 117 110; do
+    read -r st c <<<"$(gh issue view "$n" --repo jeffkit/plaita --json state,comments \
+        -q '"\(.state) \(.comments|length)"' 2>/dev/null)"
+    [[ "$st" != "OPEN" ]] && continue          # 已关闭 ⇒ 不再是"待认领"
+    last="$(gh issue view "$n" --repo jeffkit/plaita --json comments \
+        -q 'if (.comments|length)>0 then .comments[-1].author.login else "" end' 2>/dev/null)"
+    [[ "$last" == "$ME" ]] && continue          # 只有我自己说过话 ⇒ 仍无人接管
+    [[ -n "$c" && "$c" -gt 0 ]] && note "CLAIMED?: #$n 有 $c 条评论（末条来自 ${last}，可能被认领）"
 done
 
 # ── 输出 ────────────────────────────────────────────────────────────────
