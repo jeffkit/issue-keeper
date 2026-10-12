@@ -57,6 +57,10 @@ jeffkit/plaita|issues/69/comments
 jeffkit/plaita|issues/133/comments
 jeffkit/plaita|issues/136/comments
 jeffkit/plaita|issues/137/comments
+jeffkit/plaita|issues/138/comments
+jeffkit/plaita|issues/139/comments
+jeffkit/plaita|issues/140/comments
+jeffkit/plaita|issues/141/comments
 EOF
 }
 
