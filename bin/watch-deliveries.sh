@@ -46,6 +46,10 @@ for a in "$@"; do
 done
 
 # 监视目标：repo + 路径。新增需求就在这里加一行。
+# ⚠ 下面的 heredoc 里**不能写注释**——`#` 行会被当成【repo 名】解析，
+#   产生垃圾状态文件并让 `gh api` 返回 404（2026-10-13 实测踩到）。
+#   目前覆盖三个仓：infra4agent（协调）/ plaita（主交付）/ plaita-nodes
+#   （AGS 那条分支的工作落在 plaita-nodes#15）。
 # 只盯"交付会出现的地方"：协调 hub + 待交付单。
 targets() {
     cat <<'EOF'
@@ -69,6 +73,7 @@ jeffkit/plaita|issues/146/comments
 jeffkit/plaita|issues/147/comments
 jeffkit/plaita|issues/148/comments
 jeffkit/plaita|issues/149/comments
+jeffkit/plaita-nodes|issues/15/comments
 EOF
 }
 
@@ -88,6 +93,11 @@ changed=0
 report=""
 while IFS='|' read -r repo path; do
     [[ -z "$repo" ]] && continue
+    # ⚠ 护栏（2026-10-13 实测踩到）：heredoc 里写 `#` 注释会被当成【数据】——
+    # 既不是注释也不是合法 repo 名，结果是垃圾状态文件 + `gh api` 404。
+    # 显式跳过注释行，并要求 repo 形如 `owner/name`。
+    [[ "$repo" == \#* ]] && continue
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || continue
     key="$(slug "$repo")__$(slug "$path")"
     state_file="$STATE_DIR/$key"
 
