@@ -177,6 +177,22 @@ for n in 68 69 55 133 136 137; do
     note "DELIVERY?: #$n 最后一条来自 ${last}（非我，且非认领类）— 可能待验收"
 done
 
+# ── 4b. 协同缺口自检：对方发过言、而我从未在该线程回过 ────────────────────
+# 起因（2026-10-13 用户指出）：我把"不回帖"做过头，成了"沉默的协同"——
+# 对方在本单给了报告，我却在协调线程汇总而不在本单回，**他的视角是"没人读过"**。
+# 该做的是"per-issue 报告 per-issue 回"，而不是"尽量少说话"。
+# （这是**两套清单**的又一处：协调线程 ≠ 各 issue 线程。）
+COOP_TARGETS="55 68 69 133 136 137 138 139 140 141 142 143 144 145 146 134 135"
+for n in $COOP_TARGETS; do
+    mine="$(gh issue view "$n" --repo jeffkit/plaita --json comments \
+        -q '[.comments[]|select(.author.login=="'"$ME"'")]|length' 2>/dev/null)"
+    theirs="$(gh issue view "$n" --repo jeffkit/plaita --json comments \
+        -q '[.comments[]|select(.author.login!="'"$ME"'")]|length' 2>/dev/null)"
+    if [[ "${mine:-0}" == "0" && -n "$theirs" && "$theirs" != "0" ]]; then
+        note "COOP_GAP: #$n 对方发了 ${theirs} 条，我一条都没回（per-issue 报告应 per-issue 回）"
+    fi
+done
+
 # ── 5. 无人认领的单是否被他人接管 ──────────────────────────────────────
 # ⚠ 判据必须**同时看 state**：只用"评论数 > 0"会在单被认领并**关闭**后永久为真
 #（实测：`#106` 我落地关闭后仍每轮报 `CLAIMED?`）。本会话第五次同因——
