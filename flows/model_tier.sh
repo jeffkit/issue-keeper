@@ -54,4 +54,4 @@ m = re.search(r'^pipeline_default_agent:.*$', s, re.M)
 print(m.group(0) if m else "pipeline_default_agent: (未设置 → 回退硬编码 glm53-flash)")
 PY
 EOS
-echo "已切档：model=$MODEL（keeper ≤3min live-reload 生效；worker 无需重启）"
+echo "已切档：model=${MODEL}（keeper ≤3min live-reload 生效；worker 无需重启）"

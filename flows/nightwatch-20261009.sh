@@ -59,14 +59,14 @@ except Exception:
   # ---- 判定与干预 ----
   if [ "$CUR_1308" -gt "$PREV_1308" ] 2>/dev/null; then
     RESET=$(grep -o "限额将在 [0-9-]* [0-9:]*" ~/.plaita-console/worker-mac.log 2>/dev/null | tail -1)
-    say "⚠ GLM 烧穿确认（1308: $PREV_1308→$CUR_1308）。$RESET。按兵不动，重置后核验自愈。"
+    say "⚠ GLM 烧穿确认（1308: $PREV_1308→${CUR_1308}）。${RESET}。按兵不动，重置后核验自愈。"
     PREV_1308=$CUR_1308
     RESET_AT=$(echo "$RESET" | grep -o "[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$")
   fi
   if [ -n "$RESET_AT" ] && [ "$NOW" \> "$RESET_AT" ] 2>/dev/null && [ "${RESET_CHECKED:-0}" = "0" ]; then
     sleep 180  # 重置后 3 分钟再核
     NEWRUN=$(ssh -o ConnectTimeout=8 tcloud_gz "grep -c '已入队' /home/ubuntu/.plaita-console/schedule-service.log 2>/dev/null" 2>/dev/null)
-    say "✅ 重置核验：调度入队累计=$NEWRUN（在增长=管线自愈中）"
+    say "✅ 重置核验：调度入队累计=${NEWRUN}（在增长=管线自愈中）"
     RESET_CHECKED=1
   fi
   if [ "${A_AGE:-0}" -gt 1800 ] 2>/dev/null; then
@@ -82,10 +82,10 @@ except Exception:
   fi
   if [ "$NOW" \> "00:45" 2>/dev/null ] && [ "$B_REVIVED" = "0" ]; then
     if [ "${B_MIN:-99999}" -lt 60 ] 2>/dev/null; then
-      say "✅ B 班复活确认（最后 B-flow 轮 $B_LAST，${B_MIN}min 前）"
+      say "✅ B 班复活确认（最后 B-flow 轮 ${B_LAST}，${B_MIN}min 前）"
       B_REVIVED=1
     else
-      say "🚨 CRITICAL: 00:45 已过，B 班仍无成功轮（最后 $B_LAST）——需人工查 keeper-watch DLQ"
+      say "🚨 CRITICAL: 00:45 已过，B 班仍无成功轮（最后 ${B_LAST}）——需人工查 keeper-watch DLQ"
       B_REVIVED=2
     fi
   fi

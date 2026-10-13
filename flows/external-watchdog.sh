@@ -55,7 +55,7 @@ else
   PREV=$(cat "$BASEF" 2>/dev/null || echo 0)
   if [ "$N1308" -gt "$PREV" ] 2>/dev/null; then
     R=$(grep -o "限额将在 [0-9-]* [0-9:]*" ~/.plaita-console/worker-mac.log | tail -1)
-    say "GLM 烧穿（1308=$PREV→$N1308）。${R:-重置时刻未取到，看 AGS 控制台}"
+    say "GLM 烧穿（1308=$PREV→${N1308}）。${R:-重置时刻未取到，看 AGS 控制台}"
     echo "$N1308" > "$BASEF"
   elif [ "$N1308" -lt "$PREV" ] 2>/dev/null; then
     echo "$N1308" > "$BASEF"  # 日志轮转/清理，基线跟随回落
