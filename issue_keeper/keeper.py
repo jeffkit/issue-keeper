@@ -1300,6 +1300,18 @@ def _read_pipeline_lock(lock: Path) -> int | None:
         return None
 
 
+def _repo_artifact_slug(repo: str) -> str:
+    """artifact 目录用 slug：取仓库名后半段并清理非字母数字字符。
+
+    只保留 [A-Za-z0-9_.-]，其余统一替换为 -，并合并连续 -。
+    与 workbench._repo_artifact_slug 保持逻辑一致。
+    """
+    import re
+    name = repo.split("/")[-1]
+    name = re.sub(r"[^\w.\-]", "-", name)
+    return re.sub(r"-{2,}", "-", name).strip("-")
+
+
 def _pid_alive(pid: int) -> bool:
     """pid 是否仍存在；无权限发信号视为存在（不可误清别人的锁）。"""
     try:
@@ -2422,7 +2434,7 @@ def _dispatch_pipeline(config, binding, res, it, label: str,
         log.error("[%s] pipeline bridge 不存在: %s", label, bridge)
         return {"status": "engine_error", "comment_posted": False}
 
-    slug = binding.repo.split("/")[-1]
+    slug = _repo_artifact_slug(binding.repo)
     artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{res.number}").expanduser()
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2639,7 +2651,7 @@ def _reap_pipelines(config, state, bindings) -> int:
             if not since:
                 continue
             label = f"{binding.repo} #{key}"
-            slug = binding.repo.split("/")[-1]
+            slug = _repo_artifact_slug(binding.repo)
             artifact_dir = Path(f"~/.issue-keeper/pipeline/{slug}-{key}").expanduser()
             lock = artifact_dir / PIPELINE_LOCK_NAME
 

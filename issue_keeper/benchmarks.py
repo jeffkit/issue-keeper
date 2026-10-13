@@ -40,7 +40,10 @@ EVAL_TRIAGE_PROMPT = (
 
 
 def _artifact_dir(repo: str, issue) -> pathlib.Path:
-    slug = str(repo).split("/")[-1]
+    import re
+    name = str(repo).split("/")[-1]
+    name = re.sub(r"[^\w.\-]", "-", name)
+    slug = re.sub(r"-{2,}", "-", name).strip("-")
     return pathlib.Path(f"~/.issue-keeper/pipeline/{slug}-{issue}").expanduser()
 
 

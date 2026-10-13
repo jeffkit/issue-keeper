@@ -83,7 +83,7 @@ def _bindings(repo="a/b"):
 
 
 def _art(tmp_path, repo="b", number=7):
-    # 目录派生必须与 keeper 一致：slug = repo.split("/")[-1]
+    # 目录派生必须与 keeper 一致：slug = _repo_artifact_slug(repo)（取后半段+标点清理）
     art = tmp_path / ".issue-keeper" / "pipeline" / f"{repo.split('/')[-1]}-{number}"
     art.mkdir(parents=True, exist_ok=True)
     return art

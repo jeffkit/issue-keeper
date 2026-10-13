@@ -57,9 +57,17 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _repo_artifact_slug(repo: str) -> str:
+    """artifact 目录用 slug：取仓库名后半段并清理非法字符。"""
+    import re
+    name = str(repo).split("/")[-1]
+    name = re.sub(r"[^\w.\-]", "-", name)
+    return re.sub(r"-{2,}", "-", name).strip("-")
+
+
 def _in_flight(repo: str, issue, lock_root: pathlib.Path | None) -> tuple[bool, str | None]:
     """run.lock 里的 bridge pid 还活着 → 在途，返回 (在途, 起跑时刻)。"""
-    slug = str(repo).split("/")[-1]
+    slug = _repo_artifact_slug(repo)
     lock = (lock_root or PIPELINE_DIR) / f"{slug}-{issue}" / "run.lock"
     try:
         pid = int(lock.read_text(encoding="utf-8").strip())
