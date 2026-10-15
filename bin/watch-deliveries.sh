@@ -79,11 +79,29 @@ EOF
 
 # 单个目标的"指纹"：评论数 + 最后一条的 id/时间/作者。
 # 用内容而非纯计数——编辑既有评论也该被发现。
+#
+# ⚠ 2026-10-15 修正（**自噪声**）：原指纹对**任何**末条变化都报警，包括**我自己**发的评论
+# ⇒ 我一回帖 watcher 立刻把自己叫醒一次（实测 `#146`：我 02:05 回帖，02:24 就报
+# `WATCHER_HIT`）。这是**反馈回路**，与 NEW_ACTIVITY/COOP_GAP 同族的「判据不是我处理到哪」。
+# 本脚本的职责是「**交付侧**有变化叫我」，故指纹只取**非我**的最后一条：
+# 即"最后一条不是我发的"那条的作者/时间——我发言不改变它，交付方发言才改变。
+#
+# ⚠ 实现坑（2026-10-15 实测）：本机 `gh` **不支持** `--jq --arg`（报
+# `accepts 1 arg(s), received 4`）。若照搬会**静默取到空指纹** ⇒ 目标全部变成
+# "取指纹失败（跳过）"，watcher 表面正常、实则**全瞎** —— 正是本会话反复撞见的
+# "静默的坏"。故不依赖 `--arg`：把 ME 作为字面量**转义后内联**进 jq 表达式
+# （登录名只含 `[A-Za-z0-9-]`，但仍做一次转义防御）。
+ME_W="$(gh api user --jq .login 2>/dev/null || echo jeffkit)"
+ME_Q="${ME_W//\\/\\\\}"; ME_Q="${ME_Q//\"/\\\"}"
 fingerprint() {
     local repo="$1" path="$2"
     "$GH_BIN" api "repos/$repo/$path" --jq '
         (length|tostring) + "|" +
-        (if length>0 then ((.[-1].id|tostring) + "@" + .[-1].user.login + "@" + .[-1].updated_at) else "-" end)
+        ( [ .[] | select(.user.login != "'"$ME_Q"'") ] as $theirs
+        | if ($theirs|length)>0
+          then (($theirs[-1].id|tostring) + "@" + $theirs[-1].user.login + "@" + $theirs[-1].updated_at
+                + "@n=" + (($theirs|length)|tostring))
+          else "-" end )
     ' 2>/dev/null
 }
 
