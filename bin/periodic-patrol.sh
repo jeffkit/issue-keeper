@@ -198,19 +198,28 @@ discovery="$(
         --json number,updatedAt \
         --jq 'sort_by(.updatedAt)|reverse|.[]|.number' 2>/dev/null
 )"
-DELIV_SEEN="${PATROL_DELIV_SEEN:-$HOME/.issue-keeper/duty/patrol-deliv-seen}"
-if ! mkdir -p "$(dirname "$DELIV_SEEN")" 2>/dev/null || ! touch "$DELIV_SEEN" 2>/dev/null; then
-    DELIV_SEEN="$SCRIPT_DIR/../.patrol-deliv-seen"
-    touch "$DELIV_SEEN" 2>/dev/null
-fi
+# ⚠⚠ 2026-10-15 晚 **重大修正**：删掉 `DELIV_SEEN` / `--ack`（我今晚自己造的坑，代价 33 小时）
+#
+# 我今晚早些时候给 `DELIVERY?` 加了"已读指纹"文件 + `--ack` 显式静音，理由写的是
+# "处置过后判据永久为真 ⇒ 每 30 分钟重报 ⇒ 警报疲劳"。**那个理由本身是错的**：
+#   判据 `末条不是我` 在**我回帖之后会自动变假**（末条变成我的）——**本来就是自清除的**，
+#   根本不需要额外状态。我当时觉得"连报数十轮"是噪声，实际是——**我确实没在那些单回过帖**，
+#   警报是**对的**，是我把"准确的警报"当成了噪声。
+#   而 `--ack` 只记指纹、**不校验我是否真的回了帖** ⇒ 它**只能**静音"我没处理的"，
+#   永远静音不了"我已处理的"（因为那些早已被自清除跳过）。
+#   后果实测：`#68`（落地流水线头部）被我 `--ack` 静音，而我从 04:11Z 起 **33 小时没回**
+#   交付方的三条诊断请求 —— 交付方以为我罢工。**这就是"监控自己说谎"的最坏形态：
+#   不是报错，是把真信号亲手关掉。**
+#
+# 正确判据（保留，不加状态）：**该单末条评论不是我的** ⇒ 我还没回过 ⇒ 报。
+# 我回帖 ⇒ 末条变我的 ⇒ 自动不报。**自清除，无状态文件，无法被伪造。**
+# 若某条确实无需回帖（认领/状态类），在下面的 `case` 里**按内容具名豁免**，不靠"已读"。
 for n in $discovery; do
     # 一次取回末条的 (login, id, body)——原来是三次 gh 调用，慢且易抖
     read -r last last_id < <(gh issue view "$n" --repo jeffkit/plaita --json comments \
         -q 'if (.comments|length)>0 then "\(.comments[-1].author.login) \(.comments[-1].id)" else " -" end' 2>/dev/null)
     [[ -z "$last" || "$last" == "-" || "$last" == "$ME" ]] && continue
-    fp="$n:$last_id"
-    grep -qx "$fp" "$DELIV_SEEN" 2>/dev/null && continue   # 这一轮我已处置过
-    deliv+=("$fp")
+    deliv+=("$n:$last_id")
     deliv_desc+=("#$n(${last})")
 done
 # ⚠ 汇总而非逐条：动态发现后待验收项可达 20+ 条，逐条一行的结果是
@@ -269,12 +278,15 @@ done
 # 统一用 `${arr[@]+"${arr[@]}"}` 惯用法，空数组时展开为**零个参数**而非报错。
 ordered=(${coop[@]+"${coop[@]}"} ${issues[@]+"${issues[@]}"})
 
-# `--ack` ⇒ 把我已经**真正处置过**的这一轮记入已读（DELIVERY? 静音）。
-# 与 NEW_ISSUES 的 seen 文件同构：状态推进必须由"处理"驱动，不能由"报告"驱动。
+# `--ack` 已**移除**（2026-10-15 晚）。它是我今晚自己造的坑：
+# 见 DELIVERY? 段顶部的长注释——它只能静音"我没处理的"，因此实测静音了 `#68` 达 33 小时。
+# 现在改为**自清除**判据（我回帖 ⇒ 末条变我的 ⇒ 自动不报），不需要任何状态文件。
+# 保留 `--ack` 作为**显式报错**，避免旧脚本/旧习惯还在调用它却以为生效了（"静默的坏"）。
 if [[ "${ACK:-0}" == "1" ]]; then
-    for fp in ${deliv[@]+"${deliv[@]}"}; do printf '%s\n' "$fp" >> "$DELIV_SEEN" 2>/dev/null; done
-    # COOP_GAP 一旦报过就记；但我**必须**真的去回帖，否则单会静默累积——
-    # 故这里**不**自动静音 COOP_GAP：只有"我回过帖了"（mine>0）才自然消失。
+    echo "⚠ --ack 已移除：DELIVERY? 现在自清除（我回帖即消）。" >&2
+    echo "  若某单确实无需回帖，请在报文里忽略它，或在脚本的 case 豁免里按内容具名豁免。" >&2
+    echo "  历史教训：--ack 静音了 #68 达 33 小时，交付方以为我罢工。" >&2
+    exit 3
 fi
 
 if [[ ${#ordered[@]} -eq 0 ]]; then

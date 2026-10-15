@@ -25,8 +25,6 @@ frontend/dist/
 
 .watch-log-seen
 .patrol-dlq-baseline
-# 交付指纹已读集合（DELIVERY? 静音用；本地状态，不入库）
-.patrol-deliv-seen
 
 # 值守/评审工作笔记（本地留痕，不入库）
 notes/
